@@ -174,7 +174,7 @@ export interface SimulationConfig {
   planet: PlanetInputs;
   tectonics: TectonicInputs;
   events: WorldEventRecord[];
-  generationPreset?: "fast" | "balanced" | "detailed";
+  generationPreset?: "ultra" | "fast" | "balanced" | "detailed";
 }
 
 export interface SimulationStats {

@@ -212,6 +212,7 @@ enum RecomputeReason {
 
 #[derive(Clone, Copy)]
 enum GenerationPreset {
+    Ultra,
     Fast,
     Balanced,
     Detailed,
@@ -227,6 +228,7 @@ struct DetailProfile {
 
 fn parse_generation_preset(value: Option<&str>) -> GenerationPreset {
     match value.unwrap_or("balanced") {
+        "ultra" => GenerationPreset::Ultra,
         "fast" => GenerationPreset::Fast,
         "detailed" => GenerationPreset::Detailed,
         _ => GenerationPreset::Balanced,
@@ -235,6 +237,12 @@ fn parse_generation_preset(value: Option<&str>) -> GenerationPreset {
 
 fn detail_profile(preset: GenerationPreset) -> DetailProfile {
     match preset {
+        GenerationPreset::Ultra => DetailProfile {
+            buoyancy_smooth_passes: 1,
+            erosion_rounds: 0,
+            ocean_smooth_passes: 0,
+            max_kernel_radius: 3,
+        },
         GenerationPreset::Fast => DetailProfile {
             buoyancy_smooth_passes: 4,
             erosion_rounds: 1,
@@ -524,9 +532,15 @@ fn build_irregular_plate_field(plates: &[PlateSpec], seed: u32, cache: &WorldCac
             }
 
             let lat = cache.lat_by_y[j];
-            let lon = cache.lon_by_x[j];
-            let wave_a = (lat * gp.freq_a + lon * gp.freq_b + gp.phase_a).sin();
-            let wave_b = (lat * gp.freq_c - lon * gp.freq_d + gp.phase_b).cos();
+            let sx = cache.x_by_cell[j];
+            let sy = cache.y_by_cell[j];
+            let sz = cache.z_by_cell[j];
+            let scale_a = 0.8 + gp.freq_a * 24.0;
+            let scale_b = 0.8 + gp.freq_b * 24.0;
+            let scale_c = 0.8 + gp.freq_c * 24.0;
+            let scale_d = 0.8 + gp.freq_d * 24.0;
+            let wave_a = (sx * scale_a + sy * scale_b + gp.phase_a).sin();
+            let wave_b = (sy * scale_c - sz * scale_d + gp.phase_b).cos();
             let rough_factor = 1.0 + gp.roughness * (0.22 * wave_a + 0.18 * wave_b);
             let drift_align = dx as f32 * gp.drift_x + dy as f32 * gp.drift_y;
             let drift_factor = 1.03 - 0.12 * drift_align;
@@ -817,12 +831,20 @@ fn apply_coastal_detail(relief: &mut [f32], seed: u32, cache: &WorldCache) {
             continue;
         }
 
-        let lat = cache.lat_by_y[i];
-        let lon = cache.lon_by_x[i];
-        let warp_lat = lat + 2.4 * (lon * 0.065 + seed as f32 * 0.0013).sin();
-        let warp_lon = lon + 3.6 * (lat * 0.058 - seed as f32 * 0.0011).cos();
-        let n = (warp_lat * 0.19 + warp_lon * 0.23 + seed as f32 * 0.0022).sin() * 0.62
-            + (warp_lat * 0.31 - warp_lon * 0.17 - seed as f32 * 0.0016).cos() * 0.38;
+        let sx = cache.x_by_cell[i];
+        let sy = cache.y_by_cell[i];
+        let sz = cache.z_by_cell[i];
+        let seed_phase = seed as f32 * 0.00091;
+        let warp_x =
+            sx + 0.22 * (sy * 6.1 + seed_phase).sin() + 0.14 * (sz * 7.4 - seed_phase * 1.7).cos();
+        let warp_y = sy
+            + 0.2 * (sz * 5.8 - seed_phase * 1.2).sin()
+            + 0.12 * (sx * 6.9 + seed_phase * 0.8).cos();
+        let warp_z = sz
+            + 0.18 * (sx * 5.2 + seed_phase * 1.5).sin()
+            + 0.1 * (sy * 7.2 - seed_phase * 0.6).cos();
+        let n = (warp_x * 7.6 + warp_y * 6.4 + warp_z * 5.1 + seed_phase * 1.9).sin() * 0.62
+            + (warp_y * 8.1 - warp_z * 5.7 + warp_x * 4.6 - seed_phase * 1.3).cos() * 0.38;
         let coast_weight = near_sea.powf(1.18);
         relief[i] += coast_weight * n * 92.0;
     }
@@ -987,15 +1009,17 @@ fn apply_ocean_profile(
             -abyssal_base - 1850.0 * t.powf(0.62)
         };
 
-        let lat = cache.lat_by_y[i];
-        let lon = cache.lon_by_x[i];
+        let sx = cache.x_by_cell[i];
+        let sy = cache.y_by_cell[i];
+        let sz = cache.z_by_cell[i];
         let basin_weight = clampf(
             (d - shelf_cells) / (shelf_cells + slope_cells + 1.0),
             0.0,
             1.0,
         );
-        let undulation = (lat * 0.082 + lon * 0.067 + seed as f32 * 0.0012).sin() * 0.6
-            + (lat * 0.041 - lon * 0.109 - seed as f32 * 0.0018).cos() * 0.4;
+        let seed_phase = seed as f32 * 0.0012;
+        let undulation = (sx * 7.2 + sy * 5.3 + sz * 4.1 + seed_phase).sin() * 0.6
+            + (sy * 8.6 - sz * 4.9 + sx * 3.7 - seed_phase * 1.35).cos() * 0.4;
         target_depth += undulation * (120.0 + 320.0 * basin_weight);
 
         let strength = clampf(boundary_strength[i], 0.0, 1.0);
@@ -1161,12 +1185,11 @@ fn compute_relief(
 
                 let source_plate = plates.plate_field[j] as usize;
                 let source_heat = plates.plate_vectors[source_plate].heat;
-                let ridge_noise = 0.65
-                    + 0.35
-                        * (cache.lat_by_y[j] * 0.11
-                            + cache.lon_by_x[j] * 0.17
-                            + seed as f32 * 0.0027)
-                            .sin();
+                let bx = cache.x_by_cell[j];
+                let by = cache.y_by_cell[j];
+                let bz = cache.z_by_cell[j];
+                let ridge_noise =
+                    0.65 + 0.35 * (bx * 3.9 + by * 5.2 + bz * 4.3 + seed as f32 * 0.0027).sin();
                 let source_heat_norm = source_heat / tectonics.mantle_heat.max(1.0);
                 let heat_width = 0.75 + source_heat_norm * 1.6 + (source_heat_norm - 0.55) * 0.9;
                 let local_width = clampf(0.65 + heat_width * ridge_noise, 0.5, 4.8);
@@ -1195,18 +1218,10 @@ fn compute_relief(
                     + (along * along) / (sigma_along * sigma_along);
                 let w = (-anisotropy).exp();
                 let width_tuning = 0.32 + 0.95 * s + 0.28 * boundary_bias;
-                let chain_segment = 0.35
-                    + 0.65
-                        * (0.5
-                            + 0.5
-                                * (cache.lat_by_y[j] * 0.27 + cache.lon_by_x[j] * 0.34 + phase_a)
-                                    .sin());
-                let chain_cluster = 0.45
-                    + 0.55
-                        * (0.5
-                            + 0.5
-                                * (cache.lat_by_y[j] * 0.22 - cache.lon_by_x[j] * 0.19 + phase_b)
-                                    .cos());
+                let chain_segment =
+                    0.35 + 0.65 * (0.5 + 0.5 * (bx * 9.4 + by * 7.6 + bz * 5.8 + phase_a).sin());
+                let chain_cluster =
+                    0.45 + 0.55 * (0.5 + 0.5 * (by * 8.8 - bz * 6.3 + bx * 4.2 + phase_b).cos());
                 let mut intensity = w * width_tuning;
 
                 if t == 1 {
@@ -1221,19 +1236,19 @@ fn compute_relief(
             }
         }
 
-        let lat = cache.lat_by_y[i];
-        let lon = cache.lon_by_x[i];
-        let warp_lat =
-            lat + 11.0 * (lon * 0.045 + phase_a).sin() + 6.0 * (lat * 0.062 + phase_b).cos();
-        let warp_lon =
-            lon + 14.0 * (lat * 0.037 + phase_c).cos() - 7.0 * (lon * 0.053 + phase_a).sin();
+        let sx = cache.x_by_cell[i];
+        let sy = cache.y_by_cell[i];
+        let sz = cache.z_by_cell[i];
+        let warp_x = sx + 0.34 * (sy * 4.6 + phase_a).sin() + 0.21 * (sz * 5.1 + phase_b).cos();
+        let warp_y = sy + 0.31 * (sz * 4.2 - phase_b).sin() + 0.18 * (sx * 5.4 + phase_c).cos();
+        let warp_z = sz + 0.27 * (sx * 4.9 + phase_c).sin() + 0.16 * (sy * 5.8 - phase_a).cos();
 
-        let continental_signal = (warp_lat * 0.018 + phase_a).sin() * 0.95
-            + (warp_lon * 0.013 + phase_b).cos() * 0.8
-            + ((warp_lat + warp_lon) * 0.0105 + phase_c).sin() * 0.55
-            + (warp_lat * 0.023 - warp_lon * 0.019 + phase_a * 0.65).cos() * 0.4;
-        let regional_signal =
-            ((lat + lon) * 0.072 + phase_b).sin() * ((lat - lon) * 0.059 + phase_c).cos();
+        let continental_signal = (warp_x * 2.6 + warp_y * 2.1 + phase_a).sin() * 0.92
+            + (warp_y * 3.4 - warp_z * 1.8 + phase_b).cos() * 0.78
+            + ((warp_x + warp_z * 0.7) * 3.9 + phase_c).sin() * 0.58
+            + ((warp_y - warp_x * 0.45) * 4.3 + phase_a * 0.65).cos() * 0.38;
+        let regional_signal = (warp_x * 4.2 + warp_y * 3.5 + warp_z * 2.8 + phase_b).sin()
+            * (warp_y * 2.4 - warp_z * 4.1 + warp_x * 1.7 + phase_c).cos();
         let crust_mask_raw =
             continental_signal * 0.95 + regional_signal * 0.45 + plate_buoyancy * 0.18;
         let crust_mask = 1.0 / (1.0 + (-crust_mask_raw).exp());
@@ -1256,12 +1271,14 @@ fn compute_relief(
         let tectonic_weight = 0.16 + 0.84 * crust_mask;
         base *= tectonic_weight;
 
-        let intraplate_signal = ((lat * 0.083 + lon * 0.064) + phase_a * 0.25).sin()
-            * ((lat * 0.059 - lon * 0.051) + phase_b * 0.3).cos();
+        let intraplate_signal = (warp_x * 7.1 + warp_y * 6.6 + phase_a * 0.25).sin()
+            * (warp_y * 6.9 - warp_z * 5.5 + phase_b * 0.3).cos();
 
-        let macro_noise = (lat * macro_a + lon * macro_b + phase_a).sin() * 140.0
-            + (lat * (macro_a * 0.55) - lon * macro_c + phase_b).sin() * 90.0
-            + (lon * (macro_b * 1.6) + phase_c).cos() * 70.0;
+        let macro_noise = (sx * (4.8 + macro_a * 38.0) + sy * (3.6 + macro_b * 34.0) + phase_a)
+            .sin()
+            * 140.0
+            + (sy * (4.1 + macro_c * 30.0) - sz * (3.2 + macro_a * 26.0) + phase_b).sin() * 90.0
+            + (sz * (4.7 + macro_b * 22.0) + sx * (2.9 + macro_c * 18.0) + phase_c).cos() * 70.0;
         let continental_base = (crust_mask - 0.5) * 3600.0;
         let macro_base = continental_base
             + intraplate_signal * 260.0

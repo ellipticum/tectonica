@@ -68,6 +68,7 @@ const PREVIEW_PRESETS = [
 
 type PreviewPresetId = (typeof PREVIEW_PRESETS)[number]["id"];
 const GENERATION_PRESETS = [
+  { id: "ultra", label: "Сверхбыстро (тест)" },
   { id: "fast", label: "Быстро (черновик)" },
   { id: "balanced", label: "Баланс" },
   { id: "detailed", label: "Детально" },
