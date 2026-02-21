@@ -39,3 +39,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# rust / wasm
+rust/**/target/
+rust/**/Cargo.lock
+src/lib/planet-rs/pkg/*
+!src/lib/planet-rs/pkg/.gitignore

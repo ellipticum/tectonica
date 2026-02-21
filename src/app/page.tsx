@@ -1,7 +1,7 @@
 "use client";
 
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import { BellRing, Layers, Mountain, RefreshCw, Waves, X } from "lucide-react";
+import { BellRing, Layers, Mountain, Waves, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -41,9 +41,10 @@ import {
   type WorldEventRecord,
   type WorldDisplayLayer,
   toHeightExportPayload,
-  runSimulation,
+  type SimulationConfig,
   type SimulationResult,
 } from "@/lib/planet/simulation";
+import { runSimulationRust } from "@/lib/planet/rust-simulation";
 
 const LAYER_OPTIONS: Array<{ id: WorldDisplayLayer; label: string }> = [
   { id: "plates", label: "Плиты" },
@@ -60,15 +61,44 @@ const LAYER_OPTIONS: Array<{ id: WorldDisplayLayer; label: string }> = [
 const clamp = (v: number, min: number, max: number) => (v < min ? min : v > max ? max : v);
 
 const PREVIEW_PRESETS = [
-  { id: "native", label: "По данным", scale: 1 },
-  { id: "2k", label: "Чище x2 (~720×360)", scale: 2 },
-  { id: "4k", label: "Чище x4 (~1440×720)", scale: 4 },
-  { id: "8k", label: "Чище x8 (~2880×1440, 8k-вид)", scale: 8 },
+  { id: "low", label: "Быстро x0.25 (~512×256)", scale: 0.25 },
+  { id: "balanced", label: "Баланс x0.5 (~1024×512)", scale: 0.5 },
+  { id: "native", label: "Натив (2048×1024)", scale: 1 },
 ] as const;
 
 type PreviewPresetId = (typeof PREVIEW_PRESETS)[number]["id"];
 type ViewMode = "map" | "globe";
 type FlatProjection = "equirectangular" | "mercator";
+
+type SimulationWorkerRequest = {
+  type: "generate";
+  requestId: number;
+  config: SimulationConfig;
+  reason: RecomputeTrigger;
+};
+
+type SimulationWorkerProgress = {
+  type: "progress";
+  requestId: number;
+  progress: number;
+};
+
+type SimulationWorkerResult = {
+  type: "result";
+  requestId: number;
+  result: SimulationResult;
+};
+
+type SimulationWorkerError = {
+  type: "error";
+  requestId: number;
+  message: string;
+};
+
+type SimulationWorkerEvent =
+  | SimulationWorkerProgress
+  | SimulationWorkerResult
+  | SimulationWorkerError;
 
 type ColorStop = {
   t: number;
@@ -294,12 +324,14 @@ export default function HomePage() {
   const [displayLayer, setDisplayLayer] = useState<WorldDisplayLayer>("height");
   const [inspectLayer, setInspectLayer] = useState<LayerId>("relief");
   const [showConstraint, setShowConstraint] = useState(true);
-  const [previewMode, setPreviewMode] = useState<PreviewPresetId>("8k");
+  const [previewMode, setPreviewMode] = useState<PreviewPresetId>("balanced");
   const [viewMode, setViewMode] = useState<ViewMode>("map");
   const [flatProjection, setFlatProjection] = useState<FlatProjection>("equirectangular");
   const [viewCenterLon, setViewCenterLon] = useState(0);
   const [viewCenterLat, setViewCenterLat] = useState(0);
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const simulationWorkerRef = useRef<Worker | null>(null);
+  const generationRequestIdRef = useRef(0);
 
   const [meteorForm, setMeteorForm] = useState({
     latitude: 8,
@@ -317,21 +349,87 @@ export default function HomePage() {
     magnitude: 400,
   });
 
-  const deferredSeed = useDeferredValue(seed);
-  const deferredPlanet = useDeferredValue(planet);
-  const deferredTectonics = useDeferredValue(tectonics);
-
-  const config = useMemo(
-    () => ({
-      seed: deferredSeed,
-      planet: deferredPlanet,
-      tectonics: deferredTectonics,
-      events,
-    }),
-    [deferredSeed, deferredPlanet, deferredTectonics, events],
+  const [result, setResult] = useState<SimulationResult>(() =>
+    runSimulationRust(
+      {
+        seed: DEFAULT_SIMULATION.seed,
+        planet: DEFAULT_PLANET,
+        tectonics: DEFAULT_TECTONICS,
+        events: [],
+      },
+      "global",
+    ),
   );
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isDirty, setIsDirty] = useState(false);
+  const [generationProgress, setGenerationProgress] = useState<number>(0);
 
-  const result: SimulationResult = useMemo(() => runSimulation(config, reason), [config, reason]);
+  useEffect(() => {
+    const worker = new Worker(new URL("../workers/simulation.worker.ts", import.meta.url), {
+      type: "module",
+    });
+
+    worker.onmessage = (event: MessageEvent<SimulationWorkerEvent>) => {
+      const message = event.data;
+      if (!message || message.requestId !== generationRequestIdRef.current) {
+        return;
+      }
+
+      if (message.type === "progress") {
+        setGenerationProgress(clamp(message.progress, 0, 100));
+        return;
+      }
+
+      if (message.type === "result") {
+        setResult(message.result);
+        setIsDirty(false);
+        setGenerationProgress(100);
+        setIsGenerating(false);
+        return;
+      }
+
+      setIsGenerating(false);
+      setGenerationProgress(0);
+      // eslint-disable-next-line no-console
+      console.error(message.message);
+    };
+
+    worker.onerror = () => {
+      setIsGenerating(false);
+      setGenerationProgress(0);
+    };
+
+    simulationWorkerRef.current = worker;
+    return () => {
+      worker.terminate();
+      simulationWorkerRef.current = null;
+    };
+  }, []);
+
+  const generateWorld = () => {
+    const worker = simulationWorkerRef.current;
+    if (!worker || isGenerating) {
+      return;
+    }
+
+    const requestId = generationRequestIdRef.current + 1;
+    generationRequestIdRef.current = requestId;
+    setGenerationProgress(0);
+    setIsGenerating(true);
+
+    const payload: SimulationWorkerRequest = {
+      type: "generate",
+      requestId,
+      config: {
+        seed,
+        planet,
+        tectonics,
+        events,
+      },
+      reason,
+    };
+    worker.postMessage(payload);
+  };
   const inspectNodeIndex = useMemo(() => {
     const x = Math.floor(result.width / 2);
     const y = Math.floor(result.height / 2);
@@ -382,11 +480,13 @@ export default function HomePage() {
   const setPlanetField = (patch: Partial<typeof planet>) => {
     setPlanet((prev) => ({ ...prev, ...patch }));
     setReason("global");
+    setIsDirty(true);
   };
 
   const setTectonicsField = (patch: Partial<typeof tectonics>) => {
     setTectonics((prev) => ({ ...prev, ...patch }));
     setReason("tectonics");
+    setIsDirty(true);
   };
 
   const addEventRecord = (event: WorldEvent, summary: string, energy?: number) => {
@@ -399,6 +499,7 @@ export default function HomePage() {
     };
     setEvents((prev) => [...prev, record]);
     setReason("events");
+    setIsDirty(true);
   };
 
   const addMeteor = () => {
@@ -454,6 +555,7 @@ export default function HomePage() {
   const removeEvent = (id: string) => {
     setEvents((prev) => prev.filter((item) => item.id !== id));
     setReason("events");
+    setIsDirty(true);
   };
 
   const download = (mode: "float32" | "int16") => {
@@ -492,15 +594,12 @@ export default function HomePage() {
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button
-              variant="outline"
-              onClick={() => {
-                setSeed((prev) => prev + Math.round(Math.random() * 1000) + 1);
-                setReason("global");
-              }}
-            >
-              <RefreshCw className="mr-2 h-4 w-4" />
-              Регенерация
+            <Button onClick={generateWorld} disabled={isGenerating}>
+              {isGenerating
+                ? `Генерация ${Math.round(generationProgress)}%`
+                : isDirty
+                  ? "Сгенерировать"
+                  : "Пересчитать"}
             </Button>
             <Button onClick={() => download("float32")}>Экспорт 32-bit</Button>
             <Button variant="secondary" onClick={() => download("int16")}>
@@ -548,15 +647,33 @@ export default function HomePage() {
               <CardDescription className="text-slate-300">Слой и проекция настраиваются в правом сайдбаре</CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
-              <PlanetLayerCanvas
-                result={result}
-                layer={deferredDisplayLayer}
-                previewScale={deferredPreviewScale}
-                projection={deferredProjectionMode}
-                centerLongitudeDeg={deferredViewCenterLon}
-                centerLatitudeDeg={viewMode === "globe" ? deferredViewCenterLat : 0}
-                externalCanvasRef={previewCanvasRef}
-              />
+              <div className="relative">
+                <PlanetLayerCanvas
+                  result={result}
+                  layer={deferredDisplayLayer}
+                  previewScale={deferredPreviewScale}
+                  projection={deferredProjectionMode}
+                  centerLongitudeDeg={deferredViewCenterLon}
+                  centerLatitudeDeg={viewMode === "globe" ? deferredViewCenterLat : 0}
+                  externalCanvasRef={previewCanvasRef}
+                />
+                {isGenerating ? (
+                  <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-slate-950/58 backdrop-blur-[1px]">
+                    <div className="w-[min(86%,440px)] rounded-xl border border-white/20 bg-slate-900/90 p-4 shadow-lg">
+                      <div className="mb-2 flex items-center justify-between text-sm">
+                        <span className="text-slate-200">Генерация мира</span>
+                        <span className="font-semibold text-cyan-200">{Math.round(generationProgress)}%</span>
+                      </div>
+                      <div className="h-2 overflow-hidden rounded-full bg-slate-700/70">
+                        <div
+                          className="h-full rounded-full bg-cyan-400 transition-[width] duration-150"
+                          style={{ width: `${clamp(generationProgress, 0, 100)}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
               <div>
                 <p className="text-xs text-slate-400">Легенда</p>
                 {deferredDisplayLayer === "height" ? (

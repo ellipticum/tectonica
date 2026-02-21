@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "wasm:build": "wasm-pack build rust/planet_engine --target bundler --out-dir ../../src/lib/planet-rs/pkg --release"
   },
   "dependencies": {
     "class-variance-authority": "^0.7.1",

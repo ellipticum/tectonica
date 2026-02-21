@@ -179,7 +179,7 @@ export function PlanetLayerCanvas({
   const maxTemp = result.stats.maxTemperature;
   const minPrec = result.stats.minPrecipitation;
   const maxPrec = result.stats.maxPrecipitation;
-  const smoothRadius = previewScale >= 4 ? 0 : 1;
+  const smoothRadius = previewScale >= 1 ? 0 : previewScale >= 0.5 ? 1 : 2;
 
   const basePixels = useMemo(() => {
     const pixels = new Uint8ClampedArray(width * height * 4);
@@ -323,7 +323,7 @@ export function PlanetLayerCanvas({
 
     const sourceWidth = width;
     const sourceHeight = height;
-    const scale = Math.max(1, Math.round(previewScale));
+    const scale = Math.max(0.125, previewScale);
     const supersampledWidth = Math.max(1, Math.round(sourceWidth * scale));
     const supersampledHeight = Math.max(1, Math.round(sourceHeight * scale));
 
@@ -436,6 +436,28 @@ export function PlanetLayerCanvas({
           }
         }
 
+        if (projection !== "orthographic") {
+          const seamBlendPx = 3;
+          for (let py = 0; py < sourceHeight; py++) {
+            for (let k = 0; k < seamBlendPx; k++) {
+              const left = (py * sourceWidth + k) * 4;
+              const right = (py * sourceWidth + (sourceWidth - 1 - k)) * 4;
+              const r = Math.round((projectedPx[left] + projectedPx[right]) * 0.5);
+              const g = Math.round((projectedPx[left + 1] + projectedPx[right + 1]) * 0.5);
+              const b = Math.round((projectedPx[left + 2] + projectedPx[right + 2]) * 0.5);
+              const a = Math.round((projectedPx[left + 3] + projectedPx[right + 3]) * 0.5);
+              projectedPx[left] = r;
+              projectedPx[left + 1] = g;
+              projectedPx[left + 2] = b;
+              projectedPx[left + 3] = a;
+              projectedPx[right] = r;
+              projectedPx[right + 1] = g;
+              projectedPx[right + 2] = b;
+              projectedPx[right + 3] = a;
+            }
+          }
+        }
+
         projectedCtx.putImageData(projected, 0, 0);
         renderCanvas = projectedCanvas;
       }
@@ -447,7 +469,7 @@ export function PlanetLayerCanvas({
 
     const crispHeight = layer === "plates";
     ctx.imageSmoothingEnabled = !crispHeight;
-    ctx.imageSmoothingQuality = scale >= 4 ? "high" : "medium";
+    ctx.imageSmoothingQuality = scale >= 1 ? "high" : "low";
     ctx.drawImage(
       renderCanvas,
       0,
@@ -478,7 +500,7 @@ export function PlanetLayerCanvas({
         style={{
           width: "100%",
           height: "auto",
-          imageRendering: previewScale <= 1 ? "pixelated" : "auto",
+          imageRendering: previewScale < 0.75 ? "pixelated" : "auto",
         }}
       />
     </div>
