@@ -1,26 +1,74 @@
 @import "tailwindcss";
-
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-space-grotesk);
+  --font-mono: var(--font-mono-debug);
+  --color-background: #050816;
+  --color-foreground: #e2e8f0;
+  --color-card: #0f172a;
+  --color-card-foreground: #dbeafe;
+  --color-popover: #0b1120;
+  --color-popover-foreground: #f8fafc;
+  --color-primary: #38bdf8;
+  --color-primary-foreground: #020617;
+  --color-secondary: #22d3ee;
+  --color-secondary-foreground: #022c3c;
+  --color-muted: #1e293b;
+  --color-muted-foreground: #94a3b8;
+  --color-accent: #fb923c;
+  --color-accent-foreground: #1f2937;
+  --color-border: rgba(255, 255, 255, 0.14);
+  --color-ring: #22d3ee;
+  --color-input: rgba(255, 255, 255, 0.15);
+  --color-destructive: #f43f5e;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+html,
+body {
+  @apply min-h-full;
+}
+
+@keyframes drift {
+  from {
+    transform: translateX(-12px);
+  }
+  to {
+    transform: translateX(12px);
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@keyframes aurora {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 100% 50%;
+  }
+}
+
+@layer base {
+  body {
+    @apply relative bg-[#050816] text-foreground antialiased;
+  }
+
+  body::before {
+    content: "";
+    @apply pointer-events-none absolute inset-0 -z-10 opacity-70;
+    background:
+      radial-gradient(50% 40% at 20% 12%, rgba(56, 189, 248, 0.22), transparent),
+      radial-gradient(45% 45% at 80% 90%, rgba(168, 85, 247, 0.18), transparent),
+      linear-gradient(130deg, #020617 0%, #020617 45%, #0a1228 100%);
+    background-size: 220% 220%;
+    animation: aurora 20s linear infinite alternate;
+  }
+
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  .card-enter {
+    animation: drift 0.8s ease both;
+  }
 }
