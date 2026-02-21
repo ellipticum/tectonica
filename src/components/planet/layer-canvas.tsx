@@ -62,10 +62,11 @@ type ColorStop = {
 };
 
 const OCEAN_STOPS: ColorStop[] = [
-  { t: 0, color: [168, 221, 255] },
-  { t: 0.35, color: [102, 170, 230] },
-  { t: 0.7, color: [45, 104, 178] },
-  { t: 1, color: [8, 30, 92] },
+  { t: 0, color: [176, 206, 232] },
+  { t: 0.18, color: [146, 184, 220] },
+  { t: 0.45, color: [95, 145, 198] },
+  { t: 0.72, color: [48, 93, 155] },
+  { t: 1, color: [15, 40, 95] },
 ];
 
 const LAND_STOPS: ColorStop[] = [
@@ -151,7 +152,7 @@ function sampleBilinear(
 
 function heightToRgb(height: number, minHeight: number, maxHeight: number): [number, number, number] {
   if (height < 0) {
-    const depthT = clamp(-height / Math.max(1, -minHeight), 0, 1);
+    const depthT = Math.pow(clamp(-height / Math.max(1, -minHeight), 0, 1), 0.68);
     return sampleStops(OCEAN_STOPS, depthT);
   }
 

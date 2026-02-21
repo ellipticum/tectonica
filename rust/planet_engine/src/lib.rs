@@ -1,7 +1,7 @@
 use js_sys::Array;
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
 
@@ -199,6 +199,8 @@ pub struct SimulationConfig {
     pub planet: PlanetInputs,
     pub tectonics: TectonicInputs,
     pub events: Vec<WorldEventRecord>,
+    #[serde(default)]
+    pub generation_preset: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -206,6 +208,52 @@ enum RecomputeReason {
     Global,
     Tectonics,
     Events,
+}
+
+#[derive(Clone, Copy)]
+enum GenerationPreset {
+    Fast,
+    Balanced,
+    Detailed,
+}
+
+#[derive(Clone, Copy)]
+struct DetailProfile {
+    buoyancy_smooth_passes: usize,
+    erosion_rounds: usize,
+    ocean_smooth_passes: usize,
+    max_kernel_radius: i32,
+}
+
+fn parse_generation_preset(value: Option<&str>) -> GenerationPreset {
+    match value.unwrap_or("balanced") {
+        "fast" => GenerationPreset::Fast,
+        "detailed" => GenerationPreset::Detailed,
+        _ => GenerationPreset::Balanced,
+    }
+}
+
+fn detail_profile(preset: GenerationPreset) -> DetailProfile {
+    match preset {
+        GenerationPreset::Fast => DetailProfile {
+            buoyancy_smooth_passes: 4,
+            erosion_rounds: 1,
+            ocean_smooth_passes: 1,
+            max_kernel_radius: 4,
+        },
+        GenerationPreset::Detailed => DetailProfile {
+            buoyancy_smooth_passes: 14,
+            erosion_rounds: 3,
+            ocean_smooth_passes: 3,
+            max_kernel_radius: 7,
+        },
+        GenerationPreset::Balanced => DetailProfile {
+            buoyancy_smooth_passes: 10,
+            erosion_rounds: 2,
+            ocean_smooth_passes: 2,
+            max_kernel_radius: 6,
+        },
+    }
 }
 
 fn parse_reason(reason: &str) -> RecomputeReason {
@@ -534,6 +582,9 @@ fn compute_plates(
     tectonics: &TectonicInputs,
     seed: u32,
     cache: &WorldCache,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
 ) -> ComputePlatesResult {
     let plate_count = tectonics.plate_count.clamp(2, 20) as usize;
     let mut rng = Rng::new(seed.wrapping_add((plate_count as u32).wrapping_mul(7_919)));
@@ -592,6 +643,7 @@ fn compute_plates(
     ];
 
     for y in 0..WORLD_HEIGHT {
+        progress.phase(progress_base, progress_span, y as f32 / WORLD_HEIGHT as f32);
         for x in 0..WORLD_WIDTH {
             let i = index(x, y);
             let plate_a = plate_field[i] as usize;
@@ -635,6 +687,7 @@ fn compute_plates(
             }
         }
     }
+    progress.phase(progress_base, progress_span, 1.0);
 
     ComputePlatesResult {
         plate_field,
@@ -813,12 +866,203 @@ fn cleanup_coastal_speckles(relief: &mut [f32]) {
     relief.copy_from_slice(&next);
 }
 
+fn apply_ocean_profile(
+    relief: &mut [f32],
+    boundary_types: &[i8],
+    boundary_strength: &[f32],
+    planet: &PlanetInputs,
+    seed: u32,
+    cache: &WorldCache,
+    detail: DetailProfile,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) {
+    let mut distance_to_coast = vec![-1_i32; WORLD_SIZE];
+    let mut queue: VecDeque<usize> = VecDeque::new();
+
+    for y in 0..WORLD_HEIGHT {
+        progress.phase(
+            progress_base,
+            progress_span,
+            0.1 * (y as f32 / WORLD_HEIGHT as f32),
+        );
+        for x in 0..WORLD_WIDTH {
+            let i = index(x, y);
+            if relief[i] >= 0.0 {
+                continue;
+            }
+
+            let mut is_coast_adjacent = false;
+            for oy in -1..=1 {
+                for ox in -1..=1 {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                    if relief[j] >= 0.0 {
+                        is_coast_adjacent = true;
+                        break;
+                    }
+                }
+                if is_coast_adjacent {
+                    break;
+                }
+            }
+
+            if is_coast_adjacent {
+                distance_to_coast[i] = 0;
+                queue.push_back(i);
+            }
+        }
+    }
+
+    const FLOW_STEPS: [(i32, i32); 8] = [
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+        (1, 1),
+        (-1, 1),
+        (1, -1),
+        (-1, -1),
+    ];
+
+    while let Some(i) = queue.pop_front() {
+        let x = i % WORLD_WIDTH;
+        let y = i / WORLD_WIDTH;
+        let next_dist = distance_to_coast[i] + 1;
+
+        for (dx, dy) in FLOW_STEPS {
+            let j = index_spherical(x as i32 + dx, y as i32 + dy);
+            if relief[j] >= 0.0 || distance_to_coast[j] >= 0 {
+                continue;
+            }
+            distance_to_coast[j] = next_dist;
+            queue.push_back(j);
+        }
+    }
+    progress.phase(progress_base, progress_span, 0.2);
+
+    let mut max_distance = 1_i32;
+    for i in 0..WORLD_SIZE {
+        if relief[i] < 0.0 && distance_to_coast[i] > max_distance {
+            max_distance = distance_to_coast[i];
+        }
+    }
+
+    let shelf_cells = clampf(4.8 + (planet.radius_km / 6371.0 - 1.0) * 1.2, 3.8, 8.4);
+    let slope_cells = clampf(15.0 + (planet.ocean_percent - 67.0) * 0.08, 11.0, 23.0);
+    let abyssal_base = clampf(
+        4200.0 + (planet.ocean_percent - 67.0) * 26.0,
+        3600.0,
+        5600.0,
+    );
+
+    for i in 0..WORLD_SIZE {
+        if i % (WORLD_WIDTH * 4) == 0 {
+            progress.phase(
+                progress_base,
+                progress_span,
+                0.2 + 0.55 * (i as f32 / WORLD_SIZE as f32),
+            );
+        }
+        if relief[i] >= 0.0 {
+            continue;
+        }
+
+        let d = distance_to_coast[i].max(0) as f32;
+        let mut target_depth = if d <= shelf_cells {
+            let t = clampf(d / shelf_cells, 0.0, 1.0);
+            -25.0 - 220.0 * t.powf(1.8)
+        } else if d <= shelf_cells + slope_cells {
+            let t = clampf((d - shelf_cells) / slope_cells, 0.0, 1.0);
+            -245.0 - (abyssal_base - 245.0) * t.powf(0.78)
+        } else {
+            let t = clampf(
+                (d - shelf_cells - slope_cells) / (max_distance as f32 + 1.0),
+                0.0,
+                1.0,
+            );
+            -abyssal_base - 1850.0 * t.powf(0.62)
+        };
+
+        let lat = cache.lat_by_y[i];
+        let lon = cache.lon_by_x[i];
+        let basin_weight = clampf(
+            (d - shelf_cells) / (shelf_cells + slope_cells + 1.0),
+            0.0,
+            1.0,
+        );
+        let undulation = (lat * 0.082 + lon * 0.067 + seed as f32 * 0.0012).sin() * 0.6
+            + (lat * 0.041 - lon * 0.109 - seed as f32 * 0.0018).cos() * 0.4;
+        target_depth += undulation * (120.0 + 320.0 * basin_weight);
+
+        let strength = clampf(boundary_strength[i], 0.0, 1.0);
+        target_depth += match boundary_types[i] {
+            1 => -920.0 * strength,
+            2 => 360.0 * strength,
+            3 => -140.0 * strength,
+            _ => 0.0,
+        };
+
+        let blend = 0.74 + 0.21 * basin_weight;
+        relief[i] = clampf(
+            relief[i] * (1.0 - blend) + target_depth * blend,
+            -12000.0,
+            -5.0,
+        );
+    }
+
+    let mut smoothed = relief.to_vec();
+    for pass in 0..detail.ocean_smooth_passes {
+        for y in 0..WORLD_HEIGHT {
+            let pass_t = (pass as f32 + y as f32 / WORLD_HEIGHT as f32)
+                / detail.ocean_smooth_passes.max(1) as f32;
+            progress.phase(progress_base, progress_span, 0.75 + 0.25 * pass_t);
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                if relief[i] >= 0.0 {
+                    continue;
+                }
+                let mut sum = relief[i] * 2.8;
+                let mut wsum = 2.8;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                        if relief[j] >= 0.0 {
+                            continue;
+                        }
+                        let w = if ox == 0 || oy == 0 { 0.5 } else { 0.35 };
+                        sum += relief[j] * w;
+                        wsum += w;
+                    }
+                }
+                smoothed[i] = sum / wsum.max(1e-6);
+            }
+        }
+        for i in 0..WORLD_SIZE {
+            if relief[i] < 0.0 {
+                relief[i] = smoothed[i];
+            }
+        }
+    }
+    progress.phase(progress_base, progress_span, 1.0);
+}
+
 fn compute_relief(
     planet: &PlanetInputs,
     tectonics: &TectonicInputs,
     plates: &ComputePlatesResult,
     seed: u32,
     cache: &WorldCache,
+    detail: DetailProfile,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
 ) -> ReliefResult {
     let mut relief = vec![0.0_f32; WORLD_SIZE];
 
@@ -857,19 +1101,22 @@ fn compute_relief(
         *b = plates.plate_vectors[pid].buoyancy;
     }
     let mut buoyancy_scratch = vec![0.0_f32; WORLD_SIZE];
-    for _ in 0..4 {
+    for pass in 0..detail.buoyancy_smooth_passes {
         for y in 0..WORLD_HEIGHT {
+            let pass_t = (pass as f32 + y as f32 / WORLD_HEIGHT as f32)
+                / detail.buoyancy_smooth_passes.max(1) as f32;
+            progress.phase(progress_base, progress_span, 0.16 * pass_t);
             for x in 0..WORLD_WIDTH {
                 let i = index(x, y);
-                let mut sum = buoyancy_field[i] * 0.42;
-                let mut wsum = 0.42;
+                let mut sum = buoyancy_field[i] * 0.34;
+                let mut wsum = 0.34;
                 for oy in -1..=1 {
                     for ox in -1..=1 {
                         if ox == 0 && oy == 0 {
                             continue;
                         }
                         let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                        let w = if ox == 0 || oy == 0 { 0.1 } else { 0.045 };
+                        let w = if ox == 0 || oy == 0 { 0.125 } else { 0.07 };
                         sum += buoyancy_field[j] * w;
                         wsum += w;
                     }
@@ -881,6 +1128,13 @@ fn compute_relief(
     }
 
     for i in 0..WORLD_SIZE {
+        if i % (WORLD_WIDTH * 4) == 0 {
+            progress.phase(
+                progress_base,
+                progress_span,
+                0.16 + 0.42 * (i as f32 / WORLD_SIZE as f32),
+            );
+        }
         let plate_id = plates.plate_field[i] as usize;
         let plate_speed = plates.plate_vectors[plate_id].speed;
         let heat = plates.plate_vectors[plate_id].heat;
@@ -895,7 +1149,7 @@ fn compute_relief(
         let local_kernel = (base_kernel_radius
             + (plate_speed / 1.8).floor() as i32
             + ((heat / 30.0) * 2.0).floor() as i32)
-            .min(6);
+            .min(detail.max_kernel_radius);
 
         for oy in -local_kernel..=local_kernel {
             for ox in -local_kernel..=local_kernel {
@@ -981,7 +1235,7 @@ fn compute_relief(
         let regional_signal =
             ((lat + lon) * 0.072 + phase_b).sin() * ((lat - lon) * 0.059 + phase_c).cos();
         let crust_mask_raw =
-            continental_signal * 0.95 + regional_signal * 0.45 + plate_buoyancy * 0.55;
+            continental_signal * 0.95 + regional_signal * 0.45 + plate_buoyancy * 0.18;
         let crust_mask = 1.0 / (1.0 + (-crust_mask_raw).exp());
 
         let mut base = 0.0_f32;
@@ -1002,9 +1256,8 @@ fn compute_relief(
         let tectonic_weight = 0.16 + 0.84 * crust_mask;
         base *= tectonic_weight;
 
-        let intraplate_signal =
-            ((lat * 0.083 + lon * 0.064) + plate_id as f32 * 1.77 + phase_a * 0.25).sin()
-                * ((lat * 0.059 - lon * 0.051) + plate_id as f32 * 0.91 + phase_b * 0.3).cos();
+        let intraplate_signal = ((lat * 0.083 + lon * 0.064) + phase_a * 0.25).sin()
+            * ((lat * 0.059 - lon * 0.051) + phase_b * 0.3).cos();
 
         let macro_noise = (lat * macro_a + lon * macro_b + phase_a).sin() * 140.0
             + (lat * (macro_a * 0.55) - lon * macro_c + phase_b).sin() * 90.0
@@ -1012,7 +1265,7 @@ fn compute_relief(
         let continental_base = (crust_mask - 0.5) * 3600.0;
         let macro_base = continental_base
             + intraplate_signal * 260.0
-            + plate_buoyancy * 220.0
+            + plate_buoyancy * 70.0
             + regional_signal * 110.0;
         let noise = (random_seed.next_f32() - 0.5) * 78.0 + macro_noise * 0.45;
         let heat_term = heat * 1.8;
@@ -1024,6 +1277,11 @@ fn compute_relief(
     let macro_radius = 1_i32;
 
     for y in 0..WORLD_HEIGHT {
+        progress.phase(
+            progress_base,
+            progress_span,
+            0.58 + 0.1 * (y as f32 / WORLD_HEIGHT as f32),
+        );
         for x in 0..WORLD_WIDTH {
             let i = index(x, y);
             let mut sum = 0.0_f32;
@@ -1045,12 +1303,15 @@ fn compute_relief(
         relief[i] = relief[i] * 0.82 + macro_blend[i] * 0.18;
     }
 
-    let erosion_rounds = 2;
+    let erosion_rounds = detail.erosion_rounds;
     let mut smoothed = relief.clone();
     let mut scratch = vec![0.0_f32; WORLD_SIZE];
 
-    for _ in 0..erosion_rounds {
+    for round in 0..erosion_rounds {
         for y in 0..WORLD_HEIGHT {
+            let round_t =
+                (round as f32 + y as f32 / WORLD_HEIGHT as f32) / erosion_rounds.max(1) as f32;
+            progress.phase(progress_base, progress_span, 0.68 + 0.16 * round_t);
             for x in 0..WORLD_WIDTH {
                 let i = index(x, y);
                 let mut sum = 0.0_f32;
@@ -1097,11 +1358,25 @@ fn compute_relief(
     }
 
     normalize_height_range(&mut relief, planet, tectonics);
+    progress.phase(progress_base, progress_span, 0.86);
+    apply_ocean_profile(
+        &mut relief,
+        &plates.boundary_types,
+        &plates.boundary_strength,
+        planet,
+        seed,
+        cache,
+        detail,
+        progress,
+        progress_base + progress_span * 0.86,
+        progress_span * 0.1,
+    );
     reshape_ocean_boundaries(
         &mut relief,
         &plates.boundary_types,
         &plates.boundary_strength,
     );
+    progress.phase(progress_base, progress_span, 0.98);
 
     let mut sorted_final = relief.clone();
     sorted_final.sort_by(|a, b| a.total_cmp(b));
@@ -1109,6 +1384,7 @@ fn compute_relief(
     for h in relief.iter_mut() {
         *h -= final_recenter;
     }
+    progress.phase(progress_base, progress_span, 1.0);
 
     ReliefResult { relief, sea_level }
 }
@@ -1241,12 +1517,18 @@ fn apply_events(
     (updated, clampf(aerosol_index, 0.0, 1.0))
 }
 
-fn compute_slope(heights: &[f32]) -> (Vec<f32>, f32, f32) {
+fn compute_slope(
+    heights: &[f32],
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) -> (Vec<f32>, f32, f32) {
     let mut slope = vec![0.0_f32; WORLD_SIZE];
     let mut min_slope = f32::INFINITY;
     let mut max_slope = 0.0_f32;
 
     for y in 0..WORLD_HEIGHT {
+        progress.phase(progress_base, progress_span, y as f32 / WORLD_HEIGHT as f32);
         for x in 0..WORLD_WIDTH {
             let i = index(x, y);
             let h = heights[i];
@@ -1268,15 +1550,27 @@ fn compute_slope(heights: &[f32]) -> (Vec<f32>, f32, f32) {
             max_slope = max_slope.max(max_drop);
         }
     }
+    progress.phase(progress_base, progress_span, 1.0);
 
     (slope, min_slope, max_slope)
 }
 
-fn compute_hydrology(heights: &[f32], slope: &[f32]) -> (Vec<i32>, Vec<f32>, Vec<f32>, Vec<u8>) {
+fn compute_hydrology(
+    heights: &[f32],
+    slope: &[f32],
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) -> (Vec<i32>, Vec<f32>, Vec<f32>, Vec<u8>) {
     let mut flow_direction = vec![-1_i32; WORLD_SIZE];
     let mut flow_accumulation = vec![1.0_f32; WORLD_SIZE];
 
     for y in 0..WORLD_HEIGHT {
+        progress.phase(
+            progress_base,
+            progress_span,
+            0.45 * (y as f32 / WORLD_HEIGHT as f32),
+        );
         for x in 0..WORLD_WIDTH {
             let i = index(x, y);
             let h = heights[i];
@@ -1303,13 +1597,22 @@ fn compute_hydrology(heights: &[f32], slope: &[f32]) -> (Vec<i32>, Vec<f32>, Vec
 
     let mut order: Vec<usize> = (0..WORLD_SIZE).collect();
     order.sort_by(|a, b| heights[*b].total_cmp(&heights[*a]));
+    progress.phase(progress_base, progress_span, 0.48);
 
-    for i in order {
+    for (rank, i) in order.iter().copied().enumerate() {
+        if rank % (WORLD_WIDTH * 4) == 0 {
+            progress.phase(
+                progress_base,
+                progress_span,
+                0.48 + 0.35 * (rank as f32 / WORLD_SIZE as f32),
+            );
+        }
         let to = flow_direction[i];
         if to >= 0 {
             flow_accumulation[to as usize] += flow_accumulation[i] * (1.0 + slope[i] / 1000.0);
         }
     }
+    progress.phase(progress_base, progress_span, 0.83);
 
     let mut sorted = flow_accumulation.clone();
     sorted.sort_by(|a, b| b.total_cmp(a));
@@ -1320,11 +1623,19 @@ fn compute_hydrology(heights: &[f32], slope: &[f32]) -> (Vec<i32>, Vec<f32>, Vec
     let mut lakes = vec![0_u8; WORLD_SIZE];
 
     for i in 0..WORLD_SIZE {
+        if i % (WORLD_WIDTH * 4) == 0 {
+            progress.phase(
+                progress_base,
+                progress_span,
+                0.83 + 0.17 * (i as f32 / WORLD_SIZE as f32),
+            );
+        }
         rivers[i] = flow_accumulation[i] / threshold;
         if flow_direction[i] < 0 && heights[i] < 0.0 && slope[i] < 40.0 {
             lakes[i] = 1;
         }
     }
+    progress.phase(progress_base, progress_span, 1.0);
 
     (flow_direction, flow_accumulation, rivers, lakes)
 }
@@ -1337,6 +1648,9 @@ fn compute_climate(
     flow: &[f32],
     aerosol: f32,
     cache: &WorldCache,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
 ) -> (Vec<f32>, Vec<f32>, f32, f32, f32, f32) {
     let mut temperature = vec![0.0_f32; WORLD_SIZE];
     let mut precipitation = vec![0.0_f32; WORLD_SIZE];
@@ -1349,6 +1663,9 @@ fn compute_climate(
     let mut max_prec = -f32::INFINITY;
 
     for i in 0..WORLD_SIZE {
+        if i % (WORLD_WIDTH * 4) == 0 {
+            progress.phase(progress_base, progress_span, i as f32 / WORLD_SIZE as f32);
+        }
         let lat = cache.lat_by_y[i] * RADIANS;
         let base_insolation = (lat - tilt_rad).cos().max(0.0) * (1.0 + planet.eccentricity * 0.35);
         let elevation_for_temperature = heights[i].max(0.0);
@@ -1375,6 +1692,7 @@ fn compute_climate(
         min_prec = min_prec.min(precip);
         max_prec = max_prec.max(precip);
     }
+    progress.phase(progress_base, progress_span, 1.0);
 
     (
         temperature,
@@ -1611,19 +1929,39 @@ impl WasmSimulationResult {
     }
 }
 
-fn report_progress(progress_callback: Option<&js_sys::Function>, value: f32) -> Result<(), JsValue> {
+fn report_progress(progress_callback: Option<&js_sys::Function>, value: f32) {
     if let Some(cb) = progress_callback {
-        cb.call1(&JsValue::NULL, &JsValue::from_f64(clampf(value, 0.0, 100.0) as f64))
-            .map(|_| ())
-            .map_err(|err| {
-                if err.is_instance_of::<js_sys::Error>() {
-                    err
-                } else {
-                    JsValue::from_str("progress callback failed")
-                }
-            })?;
+        let _ = cb.call1(
+            &JsValue::NULL,
+            &JsValue::from_f64(clampf(value, 0.0, 100.0) as f64),
+        );
     }
-    Ok(())
+}
+
+struct ProgressTap<'a> {
+    callback: Option<&'a js_sys::Function>,
+    last: f32,
+}
+
+impl<'a> ProgressTap<'a> {
+    fn new(callback: Option<&'a js_sys::Function>) -> Self {
+        Self {
+            callback,
+            last: -1.0,
+        }
+    }
+
+    fn emit(&mut self, value: f32) {
+        let v = clampf(value, 0.0, 100.0);
+        if v >= 100.0 || self.last < 0.0 || v - self.last >= 0.08 {
+            report_progress(self.callback, v);
+            self.last = v;
+        }
+    }
+
+    fn phase(&mut self, base: f32, span: f32, t: f32) {
+        self.emit(base + span * clampf(t, 0.0, 1.0));
+    }
 }
 
 fn run_simulation_internal(
@@ -1631,27 +1969,46 @@ fn run_simulation_internal(
     reason: String,
     progress_callback: Option<&js_sys::Function>,
 ) -> Result<WasmSimulationResult, JsValue> {
+    let mut progress = ProgressTap::new(progress_callback);
+    progress.emit(0.0);
     let mut cfg: SimulationConfig = serde_wasm_bindgen::from_value(config)
         .map_err(|e| JsValue::from_str(&format!("config deserialize error: {e}")))?;
-    report_progress(progress_callback, 2.0)?;
+    progress.emit(1.0);
 
     cfg.events = cfg.events.into_iter().map(ensure_event_energy).collect();
 
     let cache = world_cache();
     let recomputed_layers = evaluate_recompute(parse_reason(&reason));
+    let preset = parse_generation_preset(cfg.generation_preset.as_deref());
+    let detail = detail_profile(preset);
 
-    let plates_layer = compute_plates(&cfg.planet, &cfg.tectonics, cfg.seed, cache);
-    report_progress(progress_callback, 22.0)?;
-    let relief_raw = compute_relief(&cfg.planet, &cfg.tectonics, &plates_layer, cfg.seed, cache);
-    report_progress(progress_callback, 52.0)?;
+    let plates_layer = compute_plates(
+        &cfg.planet,
+        &cfg.tectonics,
+        cfg.seed,
+        cache,
+        &mut progress,
+        2.0,
+        22.0,
+    );
+    let relief_raw = compute_relief(
+        &cfg.planet,
+        &cfg.tectonics,
+        &plates_layer,
+        cfg.seed,
+        cache,
+        detail,
+        &mut progress,
+        24.0,
+        50.0,
+    );
+    progress.emit(74.0);
     let (event_relief, aerosol) = apply_events(&cfg.planet, &relief_raw.relief, &cfg.events, cache);
-    report_progress(progress_callback, 58.0)?;
+    progress.emit(78.0);
 
-    let (slope_map, min_slope, max_slope) = compute_slope(&event_relief);
-    report_progress(progress_callback, 66.0)?;
+    let (slope_map, min_slope, max_slope) = compute_slope(&event_relief, &mut progress, 78.0, 8.0);
     let (flow_direction, flow_accumulation, river_map, lake_map) =
-        compute_hydrology(&event_relief, &slope_map);
-    report_progress(progress_callback, 76.0)?;
+        compute_hydrology(&event_relief, &slope_map, &mut progress, 86.0, 7.0);
 
     let (
         temperature_map,
@@ -1668,18 +2025,21 @@ fn run_simulation_internal(
         &flow_accumulation,
         aerosol,
         cache,
+        &mut progress,
+        93.0,
+        5.0,
     );
-    report_progress(progress_callback, 88.0)?;
+    progress.emit(98.0);
 
     let biome_map = compute_biomes(&temperature_map, &precipitation_map, &event_relief);
-    report_progress(progress_callback, 94.0)?;
+    progress.emit(99.0);
     let settlement_map = compute_settlement(
         &biome_map,
         &event_relief,
         &temperature_map,
         &precipitation_map,
     );
-    report_progress(progress_callback, 98.0)?;
+    progress.emit(99.7);
     let (min_height, max_height) = min_max(&event_relief);
     let result = WasmSimulationResult {
         width: WORLD_WIDTH as u32,
@@ -1711,7 +2071,8 @@ fn run_simulation_internal(
         max_slope,
     };
 
-    report_progress(progress_callback, 100.0)?;
+    // Keep progress <100 until JS wrapper and worker finish marshalling + posting result.
+    progress.emit(99.9);
     Ok(result)
 }
 

@@ -174,6 +174,7 @@ export interface SimulationConfig {
   planet: PlanetInputs;
   tectonics: TectonicInputs;
   events: WorldEventRecord[];
+  generationPreset?: "fast" | "balanced" | "detailed";
 }
 
 export interface SimulationStats {
@@ -321,6 +322,7 @@ export const DEFAULT_SIMULATION: SimulationConfig = {
   planet: DEFAULT_PLANET,
   tectonics: DEFAULT_TECTONICS,
   events: [],
+  generationPreset: "balanced",
 };
 
 function randomRange(rng: RNG, min: number, max: number) {

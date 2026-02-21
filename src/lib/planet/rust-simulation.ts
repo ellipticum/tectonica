@@ -26,9 +26,14 @@ export function runSimulationRust(
   onProgress?: (percent: number) => void,
 ): SimulationResult {
   const events = config.events.map((event) => ensureEventEnergy(event as WorldEventRecord));
+  let lastProgress = 0;
   const wasm = onProgress
     ? run_simulation_with_progress({ ...config, events }, reason, (value: number) => {
-        onProgress(Math.max(0, Math.min(100, value)));
+        const clamped = Math.max(0, Math.min(99.9, value));
+        if (clamped >= lastProgress) {
+          lastProgress = clamped;
+          onProgress(clamped);
+        }
       })
     : run_simulation({ ...config, events }, reason);
 

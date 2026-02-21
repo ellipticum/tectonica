@@ -67,6 +67,12 @@ const PREVIEW_PRESETS = [
 ] as const;
 
 type PreviewPresetId = (typeof PREVIEW_PRESETS)[number]["id"];
+const GENERATION_PRESETS = [
+  { id: "fast", label: "Быстро (черновик)" },
+  { id: "balanced", label: "Баланс" },
+  { id: "detailed", label: "Детально" },
+] as const;
+type GenerationPresetId = (typeof GENERATION_PRESETS)[number]["id"];
 type ViewMode = "map" | "globe";
 type FlatProjection = "equirectangular" | "mercator";
 
@@ -106,10 +112,11 @@ type ColorStop = {
 };
 
 const OCEAN_STOPS: ColorStop[] = [
-  { t: 0, color: [168, 221, 255] },
-  { t: 0.35, color: [102, 170, 230] },
-  { t: 0.7, color: [45, 104, 178] },
-  { t: 1, color: [8, 30, 92] },
+  { t: 0, color: [176, 206, 232] },
+  { t: 0.18, color: [146, 184, 220] },
+  { t: 0.45, color: [95, 145, 198] },
+  { t: 0.72, color: [48, 93, 155] },
+  { t: 1, color: [15, 40, 95] },
 ];
 
 const LAND_STOPS: ColorStop[] = [
@@ -150,7 +157,7 @@ const sampleStops = (stops: ColorStop[], t: number) => {
 
 const heightColor = (value: number, min: number, max: number) => {
   if (value < 0 && max > 0) {
-    const t = clamp(-value / Math.max(1, -min), 0, 1);
+    const t = Math.pow(clamp(-value / Math.max(1, -min), 0, 1), 0.68);
     return rgbCss(sampleStops(OCEAN_STOPS, t));
   }
 
@@ -325,6 +332,9 @@ export default function HomePage() {
   const [inspectLayer, setInspectLayer] = useState<LayerId>("relief");
   const [showConstraint, setShowConstraint] = useState(true);
   const [previewMode, setPreviewMode] = useState<PreviewPresetId>("balanced");
+  const [generationPreset, setGenerationPreset] = useState<GenerationPresetId>(
+    (DEFAULT_SIMULATION.generationPreset as GenerationPresetId) ?? "balanced",
+  );
   const [viewMode, setViewMode] = useState<ViewMode>("map");
   const [flatProjection, setFlatProjection] = useState<FlatProjection>("equirectangular");
   const [viewCenterLon, setViewCenterLon] = useState(0);
@@ -356,6 +366,7 @@ export default function HomePage() {
         planet: DEFAULT_PLANET,
         tectonics: DEFAULT_TECTONICS,
         events: [],
+        generationPreset: (DEFAULT_SIMULATION.generationPreset as GenerationPresetId) ?? "balanced",
       },
       "global",
     ),
@@ -363,8 +374,9 @@ export default function HomePage() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [isDirty, setIsDirty] = useState(false);
   const [generationProgress, setGenerationProgress] = useState<number>(0);
+  const [generationError, setGenerationError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const createSimulationWorker = () => {
     const worker = new Worker(new URL("../workers/simulation.worker.ts", import.meta.url), {
       type: "module",
     });
@@ -376,6 +388,7 @@ export default function HomePage() {
       }
 
       if (message.type === "progress") {
+        setGenerationError(null);
         setGenerationProgress(clamp(message.progress, 0, 100));
         return;
       }
@@ -385,21 +398,32 @@ export default function HomePage() {
         setIsDirty(false);
         setGenerationProgress(100);
         setIsGenerating(false);
+        setGenerationError(null);
         return;
       }
 
       setIsGenerating(false);
       setGenerationProgress(0);
+      setGenerationError(message.message || "Ошибка генерации");
       // eslint-disable-next-line no-console
       console.error(message.message);
     };
 
-    worker.onerror = () => {
+    const handleWorkerFailure = () => {
       setIsGenerating(false);
       setGenerationProgress(0);
+      setGenerationError("Ошибка worker во время генерации");
     };
 
+    worker.onerror = handleWorkerFailure;
+    worker.onmessageerror = handleWorkerFailure;
+
     simulationWorkerRef.current = worker;
+    return worker;
+  };
+
+  useEffect(() => {
+    const worker = createSimulationWorker();
     return () => {
       worker.terminate();
       simulationWorkerRef.current = null;
@@ -407,25 +431,42 @@ export default function HomePage() {
   }, []);
 
   const generateWorld = () => {
-    const worker = simulationWorkerRef.current;
-    if (!worker || isGenerating) {
+    if (isGenerating) {
       return;
     }
+
+    let worker = simulationWorkerRef.current;
+    if (!worker) {
+      worker = createSimulationWorker();
+    }
+    if (!worker) {
+      return;
+    }
+
+    const shouldGenerateNewSeed = !isDirty;
+    const nextSeed = shouldGenerateNewSeed ? Math.floor(Math.random() * 2_147_483_647) : seed;
+    if (shouldGenerateNewSeed) {
+      setSeed(nextSeed);
+    }
+
+    const config: SimulationConfig = {
+      seed: nextSeed,
+      planet,
+      tectonics,
+      events,
+      generationPreset,
+    };
 
     const requestId = generationRequestIdRef.current + 1;
     generationRequestIdRef.current = requestId;
     setGenerationProgress(0);
     setIsGenerating(true);
+    setGenerationError(null);
 
     const payload: SimulationWorkerRequest = {
       type: "generate",
       requestId,
-      config: {
-        seed,
-        planet,
-        tectonics,
-        events,
-      },
+      config,
       reason,
     };
     worker.postMessage(payload);
@@ -599,7 +640,7 @@ export default function HomePage() {
                 ? `Генерация ${Math.round(generationProgress)}%`
                 : isDirty
                   ? "Сгенерировать"
-                  : "Пересчитать"}
+                  : "Новый мир"}
             </Button>
             <Button onClick={() => download("float32")}>Экспорт 32-bit</Button>
             <Button variant="secondary" onClick={() => download("int16")}>
@@ -613,6 +654,9 @@ export default function HomePage() {
             </Button>
           </div>
         </div>
+        {generationError ? (
+          <p className="mt-2 text-sm text-rose-300">{generationError}</p>
+        ) : null}
         <Separator className="my-4 bg-white/20" />
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <div>
@@ -734,6 +778,32 @@ export default function HomePage() {
         </section>
 
         <aside className="space-y-4 self-start md:sticky md:top-6 md:order-1">
+          <Card className="border border-white/10 bg-card/80">
+            <CardHeader>
+              <CardTitle className="text-white">Генерация</CardTitle>
+              <CardDescription className="text-slate-300">Параметры качества расчета мира</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-1.5">
+              <Label>Пресет генерации</Label>
+              <Select
+                value={generationPreset}
+                onValueChange={(value) => setGenerationPreset(value as GenerationPresetId)}
+                disabled={isGenerating}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Выберите пресет" />
+                </SelectTrigger>
+                <SelectContent>
+                  {GENERATION_PRESETS.map((item) => (
+                    <SelectItem key={item.id} value={item.id}>
+                      {item.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </CardContent>
+          </Card>
+
           <Tabs defaultValue="planet" className="w-full">
             <TabsList className="grid w-full grid-cols-3">
               <TabsTrigger value="planet" className="gap-2 text-xs">
