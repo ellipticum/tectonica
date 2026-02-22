@@ -437,36 +437,6 @@ export function PlanetLayerCanvas({
           }
         }
 
-        if (projection !== "orthographic") {
-          const seamBlendPx = 4;
-          const seamX =
-            Math.round((((360 - normalizedLon) % 360 + 360) % 360) / 360 * sourceWidth) %
-            sourceWidth;
-
-          for (let py = 0; py < sourceHeight; py++) {
-            for (let k = 0; k < seamBlendPx; k++) {
-              const leftX = (seamX - 1 - k + sourceWidth) % sourceWidth;
-              const rightX = (seamX + k) % sourceWidth;
-              const left = (py * sourceWidth + leftX) * 4;
-              const right = (py * sourceWidth + rightX) * 4;
-
-              const r = Math.round((projectedPx[left] + projectedPx[right]) * 0.5);
-              const g = Math.round((projectedPx[left + 1] + projectedPx[right + 1]) * 0.5);
-              const b = Math.round((projectedPx[left + 2] + projectedPx[right + 2]) * 0.5);
-              const a = Math.round((projectedPx[left + 3] + projectedPx[right + 3]) * 0.5);
-
-              projectedPx[left] = r;
-              projectedPx[left + 1] = g;
-              projectedPx[left + 2] = b;
-              projectedPx[left + 3] = a;
-              projectedPx[right] = r;
-              projectedPx[right + 1] = g;
-              projectedPx[right + 2] = b;
-              projectedPx[right + 3] = a;
-            }
-          }
-        }
-
         projectedCtx.putImageData(projected, 0, 0);
         renderCanvas = projectedCanvas;
       }
