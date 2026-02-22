@@ -45,3 +45,6 @@ rust/**/target/
 rust/**/Cargo.lock
 src/lib/planet-rs/pkg/*
 !src/lib/planet-rs/pkg/.gitignore
+
+# generated worlds
+generations/

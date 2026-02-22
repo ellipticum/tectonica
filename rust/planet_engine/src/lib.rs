@@ -42,6 +42,20 @@ fn clampf(value: f32, min: f32, max: f32) -> f32 {
 }
 
 #[inline]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    if (edge1 - edge0).abs() < 1e-6 {
+        return if x < edge0 { 0.0 } else { 1.0 };
+    }
+    let t = clampf((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[inline]
+fn ridge(value: f32) -> f32 {
+    (1.0 - value.abs()).max(0.0)
+}
+
+#[inline]
 fn index(x: usize, y: usize) -> usize {
     y * WORLD_WIDTH + x
 }
@@ -224,6 +238,8 @@ struct DetailProfile {
     erosion_rounds: usize,
     ocean_smooth_passes: usize,
     max_kernel_radius: i32,
+    fault_iterations: usize,
+    fault_smooth_passes: usize,
 }
 
 fn parse_generation_preset(value: Option<&str>) -> GenerationPreset {
@@ -242,24 +258,32 @@ fn detail_profile(preset: GenerationPreset) -> DetailProfile {
             erosion_rounds: 0,
             ocean_smooth_passes: 0,
             max_kernel_radius: 3,
+            fault_iterations: 900,
+            fault_smooth_passes: 1,
         },
         GenerationPreset::Fast => DetailProfile {
-            buoyancy_smooth_passes: 4,
+            buoyancy_smooth_passes: 8,
             erosion_rounds: 1,
             ocean_smooth_passes: 1,
             max_kernel_radius: 4,
+            fault_iterations: 1800,
+            fault_smooth_passes: 1,
         },
         GenerationPreset::Detailed => DetailProfile {
-            buoyancy_smooth_passes: 14,
+            buoyancy_smooth_passes: 24,
             erosion_rounds: 3,
             ocean_smooth_passes: 3,
             max_kernel_radius: 7,
+            fault_iterations: 5200,
+            fault_smooth_passes: 3,
         },
         GenerationPreset::Balanced => DetailProfile {
-            buoyancy_smooth_passes: 10,
+            buoyancy_smooth_passes: 18,
             erosion_rounds: 2,
             ocean_smooth_passes: 2,
             max_kernel_radius: 6,
+            fault_iterations: 3600,
+            fault_smooth_passes: 2,
         },
     }
 }
@@ -714,6 +738,150 @@ fn compute_plates(
     }
 }
 
+fn build_fault_backbone(
+    seed: u32,
+    iterations: usize,
+    smooth_passes: usize,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) -> Vec<f32> {
+    let width = WORLD_WIDTH;
+    let height = WORLD_HEIGHT;
+    let width_i32 = width as i32;
+    let height_i32 = height as i32;
+    let x_half = width / 2;
+
+    // Column-major storage (x-major) to match classic worldgen fault accumulation.
+    let mut fault_col = vec![f32::NAN; WORLD_SIZE];
+    for x in 0..width {
+        fault_col[x * height] = 0.0;
+    }
+
+    let mut sin_iter_phi = vec![0.0_f32; width * 2];
+    let step = 2.0 * std::f32::consts::PI / width as f32;
+    for i in 0..width {
+        let s = (i as f32 * step).sin();
+        sin_iter_phi[i] = s;
+        sin_iter_phi[i + width] = s;
+    }
+
+    let mut rng = Rng::new(seed ^ 0xA341_316C);
+    let y_div2 = height as f32 * 0.5;
+    let y_div_pi = height as f32 / std::f32::consts::PI;
+
+    let fault_iterations = iterations.max(1);
+    for iter in 0..fault_iterations {
+        if iter % 24 == 0 {
+            let t = iter as f32 / fault_iterations as f32;
+            progress.phase(progress_base, progress_span, 0.8 * t);
+        }
+
+        let flag_negative = rng.next_f32() < 0.5;
+        let alpha = (rng.next_f32() - 0.5) * std::f32::consts::PI;
+        let beta = (rng.next_f32() - 0.5) * std::f32::consts::PI;
+        let cos_term = clampf(alpha.cos() * beta.cos(), -1.0, 1.0);
+        let tan_b = cos_term.acos().tan();
+        let xsi = (width as f32 * 0.5 - (width as f32 / std::f32::consts::PI) * beta).round() as i32;
+
+        for phi in 0..x_half {
+            let sin_idx = (xsi - phi as i32 + width_i32).clamp(0, (2 * width - 1) as i32) as usize;
+            let theta = (y_div_pi * (sin_iter_phi[sin_idx] * tan_b).atan() + y_div2).round() as i32;
+            let y = theta.clamp(0, height_i32 - 1) as usize;
+            let idx = phi * height + y;
+            let delta = if flag_negative { -1.0 } else { 1.0 };
+            if fault_col[idx].is_nan() {
+                fault_col[idx] = delta;
+            } else {
+                fault_col[idx] += delta;
+            }
+        }
+    }
+    progress.phase(progress_base, progress_span, 0.82);
+
+    // Mirror the second hemisphere from the first (same trick as classic algorithm).
+    let offset = x_half * height;
+    for x in 0..x_half {
+        let row = x * height;
+        for y in 1..height {
+            fault_col[row + offset + (height - y)] = fault_col[row + y];
+        }
+    }
+
+    // Integrate step-lines into signed relief profile for each longitude.
+    for x in 0..width {
+        let row = x * height;
+        let mut acc = if fault_col[row].is_nan() {
+            0.0
+        } else {
+            fault_col[row]
+        };
+        fault_col[row] = acc;
+        for y in 1..height {
+            let cur = fault_col[row + y];
+            if !cur.is_nan() {
+                acc += cur;
+            }
+            fault_col[row + y] = acc;
+        }
+    }
+
+    let mut min_v = f32::INFINITY;
+    let mut max_v = -f32::INFINITY;
+    for &v in fault_col.iter() {
+        if v.is_nan() {
+            continue;
+        }
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+    }
+    let mid = (min_v + max_v) * 0.5;
+    let half_span = ((max_v - min_v) * 0.5).max(1e-4);
+
+    let mut field = vec![0.0_f32; WORLD_SIZE];
+    for y in 0..height {
+        for x in 0..width {
+            let v = fault_col[x * height + y];
+            let n = clampf((v - mid) / half_span, -1.0, 1.0);
+            field[index(x, y)] = n;
+        }
+    }
+    progress.phase(progress_base, progress_span, 0.9);
+
+    if smooth_passes == 0 {
+        progress.phase(progress_base, progress_span, 1.0);
+        return field;
+    }
+
+    let mut scratch = field.clone();
+    for pass in 0..smooth_passes {
+        for y in 0..WORLD_HEIGHT {
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                let mut sum = field[i] * 0.46;
+                let mut wsum = 0.46;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                        let w = if ox == 0 || oy == 0 { 0.1 } else { 0.065 };
+                        sum += field[j] * w;
+                        wsum += w;
+                    }
+                }
+                scratch[i] = sum / wsum.max(1e-6);
+            }
+        }
+        field.copy_from_slice(&scratch);
+        let t = (pass as f32 + 1.0) / smooth_passes as f32;
+        progress.phase(progress_base, progress_span, 0.9 + 0.1 * t);
+    }
+
+    field
+}
+
 fn normalize_height_range(relief: &mut [f32], planet: &PlanetInputs, tectonics: &TectonicInputs) {
     let mut land_heights: Vec<f32> = Vec::new();
     let mut ocean_depths: Vec<f32> = Vec::new();
@@ -777,20 +945,58 @@ fn reshape_ocean_boundaries(relief: &mut [f32], boundary_types: &[i8], boundary_
         if relief[i] >= 0.0 {
             continue;
         }
-        let t = boundary_types[i];
-        if t == 0 {
+
+        let x = i % WORLD_WIDTH;
+        let y = i / WORLD_WIDTH;
+        let mut conv = 0.0_f32;
+        let mut div = 0.0_f32;
+        let mut transform = 0.0_f32;
+        let mut wsum = 0.0_f32;
+        for oy in -1..=1 {
+            for ox in -1..=1 {
+                let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                let t = boundary_types[j];
+                if t == 0 {
+                    continue;
+                }
+                let s = clampf(boundary_strength[j], 0.0, 1.0);
+                let w = if ox == 0 && oy == 0 {
+                    1.0
+                } else if ox == 0 || oy == 0 {
+                    0.62
+                } else {
+                    0.44
+                };
+                let value = s * w;
+                if t == 1 {
+                    conv += value;
+                } else if t == 2 {
+                    div += value;
+                } else if t == 3 {
+                    transform += value;
+                }
+                wsum += w;
+            }
+        }
+        if wsum < 1e-4 {
             continue;
         }
+        conv /= wsum;
+        div /= wsum;
+        transform /= wsum;
 
         let depth_t = clampf(-relief[i] / depth_scale, 0.0, 1.0);
-        let strength = clampf(boundary_strength[i], 0.0, 1.0);
 
-        if t == 2 {
-            let uplift = (180.0 + 900.0 * strength) * (0.7 + 0.3 * (1.0 - depth_t));
+        if div > 0.03 {
+            let uplift = (140.0 + 820.0 * div) * (0.7 + 0.3 * (1.0 - depth_t));
             relief[i] = (relief[i] + uplift).min(-15.0);
-        } else if t == 3 {
-            let uplift = (40.0 + 180.0 * strength) * (0.65 + 0.35 * (1.0 - depth_t));
+        } else if transform > 0.03 {
+            let uplift = (30.0 + 160.0 * transform) * (0.65 + 0.35 * (1.0 - depth_t));
             relief[i] += uplift;
+        }
+        if conv > 0.03 {
+            let trench = (110.0 + 610.0 * conv) * (0.58 + 0.42 * depth_t);
+            relief[i] -= trench;
         }
     }
 
@@ -886,6 +1092,100 @@ fn cleanup_coastal_speckles(relief: &mut [f32]) {
     }
 
     relief.copy_from_slice(&next);
+}
+
+fn defuse_plate_linearity(
+    relief: &mut [f32],
+    plates: &ComputePlatesResult,
+    seed: u32,
+    cache: &WorldCache,
+    detail: DetailProfile,
+) {
+    let strength_scale = if detail.buoyancy_smooth_passes >= 20 {
+        1.0
+    } else if detail.buoyancy_smooth_passes >= 12 {
+        0.85
+    } else {
+        0.65
+    };
+
+    let mut imprint = vec![0.0_f32; WORLD_SIZE];
+    for i in 0..WORLD_SIZE {
+        if relief[i] < -1600.0 {
+            continue;
+        }
+        let base = clampf(plates.boundary_strength[i], 0.0, 1.0);
+        let k = match plates.boundary_types[i] {
+            1 => 1.0,
+            2 => 0.78,
+            3 => 0.58,
+            _ => 0.0,
+        };
+        imprint[i] = base * k;
+    }
+
+    let mut imprint_next = imprint.clone();
+    for _ in 0..3 {
+        for y in 0..WORLD_HEIGHT {
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                let mut sum = imprint[i] * 0.5;
+                let mut wsum = 0.5;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                        let w = if ox == 0 || oy == 0 { 0.11 } else { 0.07 };
+                        sum += imprint[j] * w;
+                        wsum += w;
+                    }
+                }
+                imprint_next[i] = sum / wsum.max(1e-6);
+            }
+        }
+        imprint.copy_from_slice(&imprint_next);
+    }
+
+    let mut softened = relief.to_vec();
+    let seed_phase = seed as f32 * 0.0017;
+    for y in 0..WORLD_HEIGHT {
+        for x in 0..WORLD_WIDTH {
+            let i = index(x, y);
+            let mask = clampf(imprint[i] * strength_scale, 0.0, 1.0);
+            if mask < 0.08 || relief[i] < -900.0 {
+                continue;
+            }
+
+            let mut sum = relief[i] * 0.42;
+            let mut wsum = 0.42;
+            for oy in -1..=1 {
+                for ox in -1..=1 {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                    let w = if ox == 0 || oy == 0 { 0.1 } else { 0.065 };
+                    sum += relief[j] * w;
+                    wsum += w;
+                }
+            }
+            let avg = sum / wsum.max(1e-6);
+            let sx = cache.x_by_cell[i];
+            let sy = cache.y_by_cell[i];
+            let sz = cache.z_by_cell[i];
+            let depth_softener = smoothstep(-900.0, 120.0, relief[i]);
+            let perturb = ((sx * 12.1 + sy * 9.4 + sz * 8.3 + seed_phase).sin() * 0.58
+                + (sy * 13.4 - sz * 7.8 + sx * 6.1 - seed_phase * 1.4).cos() * 0.42)
+                * (14.0 + 74.0 * mask)
+                * depth_softener;
+            let mix = clampf(0.12 + 0.54 * mask, 0.0, 0.8) * depth_softener;
+            softened[i] = relief[i] * (1.0 - mix) + (avg + perturb) * mix;
+        }
+    }
+
+    relief.copy_from_slice(&softened);
 }
 
 fn apply_ocean_profile(
@@ -994,41 +1294,90 @@ fn apply_ocean_profile(
         }
 
         let d = distance_to_coast[i].max(0) as f32;
-        let mut target_depth = if d <= shelf_cells {
-            let t = clampf(d / shelf_cells, 0.0, 1.0);
-            -25.0 - 220.0 * t.powf(1.8)
-        } else if d <= shelf_cells + slope_cells {
-            let t = clampf((d - shelf_cells) / slope_cells, 0.0, 1.0);
+        let sx = cache.x_by_cell[i];
+        let sy = cache.y_by_cell[i];
+        let sz = cache.z_by_cell[i];
+        let seed_phase = seed as f32 * 0.0012;
+        let margin_signal = 0.5
+            + 0.5
+                * ((sx * 6.2 + sy * 5.1 + sz * 4.3 + seed_phase).sin() * 0.62
+                    + (sy * 7.4 - sz * 4.9 + sx * 3.8 - seed_phase * 1.1).cos() * 0.38);
+        let regime_bias = match boundary_types[i] {
+            1 => -0.28, // active convergent margins -> narrower shelf
+            2 => 0.22,  // passive/divergent margins -> wider shelf
+            3 => -0.08,
+            _ => 0.0,
+        };
+        let local_shelf =
+            shelf_cells * clampf(0.46 + 1.12 * margin_signal + regime_bias, 0.26, 2.35);
+        let local_slope = slope_cells
+            * clampf(
+                0.62 + 0.95 * (1.0 - margin_signal) - regime_bias * 0.35,
+                0.42,
+                1.95,
+            );
+        let shore_depth = -12.0 - 96.0 * clampf(margin_signal + regime_bias * 0.35, 0.0, 1.0);
+        let mut target_depth = if d <= local_shelf {
+            let t = clampf(d / local_shelf.max(0.5), 0.0, 1.0);
+            shore_depth - (170.0 + 190.0 * margin_signal) * t.powf(1.55)
+        } else if d <= local_shelf + local_slope {
+            let t = clampf((d - local_shelf) / local_slope.max(0.8), 0.0, 1.0);
             -245.0 - (abyssal_base - 245.0) * t.powf(0.78)
         } else {
             let t = clampf(
-                (d - shelf_cells - slope_cells) / (max_distance as f32 + 1.0),
+                (d - local_shelf - local_slope) / (max_distance as f32 + 1.0),
                 0.0,
                 1.0,
             );
             -abyssal_base - 1850.0 * t.powf(0.62)
         };
-
-        let sx = cache.x_by_cell[i];
-        let sy = cache.y_by_cell[i];
-        let sz = cache.z_by_cell[i];
         let basin_weight = clampf(
-            (d - shelf_cells) / (shelf_cells + slope_cells + 1.0),
+            (d - local_shelf) / (local_shelf + local_slope + 1.0),
             0.0,
             1.0,
         );
-        let seed_phase = seed as f32 * 0.0012;
         let undulation = (sx * 7.2 + sy * 5.3 + sz * 4.1 + seed_phase).sin() * 0.6
             + (sy * 8.6 - sz * 4.9 + sx * 3.7 - seed_phase * 1.35).cos() * 0.4;
         target_depth += undulation * (120.0 + 320.0 * basin_weight);
 
-        let strength = clampf(boundary_strength[i], 0.0, 1.0);
-        target_depth += match boundary_types[i] {
-            1 => -920.0 * strength,
-            2 => 360.0 * strength,
-            3 => -140.0 * strength,
-            _ => 0.0,
-        };
+        let x = i % WORLD_WIDTH;
+        let y = i / WORLD_WIDTH;
+        let mut conv = 0.0_f32;
+        let mut div = 0.0_f32;
+        let mut transform = 0.0_f32;
+        let mut wsum = 0.0_f32;
+        for oy in -1..=1 {
+            for ox in -1..=1 {
+                let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                let t = boundary_types[j];
+                if t == 0 {
+                    continue;
+                }
+                let s = clampf(boundary_strength[j], 0.0, 1.0);
+                let w = if ox == 0 && oy == 0 {
+                    1.0
+                } else if ox == 0 || oy == 0 {
+                    0.58
+                } else {
+                    0.4
+                };
+                let value = s * w;
+                if t == 1 {
+                    conv += value;
+                } else if t == 2 {
+                    div += value;
+                } else if t == 3 {
+                    transform += value;
+                }
+                wsum += w;
+            }
+        }
+        if wsum > 1e-4 {
+            conv /= wsum;
+            div /= wsum;
+            transform /= wsum;
+            target_depth += -760.0 * conv + 300.0 * div - 120.0 * transform;
+        }
 
         let blend = 0.74 + 0.21 * basin_weight;
         relief[i] = clampf(
@@ -1117,6 +1466,14 @@ fn compute_relief(
     let k_relief = 560.0_f32;
     let max_boundary_score = (tectonics.plate_speed_cm_per_year * 2.5).max(1.0);
     let base_kernel_radius = 3_i32;
+    let fault_backbone = build_fault_backbone(
+        seed_mix,
+        detail.fault_iterations,
+        detail.fault_smooth_passes,
+        progress,
+        progress_base,
+        progress_span * 0.14,
+    );
 
     // Smooth per-plate buoyancy so continent/ocean macro-shape is not cut by hard plate polygons.
     let mut buoyancy_field = vec![0.0_f32; WORLD_SIZE];
@@ -1129,7 +1486,7 @@ fn compute_relief(
         for y in 0..WORLD_HEIGHT {
             let pass_t = (pass as f32 + y as f32 / WORLD_HEIGHT as f32)
                 / detail.buoyancy_smooth_passes.max(1) as f32;
-            progress.phase(progress_base, progress_span, 0.16 * pass_t);
+            progress.phase(progress_base, progress_span, 0.14 + 0.12 * pass_t);
             for x in 0..WORLD_WIDTH {
                 let i = index(x, y);
                 let mut sum = buoyancy_field[i] * 0.34;
@@ -1156,7 +1513,7 @@ fn compute_relief(
             progress.phase(
                 progress_base,
                 progress_span,
-                0.16 + 0.42 * (i as f32 / WORLD_SIZE as f32),
+                0.26 + 0.34 * (i as f32 / WORLD_SIZE as f32),
             );
         }
         let plate_id = plates.plate_field[i] as usize;
@@ -1239,19 +1596,46 @@ fn compute_relief(
         let sx = cache.x_by_cell[i];
         let sy = cache.y_by_cell[i];
         let sz = cache.z_by_cell[i];
-        let warp_x = sx + 0.34 * (sy * 4.6 + phase_a).sin() + 0.21 * (sz * 5.1 + phase_b).cos();
-        let warp_y = sy + 0.31 * (sz * 4.2 - phase_b).sin() + 0.18 * (sx * 5.4 + phase_c).cos();
-        let warp_z = sz + 0.27 * (sx * 4.9 + phase_c).sin() + 0.16 * (sy * 5.8 - phase_a).cos();
+        let warp_x = sx + 0.38 * (sy * 3.8 + phase_a).sin() + 0.24 * (sz * 4.6 + phase_b).cos();
+        let warp_y = sy + 0.34 * (sz * 3.4 - phase_b).sin() + 0.22 * (sx * 4.8 + phase_c).cos();
+        let warp_z = sz + 0.29 * (sx * 4.2 + phase_c).sin() + 0.2 * (sy * 5.1 - phase_a).cos();
 
-        let continental_signal = (warp_x * 2.6 + warp_y * 2.1 + phase_a).sin() * 0.92
-            + (warp_y * 3.4 - warp_z * 1.8 + phase_b).cos() * 0.78
-            + ((warp_x + warp_z * 0.7) * 3.9 + phase_c).sin() * 0.58
-            + ((warp_y - warp_x * 0.45) * 4.3 + phase_a * 0.65).cos() * 0.38;
-        let regional_signal = (warp_x * 4.2 + warp_y * 3.5 + warp_z * 2.8 + phase_b).sin()
-            * (warp_y * 2.4 - warp_z * 4.1 + warp_x * 1.7 + phase_c).cos();
-        let crust_mask_raw =
-            continental_signal * 0.95 + regional_signal * 0.45 + plate_buoyancy * 0.18;
-        let crust_mask = 1.0 / (1.0 + (-crust_mask_raw).exp());
+        let warp2_x = warp_x
+            + 0.21 * (warp_y * 5.4 + phase_b * 0.7).sin()
+            + 0.13 * (warp_z * 6.0 - phase_c * 0.5).cos();
+        let warp2_y = warp_y
+            + 0.2 * (warp_z * 5.1 - phase_c * 0.8).sin()
+            + 0.12 * (warp_x * 6.3 + phase_a * 0.4).cos();
+        let warp2_z = warp_z
+            + 0.18 * (warp_x * 4.9 + phase_a * 0.6).sin()
+            + 0.1 * (warp_y * 6.6 - phase_b * 0.45).cos();
+
+        let macro_continent = (warp2_x * 2.25 + warp2_y * 1.95 + phase_a).sin() * 0.94
+            + (warp2_y * 2.85 - warp2_z * 1.55 + phase_b).cos() * 0.74
+            + ((warp2_x + warp2_z * 0.64) * 3.35 + phase_c).sin() * 0.56
+            + ((warp2_y - warp2_x * 0.42) * 3.9 + phase_a * 0.62).cos() * 0.34;
+        let regional_signal = (warp2_x * 4.1 + warp2_y * 3.3 + warp2_z * 2.5 + phase_b).sin()
+            * (warp2_y * 2.3 - warp2_z * 4.0 + warp2_x * 1.6 + phase_c).cos();
+        let ridge_axis = (warp2_x * 6.2 - warp2_y * 5.3 + warp2_z * 4.4 + phase_c).sin() * 0.57
+            + (warp2_y * 6.9 + warp2_z * 5.8 - warp2_x * 4.1 - phase_a).cos() * 0.43;
+        let ridge_signal = ridge(ridge_axis).powf(1.42);
+        let coastline_micro = (warp2_x * 11.7 + warp2_y * 10.9 + warp2_z * 8.6 + phase_a).sin()
+            * 0.56
+            + (warp2_y * 12.8 - warp2_z * 9.1 + warp2_x * 7.4 - phase_b).cos() * 0.44;
+        let fault_signal = fault_backbone[i];
+        let coastal_focus = clampf(
+            1.0 - (fault_signal * 0.72 + macro_continent * 0.22 + regional_signal * 0.18).abs() * 0.9,
+            0.0,
+            1.0,
+        )
+        .powf(1.35);
+        let continental_raw = fault_signal * 1.32
+            + macro_continent * 0.34
+            + regional_signal * 0.24
+            + ridge_signal * 0.18
+            + coastline_micro * (0.18 + 0.24 * coastal_focus) * coastal_focus
+            + plate_buoyancy * 0.02;
+        let crust_mask = smoothstep(-0.75, 0.78, continental_raw);
 
         let mut base = 0.0_f32;
         if conv_influence > 0.03 {
@@ -1267,24 +1651,31 @@ fn compute_relief(
         if transform_influence > 0.03 {
             base += 18.0 * (plate_speed - 1.0) * transform_influence.atan();
         }
-
-        let tectonic_weight = 0.16 + 0.84 * crust_mask;
+        base *= 0.52;
+        let mid_crust = 1.0 - (crust_mask - 0.5).abs() * 1.8;
+        let tectonic_weight = 0.16 + 0.42 * clampf(mid_crust, 0.0, 1.0);
         base *= tectonic_weight;
 
-        let intraplate_signal = (warp_x * 7.1 + warp_y * 6.6 + phase_a * 0.25).sin()
-            * (warp_y * 6.9 - warp_z * 5.5 + phase_b * 0.3).cos();
+        let intraplate_signal = (warp2_x * 7.1 + warp2_y * 6.4 + phase_a * 0.23).sin()
+            * (warp2_y * 6.7 - warp2_z * 5.3 + phase_b * 0.28).cos();
 
-        let macro_noise = (sx * (4.8 + macro_a * 38.0) + sy * (3.6 + macro_b * 34.0) + phase_a)
+        let macro_noise = (sx * (5.0 + macro_a * 34.0) + sy * (3.8 + macro_b * 31.0) + phase_a)
             .sin()
-            * 140.0
-            + (sy * (4.1 + macro_c * 30.0) - sz * (3.2 + macro_a * 26.0) + phase_b).sin() * 90.0
-            + (sz * (4.7 + macro_b * 22.0) + sx * (2.9 + macro_c * 18.0) + phase_c).cos() * 70.0;
-        let continental_base = (crust_mask - 0.5) * 3600.0;
+            * 130.0
+            + (sy * (4.2 + macro_c * 27.0) - sz * (3.3 + macro_a * 23.0) + phase_b).sin() * 88.0
+            + (sz * (4.6 + macro_b * 20.0) + sx * (3.1 + macro_c * 16.0) + phase_c).cos() * 64.0;
+        let continental_base = (crust_mask - 0.5) * 4700.0;
+        let coast_transition = clampf(1.0 - (crust_mask - 0.5).abs() * 2.1, 0.0, 1.0).powf(1.4);
+        let ocean_basin = (1.0 - crust_mask).powf(1.18)
+            * ((warp2_x * 3.3 - warp2_y * 2.4 + warp2_z * 2.1 + phase_b).sin() * 280.0
+                + (warp2_y * 3.1 + warp2_z * 2.8 - warp2_x * 1.9 - phase_c).cos() * 210.0);
         let macro_base = continental_base
-            + intraplate_signal * 260.0
-            + plate_buoyancy * 70.0
-            + regional_signal * 110.0;
-        let noise = (random_seed.next_f32() - 0.5) * 78.0 + macro_noise * 0.45;
+            + intraplate_signal * 225.0
+            + plate_buoyancy * 35.0
+            + regional_signal * 105.0
+            + coastline_micro * 170.0 * coast_transition
+            + ocean_basin;
+        let noise = (random_seed.next_f32() - 0.5) * 36.0 + macro_noise * 0.5;
         let heat_term = heat * 1.8;
 
         relief[i] = base + macro_base + noise + heat_term;
@@ -1297,7 +1688,7 @@ fn compute_relief(
         progress.phase(
             progress_base,
             progress_span,
-            0.58 + 0.1 * (y as f32 / WORLD_HEIGHT as f32),
+            0.6 + 0.1 * (y as f32 / WORLD_HEIGHT as f32),
         );
         for x in 0..WORLD_WIDTH {
             let i = index(x, y);
@@ -1328,7 +1719,7 @@ fn compute_relief(
         for y in 0..WORLD_HEIGHT {
             let round_t =
                 (round as f32 + y as f32 / WORLD_HEIGHT as f32) / erosion_rounds.max(1) as f32;
-            progress.phase(progress_base, progress_span, 0.68 + 0.16 * round_t);
+            progress.phase(progress_base, progress_span, 0.72 + 0.14 * round_t);
             for x in 0..WORLD_WIDTH {
                 let i = index(x, y);
                 let mut sum = 0.0_f32;
@@ -1365,6 +1756,7 @@ fn compute_relief(
     }
 
     apply_coastal_detail(&mut relief, seed, cache);
+    defuse_plate_linearity(&mut relief, plates, seed, cache, detail);
     cleanup_coastal_speckles(&mut relief);
 
     let mut sorted_after_coast = relief.clone();
