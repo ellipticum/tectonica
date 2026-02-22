@@ -446,7 +446,6 @@ struct PlateVector {
 struct ComputePlatesResult {
     plate_field: Vec<i16>,
     boundary_types: Vec<i8>,
-    boundary_scores: Vec<f32>,
     boundary_normal_x: Vec<f32>,
     boundary_normal_y: Vec<f32>,
     boundary_strength: Vec<f32>,
@@ -757,7 +756,6 @@ fn compute_plates(
         .collect();
 
     let mut boundary_types = vec![0_i8; WORLD_SIZE];
-    let mut boundary_scores = vec![0.0_f32; WORLD_SIZE];
     let mut boundary_normal_x = vec![0.0_f32; WORLD_SIZE];
     let mut boundary_normal_y = vec![0.0_f32; WORLD_SIZE];
     let mut boundary_strength = vec![0.0_f32; WORLD_SIZE];
@@ -803,7 +801,6 @@ fn compute_plates(
                 }
             }
 
-            boundary_scores[i] = score;
             boundary_normal_x[i] = normal_x;
             boundary_normal_y[i] = normal_y;
             boundary_strength[i] = clampf(score.abs() / boundary_scale, 0.0, 1.0);
@@ -824,7 +821,6 @@ fn compute_plates(
     ComputePlatesResult {
         plate_field,
         boundary_types,
-        boundary_scores,
         boundary_normal_x,
         boundary_normal_y,
         boundary_strength,
@@ -2349,8 +2345,6 @@ fn compute_relief(
         ^ (seed.wrapping_mul(2_654_435_761) as i32)) as u32;
     let mut random_seed = Rng::new(seed_mix);
     let k_relief = 560.0_f32;
-    let max_boundary_score = (tectonics.plate_speed_cm_per_year * 2.5).max(1.0);
-    let base_kernel_radius = 3_i32;
     let fault_backbone = build_fault_backbone(
         seed_mix,
         detail.fault_iterations,
@@ -2402,102 +2396,429 @@ fn compute_relief(
         (detail.buoyancy_smooth_passes / 4).clamp(1, 4),
     );
 
+    let mut heat_norm_field = vec![0.0_f32; WORLD_SIZE];
+    let mut weakness_field = vec![0.0_f32; WORLD_SIZE];
+    let mut strength_field = vec![0.0_f32; WORLD_SIZE];
+    let mut comp_source = vec![0.0_f32; WORLD_SIZE];
+    let mut ext_source = vec![0.0_f32; WORLD_SIZE];
+    let mut shear_source = vec![0.0_f32; WORLD_SIZE];
+    let mut velocity_x = vec![0.0_f32; WORLD_SIZE];
+    let mut velocity_y = vec![0.0_f32; WORLD_SIZE];
+
     for i in 0..WORLD_SIZE {
         if i % (WORLD_WIDTH * 4) == 0 {
             progress.phase(
                 progress_base,
                 progress_span,
-                0.24 + 0.36 * (i as f32 / WORLD_SIZE as f32),
+                0.24 + 0.08 * (i as f32 / WORLD_SIZE as f32),
+            );
+        }
+        let plate_id = plates.plate_field[i] as usize;
+        let heat = plates.plate_vectors[plate_id].heat;
+        let heat_norm = clampf(heat / tectonics.mantle_heat.max(1.0), 0.2, 2.3);
+        heat_norm_field[i] = heat_norm;
+
+        let sx = cache.x_by_cell[i];
+        let sy = cache.y_by_cell[i];
+        let sz = cache.z_by_cell[i];
+        let boundary = clampf(plates.boundary_strength[i], 0.0, 1.0);
+        let fault = 0.5 + 0.5 * fault_backbone[i];
+        let inherited_noise = 0.5
+            + 0.5
+                * ((sx * 5.7 + sy * 4.8 + sz * 3.9 + seed_mix as f32 * 0.0011).sin() * 0.61
+                    + (sy * 6.3 - sz * 4.4 + sx * 3.2 - seed_mix as f32 * 0.0009).cos() * 0.39);
+        let segment_noise = 0.5
+            + 0.5
+                * ((sx * 12.1 + sy * 8.7 + sz * 6.5 + seed_mix as f32 * 0.0018).sin() * 0.54
+                    + (sy * 11.4 - sz * 7.9 + sx * 5.8 - seed_mix as f32 * 0.0014).cos() * 0.46);
+        let segment_gate = smoothstep(0.24, 0.88, segment_noise);
+        let inherited_gate = smoothstep(0.22, 0.9, inherited_noise * 0.76 + fault * 0.24);
+        let weakness = clampf(
+            0.14 + 0.58 * inherited_gate + 0.34 * boundary * segment_gate,
+            0.0,
+            1.0,
+        );
+        weakness_field[i] = weakness;
+
+        let strength = clampf(
+            0.72 + 0.23 * continentality_field[i] + 0.18 * (1.0 - weakness) - 0.24 * heat_norm,
+            0.05,
+            1.5,
+        );
+        strength_field[i] = strength;
+
+        let source = boundary * (0.42 + 0.58 * segment_gate) * (0.9 + 0.2 * fault);
+        match plates.boundary_types[i] {
+            1 => {
+                comp_source[i] = source * (0.52 + 0.48 * inherited_gate);
+                shear_source[i] = source * 0.24 * (0.4 + 0.6 * segment_gate);
+            }
+            2 => {
+                ext_source[i] = source * (0.54 + 0.46 * segment_gate);
+                shear_source[i] = source * 0.2 * (0.46 + 0.54 * (1.0 - segment_gate));
+            }
+            3 => {
+                shear_source[i] = source * (0.5 + 0.5 * (1.0 - segment_gate * 0.35));
+            }
+            _ => {}
+        }
+
+        velocity_x[i] = plates.plate_vectors[plate_id].dir_x;
+        velocity_y[i] = plates.plate_vectors[plate_id].dir_y;
+    }
+
+    let vel_smooth_passes = (detail.max_kernel_radius as usize + detail.buoyancy_smooth_passes / 6)
+        .clamp(3, 8);
+    let mut vel_x_next = velocity_x.clone();
+    let mut vel_y_next = velocity_y.clone();
+    for pass in 0..vel_smooth_passes {
+        for y in 0..WORLD_HEIGHT {
+            let t = (pass as f32 + y as f32 / WORLD_HEIGHT as f32) / vel_smooth_passes as f32;
+            progress.phase(progress_base, progress_span, 0.28 + 0.04 * t);
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                let mut sx = velocity_x[i] * 0.34;
+                let mut sy = velocity_y[i] * 0.34;
+                let mut wsum = 0.34;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                        let w = if ox == 0 || oy == 0 { 0.11 } else { 0.07 };
+                        sx += velocity_x[j] * w;
+                        sy += velocity_y[j] * w;
+                        wsum += w;
+                    }
+                }
+                vel_x_next[i] = sx / wsum.max(1e-6);
+                vel_y_next[i] = sy / wsum.max(1e-6);
+            }
+        }
+        velocity_x.copy_from_slice(&vel_x_next);
+        velocity_y.copy_from_slice(&vel_y_next);
+    }
+
+    let mut comp_grad = vec![0.0_f32; WORLD_SIZE];
+    let mut ext_grad = vec![0.0_f32; WORLD_SIZE];
+    let mut shear_grad = vec![0.0_f32; WORLD_SIZE];
+    let mut comp_peak = 1e-6_f32;
+    let mut ext_peak = 1e-6_f32;
+    let mut shear_peak = 1e-6_f32;
+    for y in 0..WORLD_HEIGHT {
+        let t = y as f32 / WORLD_HEIGHT as f32;
+        progress.phase(progress_base, progress_span, 0.32 + 0.02 * t);
+        for x in 0..WORLD_WIDTH {
+            let i = index(x, y);
+            let vx_r = velocity_x[index_spherical(x as i32 + 1, y as i32)];
+            let vx_l = velocity_x[index_spherical(x as i32 - 1, y as i32)];
+            let vx_u = velocity_x[index_spherical(x as i32, y as i32 - 1)];
+            let vx_d = velocity_x[index_spherical(x as i32, y as i32 + 1)];
+            let vy_r = velocity_y[index_spherical(x as i32 + 1, y as i32)];
+            let vy_l = velocity_y[index_spherical(x as i32 - 1, y as i32)];
+            let vy_u = velocity_y[index_spherical(x as i32, y as i32 - 1)];
+            let vy_d = velocity_y[index_spherical(x as i32, y as i32 + 1)];
+            let div = ((vx_r - vx_l) + (vy_d - vy_u)) * 0.5;
+            let shear = ((vx_d - vx_u).abs() + (vy_r - vy_l).abs()) * 0.5;
+            let cg = (-div).max(0.0);
+            let eg = div.max(0.0);
+            comp_grad[i] = cg;
+            ext_grad[i] = eg;
+            shear_grad[i] = shear;
+            comp_peak = comp_peak.max(cg);
+            ext_peak = ext_peak.max(eg);
+            shear_peak = shear_peak.max(shear);
+        }
+    }
+
+    for i in 0..WORLD_SIZE {
+        let weak = weakness_field[i];
+        let cg = clampf(comp_grad[i] / comp_peak, 0.0, 1.0).powf(0.9);
+        let eg = clampf(ext_grad[i] / ext_peak, 0.0, 1.0).powf(0.9);
+        let sg = clampf(shear_grad[i] / shear_peak, 0.0, 1.0).powf(0.92);
+        comp_source[i] = clampf(
+            comp_source[i] * 0.72 + cg * (0.22 + 0.2 * weak),
+            0.0,
+            1.5,
+        );
+        ext_source[i] = clampf(
+            ext_source[i] * 0.72 + eg * (0.22 + 0.16 * (1.0 - weak)),
+            0.0,
+            1.5,
+        );
+        shear_source[i] = clampf(
+            shear_source[i] * 0.68 + sg * (0.2 + 0.22 * weak),
+            0.0,
+            1.4,
+        );
+    }
+
+    let mut comp_field = comp_source.clone();
+    let mut ext_field = ext_source.clone();
+    let mut shear_field = shear_source.clone();
+    let mut comp_next = vec![0.0_f32; WORLD_SIZE];
+    let mut ext_next = vec![0.0_f32; WORLD_SIZE];
+    let mut shear_next = vec![0.0_f32; WORLD_SIZE];
+
+    const STRAIN_NEIGHBORS: [(i32, i32, f32); 8] = [
+        (1, 0, 0.17),
+        (-1, 0, 0.17),
+        (0, 1, 0.17),
+        (0, -1, 0.17),
+        (1, 1, 0.12),
+        (-1, 1, 0.12),
+        (1, -1, 0.12),
+        (-1, -1, 0.12),
+    ];
+
+    let strain_passes = (detail.buoyancy_smooth_passes / 2 + detail.max_kernel_radius as usize + 5)
+        .clamp(9, 26);
+    for pass in 0..strain_passes {
+        let pass_t = pass as f32 / strain_passes.max(1) as f32;
+        for y in 0..WORLD_HEIGHT {
+            let row_t = (pass as f32 + y as f32 / WORLD_HEIGHT as f32) / strain_passes as f32;
+            progress.phase(progress_base, progress_span, 0.32 + 0.18 * row_t);
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                let mut nx = plates.boundary_normal_x[i];
+                let mut ny = plates.boundary_normal_y[i];
+                let mut nlen = nx.hypot(ny);
+                if nlen < 0.15 {
+                    let left = continentality_field[index_spherical(x as i32 - 1, y as i32)];
+                    let right = continentality_field[index_spherical(x as i32 + 1, y as i32)];
+                    let up = continentality_field[index_spherical(x as i32, y as i32 - 1)];
+                    let down = continentality_field[index_spherical(x as i32, y as i32 + 1)];
+                    nx = right - left;
+                    ny = down - up;
+                    nlen = nx.hypot(ny);
+                }
+                if nlen < 1e-5 {
+                    nx = 1.0;
+                    ny = 0.0;
+                    nlen = 1.0;
+                }
+                let nux = nx / nlen;
+                let nuy = ny / nlen;
+                let tx = -nuy;
+                let ty = nux;
+                let weak = weakness_field[i];
+                let heat_norm = heat_norm_field[i];
+                let strength = strength_field[i];
+                let conductivity = clampf(
+                    0.12 + 0.54 * weak + 0.2 * heat_norm - 0.2 * strength,
+                    0.05,
+                    0.96,
+                );
+
+                let mut comp_sum = comp_field[i] * 0.42;
+                let mut ext_sum = ext_field[i] * 0.42;
+                let mut shear_sum = shear_field[i] * 0.42;
+                let mut wsum = 0.42;
+
+                for (dx, dy, base_w) in STRAIN_NEIGHBORS {
+                    let j = index_spherical(x as i32 + dx, y as i32 + dy);
+                    let along = ((dx as f32) * tx + (dy as f32) * ty).abs();
+                    let across = ((dx as f32) * nux + (dy as f32) * nuy).abs();
+                    let orient = clampf(0.78 + 0.34 * along - 0.12 * across, 0.5, 1.35);
+                    let bridge = 0.55 + 0.45 * conductivity * (0.42 + 0.58 * weakness_field[j]);
+                    let w = base_w * orient * bridge;
+                    comp_sum += comp_field[j] * w;
+                    ext_sum += ext_field[j] * w;
+                    shear_sum += shear_field[j] * w;
+                    wsum += w;
+                }
+
+                let comp_avg = comp_sum / wsum.max(1e-6);
+                let ext_avg = ext_sum / wsum.max(1e-6);
+                let shear_avg = shear_sum / wsum.max(1e-6);
+
+                let comp_source_drive = comp_source[i] * (0.46 + 0.42 * weak);
+                let ext_source_drive = ext_source[i] * (0.48 + 0.38 * (1.0 - weak));
+                let shear_source_drive = shear_source[i] * (0.4 + 0.45 * weak);
+
+                comp_next[i] = clampf(
+                    comp_field[i] * (0.52 + 0.2 * (1.0 - conductivity))
+                        + comp_avg * (0.3 + 0.44 * conductivity)
+                        + comp_source_drive * 0.3
+                        - (0.008 + 0.006 * pass_t),
+                    0.0,
+                    2.8,
+                );
+                ext_next[i] = clampf(
+                    ext_field[i] * (0.54 + 0.2 * (1.0 - conductivity))
+                        + ext_avg * (0.3 + 0.4 * conductivity)
+                        + ext_source_drive * 0.31
+                        - (0.007 + 0.005 * pass_t),
+                    0.0,
+                    2.8,
+                );
+                shear_next[i] = clampf(
+                    shear_field[i] * (0.58 + 0.16 * (1.0 - conductivity))
+                        + shear_avg * (0.27 + 0.36 * conductivity)
+                        + shear_source_drive * 0.36
+                        - (0.006 + 0.004 * pass_t),
+                    0.0,
+                    2.6,
+                );
+            }
+        }
+
+        comp_field.copy_from_slice(&comp_next);
+        ext_field.copy_from_slice(&ext_next);
+        shear_field.copy_from_slice(&shear_next);
+    }
+
+    let mut comp_peak = 1e-6_f32;
+    let mut ext_peak = 1e-6_f32;
+    let mut shear_peak = 1e-6_f32;
+    for i in 0..WORLD_SIZE {
+        comp_peak = comp_peak.max(comp_field[i]);
+        ext_peak = ext_peak.max(ext_field[i]);
+        shear_peak = shear_peak.max(shear_field[i]);
+    }
+    for i in 0..WORLD_SIZE {
+        comp_field[i] = clampf(comp_field[i] / comp_peak, 0.0, 1.0).powf(0.86);
+        ext_field[i] = clampf(ext_field[i] / ext_peak, 0.0, 1.0).powf(0.9);
+        shear_field[i] = clampf(shear_field[i] / shear_peak, 0.0, 1.0).powf(0.94);
+    }
+
+    let corridor_passes = (detail.max_kernel_radius as usize / 2 + 2).clamp(2, 5);
+    for pass in 0..corridor_passes {
+        for y in 0..WORLD_HEIGHT {
+            let t = (pass as f32 + y as f32 / WORLD_HEIGHT as f32) / corridor_passes as f32;
+            progress.phase(progress_base, progress_span, 0.5 + 0.02 * t);
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                let weak = weakness_field[i];
+                let mut comp_sum = comp_field[i] * 0.44;
+                let mut ext_sum = ext_field[i] * 0.44;
+                let mut shear_sum = shear_field[i] * 0.44;
+                let mut wsum = 0.44;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                        let w = if ox == 0 || oy == 0 { 0.1 } else { 0.065 };
+                        comp_sum += comp_field[j] * w;
+                        ext_sum += ext_field[j] * w;
+                        shear_sum += shear_field[j] * w;
+                        wsum += w;
+                    }
+                }
+                let comp_avg = comp_sum / wsum.max(1e-6);
+                let ext_avg = ext_sum / wsum.max(1e-6);
+                let shear_avg = shear_sum / wsum.max(1e-6);
+                comp_next[i] = clampf(
+                    comp_field[i] * (0.6 - 0.12 * weak) + comp_avg * (0.3 + 0.32 * weak),
+                    0.0,
+                    1.0,
+                );
+                ext_next[i] = clampf(
+                    ext_field[i] * (0.62 - 0.08 * weak) + ext_avg * (0.28 + 0.26 * (1.0 - weak)),
+                    0.0,
+                    1.0,
+                );
+                shear_next[i] = clampf(
+                    shear_field[i] * (0.64 - 0.06 * weak)
+                        + shear_avg * (0.24 + 0.22 * weak),
+                    0.0,
+                    1.0,
+                );
+            }
+        }
+        comp_field.copy_from_slice(&comp_next);
+        ext_field.copy_from_slice(&ext_next);
+        shear_field.copy_from_slice(&shear_next);
+    }
+
+    let mut orogen_drive = vec![0.0_f32; WORLD_SIZE];
+    let mut crust_eq = vec![0.0_f32; WORLD_SIZE];
+    let mut crust = vec![0.0_f32; WORLD_SIZE];
+    let mut crust_next = vec![0.0_f32; WORLD_SIZE];
+    for i in 0..WORLD_SIZE {
+        let continental = continentality_field[i];
+        let landness = smoothstep(-0.08, 0.84, continental);
+        let eq = lerpf(7.0, 34.8, landness) * (1.02 - 0.14 * heat_norm_field[i]);
+        crust_eq[i] = eq;
+        let inherited = smoothstep(0.2, 0.9, 0.5 + 0.5 * fault_backbone[i]);
+        let drive = smoothstep(
+            0.1,
+            0.9,
+            comp_field[i] * (0.56 + 0.46 * weakness_field[i])
+                + shear_field[i] * 0.18
+                + inherited * 0.12 * weakness_field[i],
+        ) * (0.42 + 0.58 * landness);
+        orogen_drive[i] = drive;
+        crust[i] = clampf(eq + drive * 2.3 - ext_field[i] * 1.2, 4.0, 60.0);
+    }
+
+    let time_steps =
+        (detail.erosion_rounds * 9 + detail.max_kernel_radius as usize * 3 + 8).clamp(12, 40);
+    for step in 0..time_steps {
+        for y in 0..WORLD_HEIGHT {
+            let t = (step as f32 + y as f32 / WORLD_HEIGHT as f32) / time_steps as f32;
+            progress.phase(progress_base, progress_span, 0.5 + 0.12 * t);
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                let landness = smoothstep(-0.08, 0.84, continentality_field[i]);
+                let weak = weakness_field[i];
+                let strength = strength_field[i];
+                let comp_eff = comp_field[i] * (0.54 + 0.62 * weak)
+                    + shear_field[i] * 0.24 * (0.32 + 0.68 * landness);
+                let ext_eff = ext_field[i] * (0.64 + 0.36 * (1.0 - landness));
+                let thickening = (0.08 + 0.7 * comp_eff)
+                    * (0.42 + 0.58 * landness)
+                    * (1.14 - 0.3 * strength);
+                let thinning = (0.04 + 0.48 * ext_eff)
+                    * (0.56 + 0.52 * heat_norm_field[i])
+                    * (0.48 + 0.52 * (1.0 - landness));
+                let relaxation = (crust[i] - crust_eq[i]).max(0.0)
+                    * (0.017 + 0.03 * (1.0 - landness) + 0.01 * (step as f32 / time_steps as f32));
+                let evolved = crust[i] + thickening - thinning - relaxation;
+
+                let mut sum = evolved * 0.38;
+                let mut wsum = 0.38;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                        let w = if ox == 0 || oy == 0 { 0.1 } else { 0.065 };
+                        sum += crust[j] * w;
+                        wsum += w;
+                    }
+                }
+                let avg = sum / wsum.max(1e-6);
+                let corridor = comp_field[i]
+                    .max(shear_field[i] * 0.85)
+                    .max(ext_field[i] * 0.55);
+                let lateral = clampf(
+                    0.034 + 0.064 * (1.0 - corridor) + 0.03 * (1.0 - weak),
+                    0.022,
+                    0.16,
+                );
+                crust_next[i] = clampf(evolved * (1.0 - lateral) + avg * lateral, 4.0, 78.0);
+            }
+        }
+        crust.copy_from_slice(&crust_next);
+    }
+
+    for i in 0..WORLD_SIZE {
+        if i % (WORLD_WIDTH * 4) == 0 {
+            progress.phase(
+                progress_base,
+                progress_span,
+                0.62 + 0.2 * (i as f32 / WORLD_SIZE as f32),
             );
         }
         let plate_id = plates.plate_field[i] as usize;
         let plate_speed = plates.plate_vectors[plate_id].speed;
         let heat = plates.plate_vectors[plate_id].heat;
         let plate_buoyancy = buoyancy_field[i];
-        let x = i % WORLD_WIDTH;
-        let y = i / WORLD_WIDTH;
-
-        let mut conv_influence = 0.0_f32;
-        let mut div_influence = 0.0_f32;
-        let mut transform_influence = 0.0_f32;
-
-        let local_kernel = (base_kernel_radius
-            + (plate_speed / 1.8).floor() as i32
-            + ((heat / 30.0) * 2.0).floor() as i32)
-            .min(detail.max_kernel_radius);
-
-        for oy in -local_kernel..=local_kernel {
-            for ox in -local_kernel..=local_kernel {
-                let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                let t = plates.boundary_types[j];
-                if t == 0 {
-                    continue;
-                }
-
-                let source_plate = plates.plate_field[j] as usize;
-                let source_heat = plates.plate_vectors[source_plate].heat;
-                let bx = cache.x_by_cell[j];
-                let by = cache.y_by_cell[j];
-                let bz = cache.z_by_cell[j];
-                let ridge_noise =
-                    0.65 + 0.35 * (bx * 3.9 + by * 5.2 + bz * 4.3 + seed as f32 * 0.0021).sin();
-                let source_heat_norm = source_heat / tectonics.mantle_heat.max(1.0);
-                let heat_width = 0.75 + source_heat_norm * 1.6 + (source_heat_norm - 0.55) * 0.9;
-                let local_width = clampf(0.65 + heat_width * ridge_noise, 0.5, 4.8);
-                let s = clampf(
-                    plates.boundary_scores[j].abs() / max_boundary_score,
-                    0.0,
-                    1.0,
-                );
-                let n_normal_x = plates.boundary_normal_x[j];
-                let n_normal_y = plates.boundary_normal_y[j];
-                let normal_len = n_normal_x.hypot(n_normal_y).max(1.0);
-                let normal_x = n_normal_x / normal_len;
-                let normal_y = n_normal_y / normal_len;
-                let tangent_x = -normal_y;
-                let tangent_y = normal_x;
-                let across = ox as f32 * normal_x + oy as f32 * normal_y;
-                let along = ox as f32 * tangent_x + oy as f32 * tangent_y;
-                let boundary_bias = clampf(plates.boundary_strength[j] * 1.25, 0.0, 1.4);
-                let sigma_across = (local_width * (0.85 + 1.1 * s)
-                    + 0.05 * ((ox as f32) * 3.1 + (oy as f32) * 2.3).sin())
-                .max(0.55);
-                let sigma_along = (local_width * (1.65 + 1.7 * boundary_bias + 0.95 * s)
-                    + 0.55 * ((oy as f32) * 2.1 - (ox as f32) * 1.9).cos())
-                .max(1.05);
-                let anisotropy = (across * across) / (sigma_across * sigma_across)
-                    + (along * along) / (sigma_along * sigma_along);
-                let w = (-anisotropy).exp();
-                let width_tuning = 0.25 + 0.76 * s + 0.2 * boundary_bias;
-                let chain_segment = 0.35
-                    + 0.65
-                        * (0.5
-                            + 0.5
-                                * (bx * 9.4 + by * 7.6 + bz * 5.8 + seed_mix as f32 * 0.0011).sin());
-                let chain_cluster = 0.45
-                    + 0.55
-                        * (0.5
-                            + 0.5
-                                * (by * 8.8 - bz * 6.3 + bx * 4.2 - seed_mix as f32 * 0.0009).cos());
-                let mut intensity = w * width_tuning;
-                let ridge_gate = 0.5 + 0.5
-                    * ((bx * 11.6 + by * 9.3 + bz * 7.1 + seed_mix as f32 * 0.0013).sin() * 0.57
-                        + (by * 10.4 - bz * 8.2 + bx * 6.7 - seed_mix as f32 * 0.0015).cos() * 0.43);
-                let ridge_patch = smoothstep(0.3, 0.88, ridge_gate);
-
-                if t == 1 {
-                    intensity *= chain_segment * chain_cluster;
-                    intensity *= 0.16 + 0.84 * ridge_patch;
-                    conv_influence += intensity;
-                } else if t == 2 {
-                    intensity *= (0.56 + 0.34 * chain_segment) * (0.66 + 0.34 * ridge_patch);
-                    div_influence += intensity;
-                } else {
-                    transform_influence += intensity;
-                }
-            }
-        }
-
         let sx = cache.x_by_cell[i];
         let sy = cache.y_by_cell[i];
         let sz = cache.z_by_cell[i];
@@ -2549,55 +2870,68 @@ fn compute_relief(
         let shelf_span = 0.18 + 0.16 * (0.5 + 0.5 * shelf_noise);
         let coast_weight = 1.0 - smoothstep(0.05, shelf_span.max(0.08), continental_raw.abs());
         let interior_weight = 1.0 - coast_weight;
-        let mountain_patch = smoothstep(0.22, 0.86, 0.5 + 0.5 * regional_signal);
+        let mountain_patch = smoothstep(0.2, 0.88, 0.5 + 0.5 * regional_signal);
 
-        let fault_mod = 0.5 + 0.5 * fault_backbone[i];
-        let ridge_cluster = smoothstep(0.22, 0.82, 0.5 + 0.5 * fault_mod);
-        let tectonic_scale = ((k_relief * plate_speed) / planet.gravity.max(1.0)) * 0.018;
-        let land_gate = smoothstep(0.12, 0.95, continental_raw);
+        let tectonic_scale = ((k_relief * plate_speed) / planet.gravity.max(1.0)) * 0.0135;
+        let land_gate = smoothstep(0.1, 0.95, continental_raw);
         let ocean_gate = smoothstep(0.2, 0.98, -continental_raw);
-        let conv_shape = conv_influence.powf(0.72);
-        let div_shape = div_influence.powf(0.78);
-        let transform_shape = transform_influence.powf(0.82);
+        let comp = comp_field[i];
+        let ext = ext_field[i];
+        let shear = shear_field[i];
+        let crust_anom = crust[i] - crust_eq[i];
+        let orogen = smoothstep(0.08, 0.9, orogen_drive[i]);
+        let plateau = smoothstep(3.0, 18.0, crust_anom) * smoothstep(0.24, 0.92, land_gate);
+        let segmentation = smoothstep(
+            0.16,
+            0.88,
+            weakness_field[i] * 0.78 + 0.22 * (0.5 + 0.5 * fault_backbone[i]),
+        );
+
         let mountain_uplift = tectonic_scale
-            * (220.0 + 1650.0 * conv_shape)
-            * (0.6 + 0.4 * mountain_patch)
-            * (0.7 + 0.3 * ridge_cluster)
             * land_gate
-            * (0.35 + 0.65 * interior_weight);
-        let trench_cut = tectonic_scale
-            * (170.0 + 1500.0 * div_shape)
-            * (0.72 + 0.28 * (1.0 - mountain_patch))
+            * (95.0
+                + 1480.0 * orogen * (0.54 + 0.46 * segmentation)
+                + 280.0 * plateau
+                + 230.0 * clampf(crust_anom / 20.0, 0.0, 1.0))
+            * (0.62 + 0.38 * mountain_patch)
+            * (0.38 + 0.62 * interior_weight);
+        let transpress_uplift = tectonic_scale
+            * land_gate
+            * (45.0 + 260.0 * shear.powf(1.08))
+            * smoothstep(0.14, 0.8, shear + comp * 0.34);
+        let ridge_ocean_uplift = tectonic_scale
             * ocean_gate
-            * (0.45 + 0.55 * interior_weight);
+            * (42.0 + 640.0 * ext.powf(0.84))
+            * (0.6 + 0.4 * (1.0 - orogen));
+        let trench_cut = tectonic_scale
+            * ocean_gate
+            * (90.0 + 1730.0 * comp.powf(0.92))
+            * (0.66 + 0.34 * ocean_core.powf(0.42));
         let transform_term = tectonic_scale
-            * 220.0
-            * transform_shape
-            * (regional_signal * 0.65 + micro_signal * 0.35)
+            * 140.0
+            * shear.powf(0.9)
+            * (regional_signal * 0.6 + micro_signal * 0.4)
             * (land_gate + ocean_gate).min(1.0);
-        let base = mountain_uplift - trench_cut + transform_term;
+        let base = mountain_uplift + transpress_uplift + ridge_ocean_uplift - trench_cut + transform_term;
 
         let continental_base = if continental_raw >= 0.0 {
-            120.0
-                + land_core.powf(1.16)
-                    * (1700.0 + 2600.0 * smoothstep(0.18, 0.96, land_core))
+            85.0 + land_core.powf(1.16) * (1480.0 + 2350.0 * smoothstep(0.18, 0.96, land_core))
         } else {
-            -(180.0
-                + ocean_core.powf(1.18)
-                    * (2100.0 + 3400.0 * smoothstep(0.22, 0.98, ocean_core)))
+            -(170.0 + ocean_core.powf(1.18) * (1860.0 + 3180.0 * smoothstep(0.22, 0.98, ocean_core)))
         };
 
-        let litho_variation = (regional_signal * 120.0
-            + micro_signal * 62.0
-            + macro_noise * 40.0
-            + plate_buoyancy * 15.0)
-            * (0.18 + 0.82 * interior_weight);
+        let litho_variation = (regional_signal * 112.0
+            + micro_signal * 58.0
+            + macro_noise * 44.0
+            + plate_buoyancy * 14.0
+            + crust_anom * (14.0 + 26.0 * orogen))
+            * (0.2 + 0.8 * interior_weight);
         let macro_base = continental_base + litho_variation;
 
-        let noise = (random_seed.next_f32() - 0.5) * 14.0
-            + regional_signal * 24.0
-            + micro_signal * (8.0 + 12.0 * interior_weight);
-        let heat_term = (heat - tectonics.mantle_heat * 0.5) * 1.15;
+        let noise = (random_seed.next_f32() - 0.5) * 10.0
+            + regional_signal * 21.0
+            + micro_signal * (6.5 + 9.0 * interior_weight);
+        let heat_term = (heat - tectonics.mantle_heat * 0.5) * 0.95;
 
         relief[i] = base + macro_base + noise + heat_term;
     }
@@ -2688,7 +3022,9 @@ fn compute_relief(
     }
 
     normalize_height_range(&mut relief, planet, tectonics);
-    defuse_orogenic_ribbons(&mut relief, seed_mix, cache, detail);
+    if detail.erosion_rounds == 0 {
+        defuse_orogenic_ribbons(&mut relief, seed_mix, cache, detail);
+    }
     progress.phase(progress_base, progress_span, 0.86);
     apply_ocean_profile(
         &mut relief,

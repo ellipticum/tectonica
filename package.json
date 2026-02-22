@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "wasm:build": "wasm-pack build rust/planet_engine --target bundler --out-dir ../../src/lib/planet-rs/pkg --release",
-    "gen:dump": "wasm-pack build rust/planet_engine --target nodejs --out-dir ../../generations/pkg --release && node scripts/run-generation-from-scratch.cjs"
+    "gen:dump": "wasm-pack build rust/planet_engine --target nodejs --out-dir ../../generations/pkg --release && node scripts/run-generation-from-scratch.cjs",
+    "gen:score": "node scripts/evaluate-relief-quality.cjs"
   },
   "dependencies": {
     "class-variance-authority": "^0.7.1",
