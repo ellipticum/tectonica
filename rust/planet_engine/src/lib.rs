@@ -1434,7 +1434,12 @@ fn apply_coastal_detail(relief: &mut [f32], seed: u32, cache: &WorldCache) {
             seed_phase * 9.2,
         );
         let coast_weight = near_sea.powf(1.08);
-        relief[i] += coast_weight * (macro_n * 34.0 + micro * 20.0);
+        let delta = coast_weight * (macro_n * 26.0 + micro * 14.0);
+        if h >= 0.0 {
+            relief[i] = (h + delta).max(8.0);
+        } else {
+            relief[i] = (h + delta).min(-8.0);
+        }
     }
 }
 
@@ -1474,6 +1479,221 @@ fn cleanup_coastal_speckles(relief: &mut [f32]) {
     }
 
     relief.copy_from_slice(&next);
+}
+
+fn clean_landmask_components(mask: &mut [u8], min_land_cells: usize, min_inland_water_cells: usize) {
+    let mut visited = vec![0_u8; WORLD_SIZE];
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    let mut component: Vec<usize> = Vec::new();
+
+    // Remove tiny land islands.
+    for start in 0..WORLD_SIZE {
+        if mask[start] != 1 || visited[start] != 0 {
+            continue;
+        }
+        visited[start] = 1;
+        queue.push_back(start);
+        component.clear();
+        while let Some(i) = queue.pop_front() {
+            component.push(i);
+            let x = i % WORLD_WIDTH;
+            let y = i / WORLD_WIDTH;
+            for oy in -1..=1 {
+                for ox in -1..=1 {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                    if visited[j] == 0 && mask[j] == 1 {
+                        visited[j] = 1;
+                        queue.push_back(j);
+                    }
+                }
+            }
+        }
+        if component.len() < min_land_cells {
+            for &i in component.iter() {
+                mask[i] = 0;
+            }
+        }
+    }
+
+    // Find largest water body (global ocean candidate).
+    visited.fill(0);
+    let mut largest_water = 0_usize;
+    for start in 0..WORLD_SIZE {
+        if mask[start] != 0 || visited[start] != 0 {
+            continue;
+        }
+        visited[start] = 1;
+        queue.push_back(start);
+        let mut size = 0_usize;
+        while let Some(i) = queue.pop_front() {
+            size += 1;
+            let x = i % WORLD_WIDTH;
+            let y = i / WORLD_WIDTH;
+            for oy in -1..=1 {
+                for ox in -1..=1 {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                    if visited[j] == 0 && mask[j] == 0 {
+                        visited[j] = 1;
+                        queue.push_back(j);
+                    }
+                }
+            }
+        }
+        largest_water = largest_water.max(size);
+    }
+
+    // Fill tiny inland seas/lakes but keep major water bodies.
+    visited.fill(0);
+    for start in 0..WORLD_SIZE {
+        if mask[start] != 0 || visited[start] != 0 {
+            continue;
+        }
+        visited[start] = 1;
+        queue.push_back(start);
+        component.clear();
+        while let Some(i) = queue.pop_front() {
+            component.push(i);
+            let x = i % WORLD_WIDTH;
+            let y = i / WORLD_WIDTH;
+            for oy in -1..=1 {
+                for ox in -1..=1 {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                    if visited[j] == 0 && mask[j] == 0 {
+                        visited[j] = 1;
+                        queue.push_back(j);
+                    }
+                }
+            }
+        }
+        let size = component.len();
+        if size < min_inland_water_cells && size < largest_water / 18 {
+            for &i in component.iter() {
+                mask[i] = 1;
+            }
+        }
+    }
+}
+
+fn smooth_landmask(mask: &mut [u8], passes: usize) {
+    if passes == 0 {
+        return;
+    }
+    let mut next = mask.to_vec();
+    for _ in 0..passes {
+        for y in 0..WORLD_HEIGHT {
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                let mut land_neighbors = 0_i32;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                        if mask[j] == 1 {
+                            land_neighbors += 1;
+                        }
+                    }
+                }
+
+                let cur = mask[i];
+                next[i] = if cur == 1 {
+                    if land_neighbors <= 2 {
+                        0
+                    } else {
+                        1
+                    }
+                } else if land_neighbors >= 6 {
+                    1
+                } else {
+                    0
+                };
+            }
+        }
+        mask.copy_from_slice(&next);
+    }
+}
+
+fn blend_topology_edges(relief: &mut [f32]) {
+    let mut next = relief.to_vec();
+    for _ in 0..2 {
+        for y in 0..WORLD_HEIGHT {
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                let sign_i = relief[i] >= 0.0;
+                let mut opposite = 0_u8;
+                let mut sum = relief[i] * 0.45;
+                let mut wsum = 0.45;
+
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                        let sign_j = relief[j] >= 0.0;
+                        if sign_i != sign_j {
+                            opposite += 1;
+                        }
+                        let w = if ox == 0 || oy == 0 { 0.14 } else { 0.09 };
+                        sum += relief[j] * w;
+                        wsum += w;
+                    }
+                }
+
+                if opposite >= 3 {
+                    next[i] = sum / wsum.max(1e-6);
+                } else {
+                    next[i] = relief[i];
+                }
+            }
+        }
+        relief.copy_from_slice(&next);
+    }
+}
+
+fn stabilize_landmass_topology(relief: &mut [f32], planet: &PlanetInputs, detail: DetailProfile) {
+    let mut landmask = vec![0_u8; WORLD_SIZE];
+    for i in 0..WORLD_SIZE {
+        landmask[i] = if relief[i] >= 0.0 { 1 } else { 0 };
+    }
+
+    let smooth_passes = if detail.erosion_rounds >= 2 { 3 } else { 2 };
+    smooth_landmask(&mut landmask, smooth_passes);
+
+    let min_land_cells = clampf(
+        WORLD_SIZE as f32
+            * (0.0018 + (planet.ocean_percent / 100.0) * 0.0018),
+        1800.0,
+        18_000.0,
+    ) as usize;
+    let min_inland_water_cells = clampf(
+        WORLD_SIZE as f32 * (0.0019 + (1.0 - planet.ocean_percent / 100.0) * 0.0014),
+        2200.0,
+        26_000.0,
+    ) as usize;
+    clean_landmask_components(&mut landmask, min_land_cells, min_inland_water_cells);
+
+    for i in 0..WORLD_SIZE {
+        if landmask[i] == 1 {
+            if relief[i] < 0.0 {
+                relief[i] = relief[i] * 0.3 + 70.0;
+            }
+        } else if relief[i] >= 0.0 {
+            relief[i] = relief[i] * 0.25 - 75.0;
+        }
+    }
+
+    blend_topology_edges(relief);
 }
 
 fn defuse_plate_linearity(
@@ -1563,7 +1783,12 @@ fn defuse_plate_linearity(
                 * (14.0 + 74.0 * mask)
                 * depth_softener;
             let mix = clampf(0.16 + 0.6 * mask, 0.0, 0.84) * depth_softener;
-            softened[i] = relief[i] * (1.0 - mix) + (avg + perturb) * mix;
+            let blended = relief[i] * (1.0 - mix) + (avg + perturb) * mix;
+            softened[i] = if relief[i] >= 0.0 {
+                blended.max(10.0)
+            } else {
+                blended.min(-10.0)
+            };
         }
     }
 
@@ -2451,6 +2676,7 @@ fn compute_relief(
         *h -= sea_level;
     }
 
+    stabilize_landmass_topology(&mut relief, planet, detail);
     apply_coastal_detail(&mut relief, seed, cache);
     defuse_plate_linearity(&mut relief, plates, seed, cache, detail);
 

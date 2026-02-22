@@ -74,6 +74,13 @@ const GENERATION_PRESETS = [
   { id: "detailed", label: "Детально" },
 ] as const;
 type GenerationPresetId = (typeof GENERATION_PRESETS)[number]["id"];
+const SEED_SEARCH_PRESETS = [
+  { id: "1", label: "1 seed (fast)", attempts: 1 },
+  { id: "4", label: "4 seeds (selection)", attempts: 4 },
+  { id: "8", label: "8 seeds (earth-like)", attempts: 8 },
+  { id: "12", label: "12 seeds (max selection)", attempts: 12 },
+] as const;
+type SeedSearchPresetId = (typeof SEED_SEARCH_PRESETS)[number]["id"];
 type ViewMode = "map" | "globe";
 type FlatProjection = "equirectangular" | "mercator";
 
@@ -82,6 +89,7 @@ type SimulationWorkerRequest = {
   requestId: number;
   config: SimulationConfig;
   reason: RecomputeTrigger;
+  attempts?: number;
 };
 
 type SimulationWorkerProgress = {
@@ -336,6 +344,7 @@ export default function HomePage() {
   const [generationPreset, setGenerationPreset] = useState<GenerationPresetId>(
     (DEFAULT_SIMULATION.generationPreset as GenerationPresetId) ?? "balanced",
   );
+  const [seedSearchPreset, setSeedSearchPreset] = useState<SeedSearchPresetId>("4");
   const [viewMode, setViewMode] = useState<ViewMode>("map");
   const [flatProjection, setFlatProjection] = useState<FlatProjection>("equirectangular");
   const [viewCenterLon, setViewCenterLon] = useState(0);
@@ -457,6 +466,8 @@ export default function HomePage() {
       events,
       generationPreset,
     };
+    const searchAttempts =
+      SEED_SEARCH_PRESETS.find((item) => item.id === seedSearchPreset)?.attempts ?? 1;
 
     const requestId = generationRequestIdRef.current + 1;
     generationRequestIdRef.current = requestId;
@@ -469,6 +480,7 @@ export default function HomePage() {
       requestId,
       config,
       reason,
+      attempts: searchAttempts,
     };
     worker.postMessage(payload);
   };
@@ -796,6 +808,24 @@ export default function HomePage() {
                 </SelectTrigger>
                 <SelectContent>
                   {GENERATION_PRESETS.map((item) => (
+                    <SelectItem key={item.id} value={item.id}>
+                      {item.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <div className="h-2" />
+              <Label>Seed Search</Label>
+              <Select
+                value={seedSearchPreset}
+                onValueChange={(value) => setSeedSearchPreset(value as SeedSearchPresetId)}
+                disabled={isGenerating}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select seed search mode" />
+                </SelectTrigger>
+                <SelectContent>
+                  {SEED_SEARCH_PRESETS.map((item) => (
                     <SelectItem key={item.id} value={item.id}>
                       {item.label}
                     </SelectItem>
@@ -1344,3 +1374,4 @@ function LabeledInput({
     </div>
   );
 }
+
