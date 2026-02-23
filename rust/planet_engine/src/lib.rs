@@ -2396,14 +2396,45 @@ fn compute_relief(
         (detail.buoyancy_smooth_passes / 4).clamp(1, 4),
     );
 
+    let plate_count = plates.plate_vectors.len();
+    let mut plate_land_sum = vec![0.0_f32; plate_count];
+    let mut plate_land_cells = vec![0_u32; plate_count];
+    for i in 0..WORLD_SIZE {
+        let pid = plates.plate_field[i] as usize;
+        let landness = smoothstep(-0.14, 0.84, continentality_field[i]);
+        plate_land_sum[pid] += landness;
+        plate_land_cells[pid] += 1;
+    }
+    let mut plate_landness = vec![0.5_f32; plate_count];
+    for pid in 0..plate_count {
+        let cnt = plate_land_cells[pid].max(1) as f32;
+        plate_landness[pid] = clampf(plate_land_sum[pid] / cnt, 0.0, 1.0);
+    }
+
     let mut heat_norm_field = vec![0.0_f32; WORLD_SIZE];
     let mut weakness_field = vec![0.0_f32; WORLD_SIZE];
     let mut strength_field = vec![0.0_f32; WORLD_SIZE];
     let mut comp_source = vec![0.0_f32; WORLD_SIZE];
     let mut ext_source = vec![0.0_f32; WORLD_SIZE];
     let mut shear_source = vec![0.0_f32; WORLD_SIZE];
+    let mut cc_collision = vec![0.0_f32; WORLD_SIZE];
+    let mut oc_collision_cont = vec![0.0_f32; WORLD_SIZE];
+    let mut oc_collision_ocean = vec![0.0_f32; WORLD_SIZE];
+    let mut oo_collision = vec![0.0_f32; WORLD_SIZE];
+    let mut subduction_source = vec![0.0_f32; WORLD_SIZE];
+    let mut rift_source = vec![0.0_f32; WORLD_SIZE];
     let mut velocity_x = vec![0.0_f32; WORLD_SIZE];
     let mut velocity_y = vec![0.0_f32; WORLD_SIZE];
+    const LOCAL_NEIGHBORS: [(i32, i32, f32); 8] = [
+        (1, 0, 1.0),
+        (-1, 0, 1.0),
+        (0, -1, 1.0),
+        (0, 1, 1.0),
+        (1, -1, std::f32::consts::FRAC_1_SQRT_2),
+        (-1, -1, std::f32::consts::FRAC_1_SQRT_2),
+        (1, 1, std::f32::consts::FRAC_1_SQRT_2),
+        (-1, 1, std::f32::consts::FRAC_1_SQRT_2),
+    ];
 
     for i in 0..WORLD_SIZE {
         if i % (WORLD_WIDTH * 4) == 0 {
@@ -2447,24 +2478,161 @@ fn compute_relief(
         );
         strength_field[i] = strength;
 
-        let source = boundary * (0.42 + 0.58 * segment_gate) * (0.9 + 0.2 * fault);
+        let mut conv_cc = 0.0_f32;
+        let mut conv_oc_cont = 0.0_f32;
+        let mut conv_oc_ocean = 0.0_f32;
+        let mut conv_oo = 0.0_f32;
+        let mut div_mix = 0.0_f32;
+        let mut shear_mix = 0.0_f32;
+        let mut local_wsum = 0.0_f32;
+        let land_a = plate_landness[plate_id];
+        let a = &plates.plate_vectors[plate_id];
+        for (dx, dy, w) in LOCAL_NEIGHBORS {
+            let j = index_spherical((i % WORLD_WIDTH) as i32 + dx, (i / WORLD_WIDTH) as i32 + dy);
+            let plate_b = plates.plate_field[j] as usize;
+            if plate_b == plate_id {
+                continue;
+            }
+
+            let b = &plates.plate_vectors[plate_b];
+            let rel_x = b.dir_x - a.dir_x;
+            let rel_y = b.dir_y - a.dir_y;
+            let n_len = (dx as f32).hypot(dy as f32).max(1.0);
+            let nx = dx as f32 / n_len;
+            let ny = dy as f32 / n_len;
+            let tx = -ny;
+            let ty = nx;
+            let conv = (rel_x * nx + rel_y * ny).max(0.0);
+            let div = (-(rel_x * nx + rel_y * ny)).max(0.0);
+            let shear = (rel_x * tx + rel_y * ty).abs();
+            let land_b = plate_landness[plate_b];
+            let w_eff = w * (0.72 + 0.28 * boundary);
+
+            if land_a > 0.57 && land_b > 0.57 {
+                conv_cc += conv * w_eff;
+                div_mix += div * 0.28 * w_eff;
+            } else if land_a < 0.43 && land_b < 0.43 {
+                conv_oo += conv * w_eff;
+                div_mix += div * 0.94 * w_eff;
+            } else {
+                if land_a >= land_b {
+                    conv_oc_cont += conv * w_eff;
+                } else {
+                    conv_oc_ocean += conv * w_eff;
+                }
+                div_mix += div * 0.62 * w_eff;
+            }
+
+            shear_mix += shear * w_eff;
+            local_wsum += w_eff;
+        }
+
+        if local_wsum > 1e-5 {
+            conv_cc /= local_wsum;
+            conv_oc_cont /= local_wsum;
+            conv_oc_ocean /= local_wsum;
+            conv_oo /= local_wsum;
+            div_mix /= local_wsum;
+            shear_mix /= local_wsum;
+        }
+
+        let speed_norm = tectonics.plate_speed_cm_per_year.max(0.2);
+        let conv_cc_n = clampf(conv_cc / speed_norm, 0.0, 1.0);
+        let conv_oc_cont_n = clampf(conv_oc_cont / speed_norm, 0.0, 1.0);
+        let conv_oc_ocean_n = clampf(conv_oc_ocean / speed_norm, 0.0, 1.0);
+        let conv_oo_n = clampf(conv_oo / speed_norm, 0.0, 1.0);
+        let div_n = clampf(div_mix / speed_norm, 0.0, 1.0);
+        let shear_n = clampf(shear_mix / (speed_norm * 1.8), 0.0, 1.0);
+
+        cc_collision[i] = conv_cc_n;
+        oc_collision_cont[i] = conv_oc_cont_n;
+        oc_collision_ocean[i] = conv_oc_ocean_n;
+        oo_collision[i] = conv_oo_n;
+        subduction_source[i] = clampf(conv_oc_ocean_n * 0.95 + conv_oo_n * 0.55, 0.0, 1.4);
+        rift_source[i] = clampf(div_n * (0.58 + 0.42 * (1.0 - conv_cc_n)), 0.0, 1.4);
+
+        let source = boundary * (0.38 + 0.62 * segment_gate) * (0.86 + 0.24 * fault);
+        let collisional_mix = 0.6 * conv_cc_n + 0.42 * conv_oc_cont_n + 0.28 * conv_oo_n;
         match plates.boundary_types[i] {
             1 => {
-                comp_source[i] = source * (0.52 + 0.48 * inherited_gate);
-                shear_source[i] = source * 0.24 * (0.4 + 0.6 * segment_gate);
+                comp_source[i] = source
+                    * (0.34
+                        + 1.04 * collisional_mix
+                        + 0.44 * inherited_gate
+                        + 0.16 * shear_n);
+                shear_source[i] =
+                    source * (0.16 + 0.54 * shear_n + 0.18 * conv_oc_cont_n + 0.12 * conv_cc_n);
+                ext_source[i] = source * 0.08 * div_n;
             }
             2 => {
-                ext_source[i] = source * (0.54 + 0.46 * segment_gate);
-                shear_source[i] = source * 0.2 * (0.46 + 0.54 * (1.0 - segment_gate));
+                ext_source[i] = source * (0.4 + 0.82 * rift_source[i] + 0.2 * (1.0 - collisional_mix));
+                shear_source[i] = source * (0.18 + 0.4 * shear_n + 0.18 * (1.0 - segment_gate));
+                comp_source[i] = source * 0.05 * conv_oc_cont_n;
             }
             3 => {
-                shear_source[i] = source * (0.5 + 0.5 * (1.0 - segment_gate * 0.35));
+                let transpress = shear_n * (0.46 + 0.54 * collisional_mix);
+                shear_source[i] = source * (0.34 + 0.72 * transpress);
+                comp_source[i] = source * 0.2 * transpress;
+                ext_source[i] = source * 0.14 * (div_n * (1.0 - transpress));
             }
             _ => {}
         }
 
         velocity_x[i] = plates.plate_vectors[plate_id].dir_x;
         velocity_y[i] = plates.plate_vectors[plate_id].dir_y;
+    }
+
+    let collision_smooth_passes = (detail.max_kernel_radius as usize / 2 + 2).clamp(2, 6);
+    let mut cc_next = cc_collision.clone();
+    let mut oc_cont_next = oc_collision_cont.clone();
+    let mut oc_ocean_next = oc_collision_ocean.clone();
+    let mut oo_next = oo_collision.clone();
+    let mut subduction_next = subduction_source.clone();
+    let mut rift_next = rift_source.clone();
+    for pass in 0..collision_smooth_passes {
+        for y in 0..WORLD_HEIGHT {
+            let t =
+                (pass as f32 + y as f32 / WORLD_HEIGHT as f32) / collision_smooth_passes as f32;
+            progress.phase(progress_base, progress_span, 0.28 + 0.02 * t);
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                let mut cc_sum = cc_collision[i] * 0.5;
+                let mut oc_cont_sum = oc_collision_cont[i] * 0.5;
+                let mut oc_ocean_sum = oc_collision_ocean[i] * 0.5;
+                let mut oo_sum = oo_collision[i] * 0.5;
+                let mut sub_sum = subduction_source[i] * 0.5;
+                let mut rift_sum = rift_source[i] * 0.5;
+                let mut wsum = 0.5;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                        let w = if ox == 0 || oy == 0 { 0.11 } else { 0.075 };
+                        cc_sum += cc_collision[j] * w;
+                        oc_cont_sum += oc_collision_cont[j] * w;
+                        oc_ocean_sum += oc_collision_ocean[j] * w;
+                        oo_sum += oo_collision[j] * w;
+                        sub_sum += subduction_source[j] * w;
+                        rift_sum += rift_source[j] * w;
+                        wsum += w;
+                    }
+                }
+                cc_next[i] = cc_sum / wsum.max(1e-6);
+                oc_cont_next[i] = oc_cont_sum / wsum.max(1e-6);
+                oc_ocean_next[i] = oc_ocean_sum / wsum.max(1e-6);
+                oo_next[i] = oo_sum / wsum.max(1e-6);
+                subduction_next[i] = sub_sum / wsum.max(1e-6);
+                rift_next[i] = rift_sum / wsum.max(1e-6);
+            }
+        }
+        cc_collision.copy_from_slice(&cc_next);
+        oc_collision_cont.copy_from_slice(&oc_cont_next);
+        oc_collision_ocean.copy_from_slice(&oc_ocean_next);
+        oo_collision.copy_from_slice(&oo_next);
+        subduction_source.copy_from_slice(&subduction_next);
+        rift_source.copy_from_slice(&rift_next);
     }
 
     let vel_smooth_passes = (detail.max_kernel_radius as usize + detail.buoyancy_smooth_passes / 6)
@@ -2537,20 +2705,32 @@ fn compute_relief(
         let cg = clampf(comp_grad[i] / comp_peak, 0.0, 1.0).powf(0.9);
         let eg = clampf(ext_grad[i] / ext_peak, 0.0, 1.0).powf(0.9);
         let sg = clampf(shear_grad[i] / shear_peak, 0.0, 1.0).powf(0.92);
+        let collisional_boost =
+            cc_collision[i] * 0.7 + oc_collision_cont[i] * 0.52 + oo_collision[i] * 0.34;
+        let subduction_boost = subduction_source[i];
+        let rift_boost = rift_source[i];
         comp_source[i] = clampf(
-            comp_source[i] * 0.72 + cg * (0.22 + 0.2 * weak),
+            comp_source[i] * 0.68
+                + cg * (0.2 + 0.18 * weak)
+                + collisional_boost * (0.24 + 0.26 * weak),
             0.0,
-            1.5,
+            1.9,
         );
         ext_source[i] = clampf(
-            ext_source[i] * 0.72 + eg * (0.22 + 0.16 * (1.0 - weak)),
+            ext_source[i] * 0.68
+                + eg * (0.2 + 0.14 * (1.0 - weak))
+                + rift_boost * (0.22 + 0.18 * (1.0 - weak))
+                + subduction_boost * 0.08,
             0.0,
-            1.5,
+            1.9,
         );
         shear_source[i] = clampf(
-            shear_source[i] * 0.68 + sg * (0.2 + 0.22 * weak),
+            shear_source[i] * 0.66
+                + sg * (0.19 + 0.2 * weak)
+                + collisional_boost * 0.12
+                + subduction_boost * 0.1,
             0.0,
-            1.4,
+            1.7,
         );
     }
 
@@ -2744,15 +2924,24 @@ fn compute_relief(
         let eq = lerpf(7.0, 34.8, landness) * (1.02 - 0.14 * heat_norm_field[i]);
         crust_eq[i] = eq;
         let inherited = smoothstep(0.2, 0.9, 0.5 + 0.5 * fault_backbone[i]);
+        let collisionality =
+            cc_collision[i] * 0.88 + oc_collision_cont[i] * 0.62 + oo_collision[i] * 0.42;
         let drive = smoothstep(
             0.1,
             0.9,
             comp_field[i] * (0.56 + 0.46 * weakness_field[i])
                 + shear_field[i] * 0.18
-                + inherited * 0.12 * weakness_field[i],
+                + inherited * 0.12 * weakness_field[i]
+                + collisionality * (0.24 + 0.18 * landness),
         ) * (0.42 + 0.58 * landness);
         orogen_drive[i] = drive;
-        crust[i] = clampf(eq + drive * 2.3 - ext_field[i] * 1.2, 4.0, 60.0);
+        crust[i] = clampf(
+            eq + drive * (2.1 + 1.2 * collisionality)
+                - ext_field[i] * (0.95 + 0.45 * rift_source[i])
+                - subduction_source[i] * (0.6 + 0.62 * (1.0 - landness)),
+            4.0,
+            64.0,
+        );
     }
 
     let time_steps =
@@ -2766,15 +2955,23 @@ fn compute_relief(
                 let landness = smoothstep(-0.08, 0.84, continentality_field[i]);
                 let weak = weakness_field[i];
                 let strength = strength_field[i];
+                let collisionality =
+                    cc_collision[i] * 0.92 + oc_collision_cont[i] * 0.66 + oo_collision[i] * 0.48;
+                let subduction = subduction_source[i];
+                let rift = rift_source[i];
                 let comp_eff = comp_field[i] * (0.54 + 0.62 * weak)
-                    + shear_field[i] * 0.24 * (0.32 + 0.68 * landness);
-                let ext_eff = ext_field[i] * (0.64 + 0.36 * (1.0 - landness));
-                let thickening = (0.08 + 0.7 * comp_eff)
+                    + shear_field[i] * 0.24 * (0.32 + 0.68 * landness)
+                    + collisionality * (0.22 + 0.28 * landness);
+                let ext_eff = ext_field[i] * (0.64 + 0.36 * (1.0 - landness))
+                    + rift * 0.42
+                    + subduction * 0.22;
+                let thickening = (0.08 + 0.68 * comp_eff)
                     * (0.42 + 0.58 * landness)
-                    * (1.14 - 0.3 * strength);
-                let thinning = (0.04 + 0.48 * ext_eff)
+                    * (1.14 - 0.3 * strength)
+                    * (0.86 + 0.48 * collisionality);
+                let thinning = (0.04 + 0.46 * ext_eff)
                     * (0.56 + 0.52 * heat_norm_field[i])
-                    * (0.48 + 0.52 * (1.0 - landness));
+                    * (0.42 + 0.58 * (1.0 - landness));
                 let relaxation = (crust[i] - crust_eq[i]).max(0.0)
                     * (0.017 + 0.03 * (1.0 - landness) + 0.01 * (step as f32 / time_steps as f32));
                 let evolved = crust[i] + thickening - thinning - relaxation;
@@ -2795,9 +2992,10 @@ fn compute_relief(
                 let avg = sum / wsum.max(1e-6);
                 let corridor = comp_field[i]
                     .max(shear_field[i] * 0.85)
-                    .max(ext_field[i] * 0.55);
+                    .max(ext_field[i] * 0.55)
+                    .max(collisionality * 0.7);
                 let lateral = clampf(
-                    0.034 + 0.064 * (1.0 - corridor) + 0.03 * (1.0 - weak),
+                    0.034 + 0.064 * (1.0 - corridor) + 0.03 * (1.0 - weak) - 0.012 * collisionality,
                     0.022,
                     0.16,
                 );
@@ -2878,6 +3076,12 @@ fn compute_relief(
         let comp = comp_field[i];
         let ext = ext_field[i];
         let shear = shear_field[i];
+        let collision_cc = smoothstep(0.08, 0.86, cc_collision[i]);
+        let collision_oc_cont = smoothstep(0.08, 0.86, oc_collision_cont[i]);
+        let collision_oc_ocean = smoothstep(0.08, 0.86, oc_collision_ocean[i]);
+        let collision_oo = smoothstep(0.08, 0.86, oo_collision[i]);
+        let subduction = clampf(subduction_source[i], 0.0, 1.6);
+        let rift = clampf(rift_source[i], 0.0, 1.6);
         let crust_anom = crust[i] - crust_eq[i];
         let orogen = smoothstep(0.08, 0.9, orogen_drive[i]);
         let plateau = smoothstep(3.0, 18.0, crust_anom) * smoothstep(0.24, 0.92, land_gate);
@@ -2886,33 +3090,66 @@ fn compute_relief(
             0.88,
             weakness_field[i] * 0.78 + 0.22 * (0.5 + 0.5 * fault_backbone[i]),
         );
+        let collisional_mix = clampf(
+            collision_cc * 0.74 + collision_oc_cont * 0.52 + collision_oo * 0.36,
+            0.0,
+            1.0,
+        );
+        let orogen_cc =
+            smoothstep(0.16, 0.9, orogen * 0.62 + collision_cc * 0.92 + plateau * 0.24);
+        let arc_orogen = smoothstep(
+            0.14,
+            0.9,
+            collision_oc_cont * 0.84 + collision_oo * 0.66 + comp * 0.26,
+        );
 
         let mountain_uplift = tectonic_scale
             * land_gate
-            * (95.0
-                + 1480.0 * orogen * (0.54 + 0.46 * segmentation)
+            * (70.0
+                + 1280.0 * orogen_cc * (0.46 + 0.54 * segmentation)
+                + 690.0 * arc_orogen * (0.42 + 0.58 * (1.0 - segmentation * 0.55))
                 + 280.0 * plateau
-                + 230.0 * clampf(crust_anom / 20.0, 0.0, 1.0))
-            * (0.62 + 0.38 * mountain_patch)
+                + 210.0 * clampf(crust_anom / 20.0, 0.0, 1.0))
+            * (0.56 + 0.44 * mountain_patch)
             * (0.38 + 0.62 * interior_weight);
         let transpress_uplift = tectonic_scale
             * land_gate
-            * (45.0 + 260.0 * shear.powf(1.08))
-            * smoothstep(0.14, 0.8, shear + comp * 0.34);
+            * (42.0 + 260.0 * shear.powf(1.08))
+            * smoothstep(0.14, 0.8, shear + comp * 0.32 + collisional_mix * 0.2);
         let ridge_ocean_uplift = tectonic_scale
             * ocean_gate
-            * (42.0 + 640.0 * ext.powf(0.84))
-            * (0.6 + 0.4 * (1.0 - orogen));
+            * (30.0 + 540.0 * clampf(ext * 0.66 + rift * 0.58, 0.0, 2.0).powf(0.84))
+            * (0.58 + 0.42 * (1.0 - collision_cc));
+        let trench_driver = clampf(
+            subduction * 0.94 + collision_oc_ocean * 0.7 + collision_oo * 0.56 + comp * 0.46,
+            0.0,
+            1.8,
+        );
         let trench_cut = tectonic_scale
             * ocean_gate
-            * (90.0 + 1730.0 * comp.powf(0.92))
+            * (70.0 + 1650.0 * trench_driver.powf(0.9))
             * (0.66 + 0.34 * ocean_core.powf(0.42));
+        let foreland_sag = tectonic_scale
+            * land_gate
+            * (22.0 + 150.0 * collision_cc)
+            * (0.52 + 0.48 * (1.0 - orogen_cc))
+            * (0.7 + 0.3 * interior_weight);
+        let backarc_sag = tectonic_scale
+            * land_gate
+            * (18.0 + 138.0 * collision_oc_cont)
+            * (0.45 + 0.55 * (1.0 - arc_orogen))
+            * (0.68 + 0.32 * interior_weight);
         let transform_term = tectonic_scale
             * 140.0
             * shear.powf(0.9)
             * (regional_signal * 0.6 + micro_signal * 0.4)
-            * (land_gate + ocean_gate).min(1.0);
-        let base = mountain_uplift + transpress_uplift + ridge_ocean_uplift - trench_cut + transform_term;
+            * (land_gate + ocean_gate).min(1.0)
+            * (0.62 + 0.38 * (1.0 - collision_cc));
+        let base = mountain_uplift + transpress_uplift + ridge_ocean_uplift
+            - trench_cut
+            - foreland_sag
+            - backarc_sag
+            + transform_term;
 
         let continental_base = if continental_raw >= 0.0 {
             85.0 + land_core.powf(1.16) * (1480.0 + 2350.0 * smoothstep(0.18, 0.96, land_core))

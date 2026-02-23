@@ -67,3 +67,28 @@
 6. Зафиксированные метрики (`gen:score`):
    - `high90BoundaryShare` ~ `0.015..0.035`,
    - `high98BoundaryShare` ~ `0.034..0.074`.
+
+### 2026-02-23 (этап 2, режимы столкновений)
+
+1. В `compute_relief` добавлены явные режимы столкновений по типам плит:
+   - `cc_collision` (continent-continent),
+   - `oc_collision_cont` (ocean-continent, континентальная сторона),
+   - `oc_collision_ocean` (ocean-continent, океаническая сторона),
+   - `oo_collision` (ocean-ocean).
+2. Добавлены поля:
+   - `subduction_source`,
+   - `rift_source`.
+3. Источник деформации теперь учитывает:
+   - относительную кинематику соседних плит,
+   - тип пары плит (C-C / O-C / O-O),
+   - локальные режимы convergence/divergence/transform.
+4. Добавлено сглаживание collision-полей в деформационные коридоры.
+5. Обновлены формулы uplift/trench:
+   - отдельный вклад для collisional orogen (`orogen_cc`) и arc orogen (`arc_orogen`),
+   - trench зависит от `subduction_source` и океанической стороны O-C/O-O,
+   - ridge uplift связан с `rift_source`,
+   - добавлены `foreland_sag` и `backarc_sag`.
+6. Контрольные прогоны:
+   - `generations/runs/2026-02-23T02-33-53-443Z_seed-717171`,
+   - `generations/runs/2026-02-23T02-34-53-621Z_seed-717172`,
+   - `generations/runs/2026-02-23T02-35-25-526Z_seed-717173`.
