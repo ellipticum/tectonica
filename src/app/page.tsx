@@ -27,9 +27,20 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { HeightGradientLegend } from "@/components/planet/height-gradient-legend";
 import { PlanetLayerCanvas, type ProjectionMode } from "@/components/planet/layer-canvas";
+import { LabeledInput, NumericRange } from "@/components/planet/form-controls";
+import { buildLayerLegend, formatNum } from "@/lib/planet/layer-legend";
 import {
-  BIOME_COLORS,
+  GENERATION_PRESETS,
+  LAYER_OPTIONS,
+  PREVIEW_PRESETS,
+  SEED_SEARCH_PRESETS,
+  type GenerationPresetId,
+  type PreviewPresetId,
+  type SeedSearchPresetId,
+} from "@/lib/planet/ui-presets";
+import {
   BIOME_NAMES,
   DEFAULT_PLANET,
   DEFAULT_SIMULATION,
@@ -46,41 +57,8 @@ import {
 } from "@/lib/planet/simulation";
 import { runSimulationRust } from "@/lib/planet/rust-simulation";
 
-const LAYER_OPTIONS: Array<{ id: WorldDisplayLayer; label: string }> = [
-  { id: "plates", label: "Плиты" },
-  { id: "height", label: "Высоты" },
-  { id: "slope", label: "Уклон" },
-  { id: "rivers", label: "Реки" },
-  { id: "precipitation", label: "Осадки" },
-  { id: "temperature", label: "Температура" },
-  { id: "biomes", label: "Биомы" },
-  { id: "settlement", label: "Расселение" },
-  { id: "events", label: "События" },
-];
-
 const clamp = (v: number, min: number, max: number) => (v < min ? min : v > max ? max : v);
 
-const PREVIEW_PRESETS = [
-  { id: "low", label: "Быстро x0.25 (~512×256)", scale: 0.25 },
-  { id: "balanced", label: "Баланс x0.5 (~1024×512)", scale: 0.5 },
-  { id: "native", label: "Натив (2048×1024)", scale: 1 },
-] as const;
-
-type PreviewPresetId = (typeof PREVIEW_PRESETS)[number]["id"];
-const GENERATION_PRESETS = [
-  { id: "ultra", label: "Сверхбыстро (тест)" },
-  { id: "fast", label: "Быстро (черновик)" },
-  { id: "balanced", label: "Баланс" },
-  { id: "detailed", label: "Детально" },
-] as const;
-type GenerationPresetId = (typeof GENERATION_PRESETS)[number]["id"];
-const SEED_SEARCH_PRESETS = [
-  { id: "1", label: "1 seed (fast)", attempts: 1 },
-  { id: "4", label: "4 seeds (selection)", attempts: 4 },
-  { id: "8", label: "8 seeds (earth-like)", attempts: 8 },
-  { id: "12", label: "12 seeds (max selection)", attempts: 12 },
-] as const;
-type SeedSearchPresetId = (typeof SEED_SEARCH_PRESETS)[number]["id"];
 type ViewMode = "map" | "globe";
 type FlatProjection = "equirectangular" | "mercator";
 
@@ -114,224 +92,6 @@ type SimulationWorkerEvent =
   | SimulationWorkerProgress
   | SimulationWorkerResult
   | SimulationWorkerError;
-
-type ColorStop = {
-  t: number;
-  color: [number, number, number];
-};
-
-const OCEAN_STOPS: ColorStop[] = [
-  { t: 0, color: [198, 218, 230] },
-  { t: 0.16, color: [166, 196, 216] },
-  { t: 0.36, color: [125, 164, 197] },
-  { t: 0.58, color: [86, 127, 168] },
-  { t: 0.78, color: [52, 91, 135] },
-  { t: 1, color: [18, 43, 83] },
-];
-
-const LAND_STOPS: ColorStop[] = [
-  { t: 0, color: [202, 208, 161] },
-  { t: 0.14, color: [182, 194, 140] },
-  { t: 0.3, color: [156, 177, 118] },
-  { t: 0.48, color: [169, 166, 113] },
-  { t: 0.66, color: [158, 139, 95] },
-  { t: 0.8, color: [132, 108, 78] },
-  { t: 0.92, color: [96, 75, 56] },
-  { t: 1, color: [60, 45, 36] },
-];
-
-const formatNum = (value: number) => value.toLocaleString("ru-RU", { maximumFractionDigits: 2 });
-type LegendItem = { color: string; label: string };
-
-const hslToCss = (hue: number, saturation: number, lightness: number) =>
-  `hsl(${hue.toFixed(0)} ${Math.round(saturation)}% ${Math.round(lightness)}%)`;
-
-const rgbCss = (rgb: [number, number, number]) => `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
-
-const sampleStops = (stops: ColorStop[], t: number) => {
-  const k = clamp(t, 0, 1);
-  for (let i = 1; i < stops.length; i++) {
-    const a = stops[i - 1];
-    const b = stops[i];
-    if (k <= b.t) {
-      const local = (k - a.t) / Math.max(1e-6, b.t - a.t);
-      return [
-        Math.round(a.color[0] + (b.color[0] - a.color[0]) * local),
-        Math.round(a.color[1] + (b.color[1] - a.color[1]) * local),
-        Math.round(a.color[2] + (b.color[2] - a.color[2]) * local),
-      ] as [number, number, number];
-    }
-  }
-
-  return stops[stops.length - 1]?.color ?? [255, 255, 255];
-};
-
-const heightColor = (value: number, min: number, max: number) => {
-  if (value < 0 && max > 0) {
-    const t = Math.pow(clamp(-value / Math.max(1, -min), 0, 1), 0.68);
-    return rgbCss(sampleStops(OCEAN_STOPS, t));
-  }
-
-  if (max <= 0) {
-    return rgbCss(sampleStops(OCEAN_STOPS, 1));
-  }
-
-  const t = Math.pow(clamp(value / Math.max(1, max), 0, 1), 0.72);
-  return rgbCss(sampleStops(LAND_STOPS, t));
-};
-
-const buildHeightGradient = (minHeight: number, maxHeight: number) => {
-  if (maxHeight <= 0) {
-    const oceanOnlyStops = OCEAN_STOPS.map((s) => {
-      const color = sampleStops(OCEAN_STOPS, 1 - s.t);
-      return `${rgbCss(color)} ${(s.t * 100).toFixed(2)}%`;
-    });
-    return `linear-gradient(90deg, ${oceanOnlyStops.join(", ")})`;
-  }
-  if (minHeight >= 0) {
-    return `linear-gradient(90deg, ${LAND_STOPS.map((s) => `${rgbCss(s.color)} ${(s.t * 100).toFixed(2)}%`).join(", ")})`;
-  }
-
-  const seaSplit = clamp((0 - minHeight) / Math.max(1, maxHeight - minHeight), 0.08, 0.92);
-  const oceanStops = OCEAN_STOPS.map((s) => {
-    const color = sampleStops(OCEAN_STOPS, 1 - s.t);
-    return `${rgbCss(color)} ${(s.t * seaSplit * 100).toFixed(2)}%`;
-  });
-  const landStops = LAND_STOPS.map((s) =>
-    `${rgbCss(s.color)} ${(seaSplit * 100 + s.t * (1 - seaSplit) * 100).toFixed(2)}%`,
-  );
-  return `linear-gradient(90deg, ${[...oceanStops, ...landStops].join(", ")})`;
-};
-
-const slopeLegendColor = (slope: number, maxSlope: number) => {
-  const t = clamp(slope, 0, maxSlope) / Math.max(1, maxSlope);
-  return hslToCss(25 + t * 120, 80, 18 + t * 50);
-};
-
-const climateLegendColor = (value: number, min: number, max: number, temp = false) => {
-  const t = (value - min) / Math.max(1, max - min);
-  if (temp) {
-    return hslToCss(240 - t * 260, 75, 20 + t * 55);
-  }
-  return hslToCss(210 - t * 180, 85, 20 + t * 55);
-};
-
-const buildLayerLegend = (layer: WorldDisplayLayer, result: SimulationResult): LegendItem[] => {
-  const minHeight = result.stats.minHeight;
-  const maxHeight = result.stats.maxHeight;
-  const maxSlope = result.stats.maxSlope;
-  const minTemp = result.stats.minTemperature;
-  const maxTemp = result.stats.maxTemperature;
-  const minPrec = result.stats.minPrecipitation;
-  const maxPrec = result.stats.maxPrecipitation;
-
-  if (layer === "biomes") {
-    return BIOME_NAMES.map((name, index) => {
-      const color = BIOME_COLORS[index] ?? [255, 255, 255];
-      return {
-        color: `rgb(${color[0]}, ${color[1]}, ${color[2]})`,
-        label: `${index}. ${name}`,
-      };
-    });
-  }
-
-  if (layer === "plates") {
-    const plateSet = new Set(result.plates);
-    const plateIds = Array.from(plateSet).sort((a, b) => a - b);
-    const limit = Math.min(plateIds.length, 12);
-
-    const entries: LegendItem[] = plateIds.slice(0, limit).map((plateId) => {
-      const hue = ((plateId / Math.max(1, plateIds.length)) * 360 + 20) % 360;
-      return {
-        color: hslToCss(hue, 60, 42),
-        label: `Плита ${plateId + 1}`,
-      };
-    });
-
-    if (plateIds.length > limit) {
-      entries.push({
-        color: "rgba(255,255,255,0.25)",
-        label: `...и еще ${plateIds.length - limit} шт.`,
-      });
-    }
-
-    return entries;
-  }
-
-  if (layer === "height") {
-    const vMin = minHeight;
-    const vMax = maxHeight;
-    return [
-      { color: heightColor(vMin, vMin, vMax), label: `Глубокий океан (min ${formatNum(vMin)} м)` },
-      { color: heightColor(vMin * 0.35, vMin, vMax), label: "Мелкая вода (светло-голубая)" },
-      { color: heightColor(vMin * 0.75, vMin, vMax), label: "Глубокая вода (тёмно-голубая)" },
-      { color: heightColor(0, vMin, vMax), label: "Уровень моря: 0 м (светлый оливково-песочный)" },
-      { color: heightColor(vMax * 0.2, vMin, vMax), label: "Низины суши (травянисто-оливковый)" },
-      { color: heightColor(vMax * 0.55, vMin, vMax), label: "Возвышенности (охристо-землистый)" },
-      { color: heightColor(vMax * 0.85, vMin, vMax), label: "Высокогорья (каштановый)" },
-      { color: heightColor(vMax, vMin, vMax), label: `Пики: ~${formatNum(vMax)} м (тёмно-каштановый)` },
-    ];
-  }
-
-  if (layer === "slope") {
-    const max = Math.max(1, maxSlope);
-    return [
-      { color: slopeLegendColor(0, maxSlope), label: "Пологое / слабый уклон" },
-      { color: slopeLegendColor(0.2 * max, maxSlope), label: "Лёгкий уклон" },
-      { color: slopeLegendColor(0.45 * max, maxSlope), label: "Умеренный уклон" },
-      { color: slopeLegendColor(0.7 * max, maxSlope), label: "Крутой" },
-      { color: slopeLegendColor(max, maxSlope), label: "Очень крутой" },
-    ];
-  }
-
-  if (layer === "rivers") {
-    return [
-      { color: "rgb(18, 38, 84)", label: "Низкая/низкоуровневая вода" },
-      { color: "rgb(44, 108, 140)", label: "Озера (впадины)" },
-      { color: "rgb(128, 174, 255)", label: "Река, средняя сила потока" },
-      { color: "rgb(245, 170, 255)", label: "Сильные русла" },
-      { color: "rgb(14, 14, 14)", label: "Остальные области (подложка)" },
-    ];
-  }
-
-  if (layer === "precipitation") {
-    const max = maxPrec;
-    const min = minPrec;
-    return [
-      { color: climateLegendColor(minPrec, min, max), label: "Сухо" },
-      { color: climateLegendColor(minPrec + (max - min) * 0.25, min, max), label: "Низкие осадки" },
-      { color: climateLegendColor(minPrec + (max - min) * 0.5, min, max), label: "Умеренные осадки" },
-      { color: climateLegendColor(minPrec + (max - min) * 0.75, min, max), label: "Высокие осадки" },
-      { color: climateLegendColor(max, min, max), label: "Экстремально влажные" },
-    ];
-  }
-
-  if (layer === "temperature") {
-    return [
-      { color: climateLegendColor(minTemp, minTemp, maxTemp, true), label: "Самый холодный" },
-      { color: climateLegendColor(minTemp + (maxTemp - minTemp) * 0.25, minTemp, maxTemp, true), label: "Холодный" },
-      { color: climateLegendColor(minTemp + (maxTemp - minTemp) * 0.5, minTemp, maxTemp, true), label: "Умеренный" },
-      { color: climateLegendColor(minTemp + (maxTemp - minTemp) * 0.75, minTemp, maxTemp, true), label: "Тёплый" },
-      { color: climateLegendColor(maxTemp, minTemp, maxTemp, true), label: "Очень тёплый" },
-    ];
-  }
-
-  if (layer === "settlement") {
-    return [
-      { color: "rgb(16, 16, 16)", label: "Нет поселений" },
-      { color: "rgb(90, 90, 90)", label: "Слабая активность" },
-      { color: "rgb(145, 145, 145)", label: "Умеренная активность" },
-      { color: "rgb(190, 190, 190)", label: "Развитая колония" },
-      { color: "rgb(236, 236, 236)", label: "Максимальная плотность" },
-    ];
-  }
-
-  return [
-    { color: "rgb(14, 14, 14)", label: "Подложка" },
-    { color: "rgb(70, 80, 130)", label: "Признаки гидро- и рельефной динамики" },
-    { color: "rgb(0, 190, 255)", label: "Сильные потоки после пересчета событий" },
-  ];
-};
 
 export default function HomePage() {
   const [planet, setPlanet] = useState(DEFAULT_PLANET);
@@ -1257,123 +1017,6 @@ export default function HomePage() {
         </aside>
       </div>
     </main>
-  );
-}
-
-function HeightGradientLegend({
-  minHeight,
-  maxHeight,
-}: {
-  minHeight: number;
-  maxHeight: number;
-}) {
-  const seaSplit = minHeight < 0 && maxHeight > 0
-    ? clamp((0 - minHeight) / Math.max(1, maxHeight - minHeight), 0, 1)
-    : null;
-
-  return (
-    <div className="mt-2 space-y-2">
-      <div className="relative h-7 overflow-hidden rounded-md border border-white/15">
-        <div className="absolute inset-0" style={{ background: buildHeightGradient(minHeight, maxHeight) }} />
-        {seaSplit !== null ? (
-          <div
-            className="absolute inset-y-0 w-px bg-white/75"
-            style={{ left: `${(seaSplit * 100).toFixed(2)}%` }}
-            title="Уровень моря"
-          />
-        ) : null}
-      </div>
-      <div className="flex items-center justify-between text-[11px] text-slate-300">
-        <span>{formatNum(minHeight)} м</span>
-        <span>0 м</span>
-        <span>{formatNum(maxHeight)} м</span>
-      </div>
-      <p className="text-[11px] text-slate-400">
-        Океан: светло-голубой → тёмно-синий, суша: зелёный → жёлтый → светлые пики.
-      </p>
-    </div>
-  );
-}
-
-function NumericRange({
-  label,
-  min,
-  max,
-  step,
-  value,
-  onChange,
-}: {
-  label: string;
-  min: number;
-  max: number;
-  step: number;
-  value: number;
-  onChange: (value: number) => void;
-}) {
-  const [draft, setDraft] = useState(value);
-
-  useEffect(() => {
-    setDraft(value);
-  }, [value]);
-
-  const commit = (next: number) => {
-    if (!Number.isFinite(next)) {
-      return;
-    }
-    const clamped = clamp(next, min, max);
-    setDraft(clamped);
-    onChange(clamped);
-  };
-
-  return (
-    <div className="space-y-1.5">
-      <div className="flex items-center justify-between">
-        <Label className="text-slate-300">{label}</Label>
-        <span className="text-xs text-cyan-200">{draft.toFixed(step < 1 ? 2 : step < 10 ? 1 : 0)}</span>
-      </div>
-      <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
-        <Slider
-          value={[draft]}
-          min={min}
-          max={max}
-          step={step}
-          onValueChange={(vals) => setDraft(vals[0] ?? draft)}
-          onValueCommit={(vals) => commit(vals[0] ?? draft)}
-        />
-        <Input
-          type="number"
-          value={draft}
-          min={min}
-          max={max}
-          step={step}
-          onChange={(event) => commit(Number(event.target.value))}
-          className="w-24"
-        />
-      </div>
-    </div>
-  );
-}
-
-function LabeledInput({
-  label,
-  min,
-  max,
-  step,
-  value,
-  onChange,
-}: {
-  label: string;
-  min: number;
-  max: number;
-  step?: number;
-  value: number;
-  onChange: (value: number) => void;
-}) {
-  return (
-    <div className="space-y-1.5">
-      <Label className="text-slate-300">{label}</Label>
-      <Input type="number" value={value} min={min} max={max} step={step} onChange={(event) => onChange(Number(event.target.value))} />
-    </div>
   );
 }
 

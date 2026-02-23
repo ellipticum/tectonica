@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, type MutableRefObject } from "react";
 import { BIOME_COLORS, type WorldDisplayLayer, type SimulationResult } from "@/lib/planet/simulation";
+import { LAND_STOPS, OCEAN_STOPS, sampleColorStops } from "@/lib/planet/height-palette";
 
 export type ProjectionMode = "equirectangular" | "mercator" | "orthographic";
 
@@ -54,44 +55,6 @@ function lerpColor(a: [number, number, number], b: [number, number, number], t: 
     Math.round(a[1] + (b[1] - a[1]) * k),
     Math.round(a[2] + (b[2] - a[2]) * k),
   ] as [number, number, number];
-}
-
-type ColorStop = {
-  t: number;
-  color: [number, number, number];
-};
-
-const OCEAN_STOPS: ColorStop[] = [
-  { t: 0, color: [198, 218, 230] },
-  { t: 0.16, color: [166, 196, 216] },
-  { t: 0.36, color: [125, 164, 197] },
-  { t: 0.58, color: [86, 127, 168] },
-  { t: 0.78, color: [52, 91, 135] },
-  { t: 1, color: [18, 43, 83] },
-];
-
-const LAND_STOPS: ColorStop[] = [
-  { t: 0, color: [202, 208, 161] },
-  { t: 0.14, color: [182, 194, 140] },
-  { t: 0.3, color: [156, 177, 118] },
-  { t: 0.48, color: [169, 166, 113] },
-  { t: 0.66, color: [158, 139, 95] },
-  { t: 0.8, color: [132, 108, 78] },
-  { t: 0.92, color: [96, 75, 56] },
-  { t: 1, color: [60, 45, 36] },
-];
-
-function sampleStops(stops: ColorStop[], t: number): [number, number, number] {
-  const k = clamp(t, 0, 1);
-  for (let i = 1; i < stops.length; i++) {
-    const a = stops[i - 1];
-    const b = stops[i];
-    if (k <= b.t) {
-      const local = (k - a.t) / Math.max(1e-6, b.t - a.t);
-      return lerpColor(a.color, b.color, local);
-    }
-  }
-  return stops[stops.length - 1]?.color ?? [255, 255, 255];
 }
 
 const DEG_TO_RAD = Math.PI / 180;
@@ -216,14 +179,14 @@ function heightToRgb(
 ): [number, number, number] {
   if (height < 0) {
     const depthT = Math.pow(clamp(-height / Math.max(1, -minHeight), 0, 1), 0.68);
-    return sampleStops(OCEAN_STOPS, depthT);
+    return sampleColorStops(OCEAN_STOPS, depthT);
   }
 
   if (maxHeight <= 0) return OCEAN_STOPS[0]?.color ?? [168, 221, 255];
 
   const landTLinear = clamp((height - landMinRef) / Math.max(1, landMaxRef - landMinRef), 0, 1);
   const landT = Math.pow(landTLinear, 0.72);
-  let color = sampleStops(LAND_STOPS, landT);
+  let color = sampleColorStops(LAND_STOPS, landT);
 
   if (height >= 0 && height < 260) {
     const coastT = clamp(1 - height / 260, 0, 1);
