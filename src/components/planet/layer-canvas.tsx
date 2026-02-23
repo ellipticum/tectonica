@@ -48,15 +48,6 @@ function clamp(value: number, min: number, max: number) {
   return value;
 }
 
-function lerpColor(a: [number, number, number], b: [number, number, number], t: number) {
-  const k = clamp(t, 0, 1);
-  return [
-    Math.round(a[0] + (b[0] - a[0]) * k),
-    Math.round(a[1] + (b[1] - a[1]) * k),
-    Math.round(a[2] + (b[2] - a[2]) * k),
-  ] as [number, number, number];
-}
-
 const DEG_TO_RAD = Math.PI / 180;
 const RAD_TO_DEG = 180 / Math.PI;
 const MERCATOR_MAX_LAT = 85;
@@ -186,14 +177,7 @@ function heightToRgb(
 
   const landTLinear = clamp((height - landMinRef) / Math.max(1, landMaxRef - landMinRef), 0, 1);
   const landT = Math.pow(landTLinear, 0.72);
-  let color = sampleColorStops(LAND_STOPS, landT);
-
-  if (height >= 0 && height < 260) {
-    const coastT = clamp(1 - height / 260, 0, 1);
-    color = lerpColor(color, [214, 198, 156], 0.16 * coastT);
-  }
-
-  return color;
+  return sampleColorStops(LAND_STOPS, landT);
 }
 
 function landHillshade(heightMap: Float32Array, width: number, height: number, x: number, y: number): number {

@@ -5,6 +5,7 @@ export {
   BIOME_NAMES,
   LAYER_GRAPH,
   type EventKind,
+  type GenerationScope,
   type HeightExportPayload,
   type LayerId,
   type LayerSpec,
@@ -21,86 +22,8 @@ export {
   type WorldEventRecord,
 } from "./simulation/types";
 
-import { clamp, minMax } from "./simulation/core";
-import { computePlates } from "./simulation/plates";
-import { computeRelief } from "./simulation/relief";
-import { applyEvents, ensureEventEnergy } from "./simulation/events";
-import { computeSlope, computeHydrology } from "./simulation/hydrology";
-import { computeClimate } from "./simulation/climate";
-import { computeBiomes, computeSettlement } from "./simulation/biomes";
-import { evaluateRecompute } from "./simulation/recompute";
-import {
-  LAYER_GRAPH,
-  type HeightExportPayload,
-  type RecomputeTrigger,
-  type SimulationConfig,
-  type SimulationResult,
-  type WorldEventRecord,
-} from "./simulation/types";
-import { WORLD_HEIGHT, WORLD_WIDTH } from "./simulation/core";
-
-export function runSimulation(config: SimulationConfig, reason: RecomputeTrigger = "global"): SimulationResult {
-  const planet = { ...config.planet };
-  const tectonics = { ...config.tectonics };
-  const events = config.events.map((event) => ensureEventEnergy(event as WorldEventRecord));
-
-  const layerOrder = evaluateRecompute(reason);
-  const platesLayer = computePlates(planet, tectonics, config.seed);
-  const reliefRaw = computeRelief(planet, tectonics, platesLayer, config.seed);
-  const eventRelief = applyEvents(planet, reliefRaw.relief, events);
-  const { slope, minSlope, maxSlope } = computeSlope(eventRelief.relief);
-  const hydro = computeHydrology(eventRelief.relief, slope);
-  const climate = computeClimate(
-    planet,
-    eventRelief.relief,
-    slope,
-    hydro.rivers,
-    hydro.flowAccumulation,
-    eventRelief.aerosol,
-  );
-  const biomes = computeBiomes(climate.temperature, climate.precipitation, eventRelief.relief);
-  const settlement = computeSettlement(biomes, eventRelief.relief, climate.temperature, climate.precipitation);
-  const heightRange = minMax(eventRelief.relief);
-
-  return {
-    width: WORLD_WIDTH,
-    height: WORLD_HEIGHT,
-    seed: config.seed,
-    specs: LAYER_GRAPH.map((s) => ({
-      ...s,
-      dependsOn: [...s.dependsOn],
-    })),
-    recomputedLayers: layerOrder,
-    planet: {
-      seaLevel: reliefRaw.seaLevel,
-      radiusKm: planet.radiusKm,
-      oceanPercent: planet.oceanPercent,
-    },
-    plates: platesLayer.plateField,
-    boundaryTypes: platesLayer.boundaryTypes,
-    heightMap: eventRelief.relief,
-    slopeMap: slope,
-    riverMap: hydro.rivers,
-    lakeMap: hydro.lakes,
-    flowDirection: hydro.flowDirection,
-    flowAccumulation: hydro.flowAccumulation,
-    temperatureMap: climate.temperature,
-    precipitationMap: climate.precipitation,
-    biomeMap: biomes,
-    settlementMap: settlement,
-    eventHistory: events,
-    stats: {
-      minHeight: heightRange.min,
-      maxHeight: heightRange.max,
-      minTemperature: climate.minTemp,
-      maxTemperature: climate.maxTemp,
-      minPrecipitation: climate.minPrec,
-      maxPrecipitation: climate.maxPrec,
-      minSlope,
-      maxSlope,
-    },
-  };
-}
+import { clamp } from "./simulation/core";
+import type { HeightExportPayload, SimulationResult } from "./simulation/types";
 
 export function toHeightExportPayload(
   result: SimulationResult,

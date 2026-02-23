@@ -8,6 +8,7 @@ export type LayerId =
   | "settlement";
 
 export type RecomputeTrigger = "global" | "tectonics" | "events";
+export type GenerationScope = "planet" | "tasmania";
 
 export interface LayerSpec {
   id: LayerId;
@@ -169,6 +170,7 @@ export interface SimulationConfig {
   tectonics: TectonicInputs;
   events: WorldEventRecord[];
   generationPreset?: "ultra" | "fast" | "balanced" | "detailed";
+  scope?: GenerationScope;
 }
 
 export interface SimulationStats {

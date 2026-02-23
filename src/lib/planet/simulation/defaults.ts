@@ -23,4 +23,5 @@ export const DEFAULT_SIMULATION: SimulationConfig = {
   tectonics: DEFAULT_TECTONICS,
   events: [],
   generationPreset: "balanced",
+  scope: "planet",
 };

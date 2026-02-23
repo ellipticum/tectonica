@@ -107,13 +107,13 @@ export const buildLayerLegend = (layer: WorldDisplayLayer, result: SimulationRes
     const vMax = maxHeight;
     return [
       { color: heightColor(vMin, vMin, vMax), label: `Глубокий океан (min ${formatNum(vMin)} м)` },
-      { color: heightColor(vMin * 0.35, vMin, vMax), label: "Мелкая вода (светло-голубая)" },
-      { color: heightColor(vMin * 0.75, vMin, vMax), label: "Глубокая вода (тёмно-голубая)" },
-      { color: heightColor(0, vMin, vMax), label: "Уровень моря: 0 м (светлый оливково-песочный)" },
-      { color: heightColor(vMax * 0.2, vMin, vMax), label: "Низины суши (травянисто-оливковый)" },
-      { color: heightColor(vMax * 0.55, vMin, vMax), label: "Возвышенности (охристо-землистый)" },
-      { color: heightColor(vMax * 0.85, vMin, vMax), label: "Высокогорья (каштановый)" },
-      { color: heightColor(vMax, vMin, vMax), label: `Пики: ~${formatNum(vMax)} м (тёмно-каштановый)` },
+      { color: heightColor(vMin * 0.35, vMin, vMax), label: "Мелкая вода (пастельно-голубая)" },
+      { color: heightColor(vMin * 0.75, vMin, vMax), label: "Глубокая вода (кобальтово-синяя)" },
+      { color: heightColor(0, vMin, vMax), label: "Уровень моря: 0 м (насыщенный зелёный)" },
+      { color: heightColor(vMax * 0.2, vMin, vMax), label: "Низины суши (зелёный)" },
+      { color: heightColor(vMax * 0.55, vMin, vMax), label: "Возвышенности (жёлто-охристый)" },
+      { color: heightColor(vMax * 0.85, vMin, vMax), label: "Высокогорья (серо-светлые)" },
+      { color: heightColor(vMax, vMin, vMax), label: `Пики: ~${formatNum(vMax)} м (почти белый)` },
     ];
   }
 

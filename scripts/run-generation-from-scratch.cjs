@@ -10,8 +10,10 @@ if (!fs.existsSync(pkgPath)) {
 
 const { run_simulation_with_progress } = require(pkgPath);
 
-const WIDTH = 2048;
-const HEIGHT = 1024;
+const EXPECTED_SIZE = {
+  planet: { width: 2048, height: 1024 },
+  tasmania: { width: 1024, height: 512 },
+};
 
 function clamp(v, min, max) {
   return v < min ? min : v > max ? max : v;
@@ -34,33 +36,25 @@ function sampleStops(stops, t) {
   return stops[stops.length - 1].color;
 }
 
-function lerpColor(a, b, t) {
-  const k = clamp(t, 0, 1);
-  return [
-    Math.round(a[0] + (b[0] - a[0]) * k),
-    Math.round(a[1] + (b[1] - a[1]) * k),
-    Math.round(a[2] + (b[2] - a[2]) * k),
-  ];
-}
-
 const OCEAN_STOPS = [
-  { t: 0, color: [198, 218, 230] },
-  { t: 0.16, color: [166, 196, 216] },
-  { t: 0.36, color: [125, 164, 197] },
-  { t: 0.58, color: [86, 127, 168] },
-  { t: 0.78, color: [52, 91, 135] },
-  { t: 1, color: [18, 43, 83] },
+  { t: 0, color: [220, 236, 250] },
+  { t: 0.14, color: [188, 216, 243] },
+  { t: 0.3, color: [150, 190, 232] },
+  { t: 0.5, color: [108, 156, 218] },
+  { t: 0.72, color: [70, 120, 195] },
+  { t: 0.88, color: [46, 87, 169] },
+  { t: 1, color: [30, 61, 143] },
 ];
 
 const LAND_STOPS = [
-  { t: 0, color: [202, 208, 161] },
-  { t: 0.14, color: [182, 194, 140] },
-  { t: 0.3, color: [156, 177, 118] },
-  { t: 0.48, color: [169, 166, 113] },
-  { t: 0.66, color: [158, 139, 95] },
-  { t: 0.8, color: [132, 108, 78] },
-  { t: 0.92, color: [96, 75, 56] },
-  { t: 1, color: [60, 45, 36] },
+  { t: 0, color: [4, 104, 64] },       // 0 m
+  { t: 0.118, color: [36, 129, 53] },  // 200 m
+  { t: 0.294, color: [215, 179, 95] }, // 500 m
+  { t: 0.471, color: [147, 51, 10] },  // 800 m
+  { t: 0.706, color: [99, 96, 94] },   // 1200 m
+  { t: 0.824, color: [219, 218, 218] }, // 1400 m
+  { t: 0.882, color: [253, 253, 251] }, // 1500 m
+  { t: 1, color: [247, 246, 244] },    // 1700 m
 ];
 
 function estimateLandToneRange(heightMap, maxHeight) {
@@ -116,11 +110,11 @@ function estimateLandToneRange(heightMap, maxHeight) {
   return { minRef, maxRef };
 }
 
-function landHillshade(heightMap, width, height, x, y) {
+function landHillshade(heightMap, width, height, x, y, wrapX = true) {
   const yUp = Math.max(0, y - 1);
   const yDown = Math.min(height - 1, y + 1);
-  const xLeft = (x - 1 + width) % width;
-  const xRight = (x + 1) % width;
+  const xLeft = wrapX ? (x - 1 + width) % width : Math.max(0, x - 1);
+  const xRight = wrapX ? (x + 1) % width : Math.min(width - 1, x + 1);
   const left = heightMap[y * width + xLeft] || 0;
   const right = heightMap[y * width + xRight] || 0;
   const up = heightMap[yUp * width + x] || 0;
@@ -155,12 +149,7 @@ function heightColor(value, min, max, landMinRef, landMaxRef) {
   }
   const tLinear = clamp((value - landMinRef) / Math.max(1, landMaxRef - landMinRef), 0, 1);
   const t = Math.pow(tLinear, 0.72);
-  let color = sampleStops(LAND_STOPS, t);
-  if (value >= 0 && value < 260) {
-    const coastT = clamp(1 - value / 260, 0, 1);
-    color = lerpColor(color, [214, 198, 156], 0.16 * coastT);
-  }
-  return color;
+  return sampleStops(LAND_STOPS, t);
 }
 
 function biomeColor(id) {
@@ -248,6 +237,7 @@ function writeJpg(filePath, width, height, pixelAt, quality = 92) {
 function run() {
   const seed = Number(process.env.SEED || Math.floor(Math.random() * 2_147_483_647));
   const generationPreset = process.env.PRESET || 'detailed';
+  const scope = process.env.SCOPE || 'planet';
 
   const config = {
     seed,
@@ -268,6 +258,7 @@ function run() {
     },
     events: [],
     generationPreset,
+    scope,
   };
 
   let last = -1;
@@ -283,8 +274,9 @@ function run() {
 
   const width = result.width;
   const height = result.height;
-  if (width !== WIDTH || height !== HEIGHT) {
-    console.warn(`Unexpected map size: ${width}x${height}`);
+  const expected = EXPECTED_SIZE[scope] || EXPECTED_SIZE.planet;
+  if (width !== expected.width || height !== expected.height) {
+    console.warn(`Unexpected map size for scope=${scope}: ${width}x${height}`);
   }
 
   const heightMap = result.heightMap();
@@ -309,6 +301,7 @@ function run() {
     durationMs: Date.now() - t0,
     seed,
     generationPreset,
+    scope,
     config,
     width,
     height,
@@ -344,6 +337,7 @@ function run() {
   const minH = meta.stats.minHeight;
   const maxH = meta.stats.maxHeight;
   const landToneRange = estimateLandToneRange(heightMap, maxH);
+  const wrapXForHillshade = scope !== 'tasmania';
 
   writeBmp(path.join(runDir, 'height_preview.bmp'), width, height, (i, x, y) => {
     const h = heightMap[i];
@@ -351,7 +345,7 @@ function run() {
     if (h < 0) {
       return base;
     }
-    const shade = landHillshade(heightMap, width, height, x, y);
+    const shade = landHillshade(heightMap, width, height, x, y, wrapXForHillshade);
     return [
       Math.round(clamp(base[0] * shade, 0, 255)),
       Math.round(clamp(base[1] * shade, 0, 255)),
@@ -364,7 +358,7 @@ function run() {
     if (h < 0) {
       return base;
     }
-    const shade = landHillshade(heightMap, width, height, x, y);
+    const shade = landHillshade(heightMap, width, height, x, y, wrapXForHillshade);
     return [
       Math.round(clamp(base[0] * shade, 0, 255)),
       Math.round(clamp(base[1] * shade, 0, 255)),

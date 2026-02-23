@@ -8,6 +8,9 @@ use wasm_bindgen::prelude::*;
 const WORLD_WIDTH: usize = 2048;
 const WORLD_HEIGHT: usize = 1024;
 const WORLD_SIZE: usize = WORLD_WIDTH * WORLD_HEIGHT;
+const ISLAND_WIDTH: usize = 1024;
+const ISLAND_HEIGHT: usize = 512;
+const ISLAND_SIZE: usize = ISLAND_WIDTH * ISLAND_HEIGHT;
 const RADIANS: f32 = std::f32::consts::PI / 180.0;
 const KILOMETERS_PER_DEGREE: f32 = 111.319_490_793;
 
@@ -356,6 +359,8 @@ pub struct SimulationConfig {
     pub events: Vec<WorldEventRecord>,
     #[serde(default)]
     pub generation_preset: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -363,6 +368,12 @@ enum RecomputeReason {
     Global,
     Tectonics,
     Events,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GenerationScope {
+    Planet,
+    Tasmania,
 }
 
 #[derive(Clone, Copy)]
@@ -377,6 +388,7 @@ enum GenerationPreset {
 struct DetailProfile {
     buoyancy_smooth_passes: usize,
     erosion_rounds: usize,
+    fluvial_rounds: usize,
     ocean_smooth_passes: usize,
     max_kernel_radius: i32,
     fault_iterations: usize,
@@ -398,6 +410,7 @@ fn detail_profile(preset: GenerationPreset) -> DetailProfile {
         GenerationPreset::Ultra => DetailProfile {
             buoyancy_smooth_passes: 1,
             erosion_rounds: 0,
+            fluvial_rounds: 0,
             ocean_smooth_passes: 0,
             max_kernel_radius: 3,
             fault_iterations: 720,
@@ -407,6 +420,7 @@ fn detail_profile(preset: GenerationPreset) -> DetailProfile {
         GenerationPreset::Fast => DetailProfile {
             buoyancy_smooth_passes: 6,
             erosion_rounds: 1,
+            fluvial_rounds: 1,
             ocean_smooth_passes: 1,
             max_kernel_radius: 4,
             fault_iterations: 1300,
@@ -415,7 +429,8 @@ fn detail_profile(preset: GenerationPreset) -> DetailProfile {
         },
         GenerationPreset::Detailed => DetailProfile {
             buoyancy_smooth_passes: 18,
-            erosion_rounds: 2,
+            erosion_rounds: 3,
+            fluvial_rounds: 3,
             ocean_smooth_passes: 3,
             max_kernel_radius: 6,
             fault_iterations: 3400,
@@ -425,6 +440,7 @@ fn detail_profile(preset: GenerationPreset) -> DetailProfile {
         GenerationPreset::Balanced => DetailProfile {
             buoyancy_smooth_passes: 14,
             erosion_rounds: 2,
+            fluvial_rounds: 2,
             ocean_smooth_passes: 2,
             max_kernel_radius: 5,
             fault_iterations: 2600,
@@ -440,6 +456,12 @@ fn parse_reason(reason: &str) -> RecomputeReason {
         "events" => RecomputeReason::Events,
         _ => RecomputeReason::Global,
     }
+}
+
+fn parse_scope(_value: Option<&str>) -> GenerationScope {
+    // Island scope is temporarily disabled in production path:
+    // current quality target is the full procedural planet pipeline.
+    GenerationScope::Planet
 }
 
 fn evaluate_recompute(reason: RecomputeReason) -> Vec<String> {
@@ -2456,14 +2478,14 @@ fn stabilize_landmass_topology(relief: &mut [f32], planet: &PlanetInputs, detail
 
     let min_land_cells = clampf(
         WORLD_SIZE as f32
-            * (0.0018 + (planet.ocean_percent / 100.0) * 0.0018),
-        1800.0,
-        18_000.0,
+            * (0.0008 + (planet.ocean_percent / 100.0) * 0.0010),
+        650.0,
+        9_500.0,
     ) as usize;
     let min_inland_water_cells = clampf(
-        WORLD_SIZE as f32 * (0.0019 + (1.0 - planet.ocean_percent / 100.0) * 0.0014),
-        2200.0,
-        26_000.0,
+        WORLD_SIZE as f32 * (0.0009 + (1.0 - planet.ocean_percent / 100.0) * 0.0010),
+        700.0,
+        10_000.0,
     ) as usize;
     clean_landmask_components(&mut landmask, min_land_cells, min_inland_water_cells);
 
@@ -2939,6 +2961,130 @@ fn warp_coastal_band(relief: &mut [f32], seed: u32, cache: &WorldCache) {
     }
 
     relief.copy_from_slice(&next);
+}
+
+fn carve_fluvial_valleys(
+    relief: &mut [f32],
+    detail: DetailProfile,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) {
+    if detail.fluvial_rounds == 0 {
+        return;
+    }
+
+    let rounds = detail.fluvial_rounds.min(4);
+    let mut flow_direction = vec![-1_i32; WORLD_SIZE];
+    let mut flow_accumulation = vec![1.0_f32; WORLD_SIZE];
+    let mut order: Vec<usize> = (0..WORLD_SIZE).collect();
+    let mut updated = relief.to_vec();
+
+    for round in 0..rounds {
+        for y in 0..WORLD_HEIGHT {
+            let t = (round as f32 + y as f32 / WORLD_HEIGHT as f32) / rounds as f32;
+            progress.phase(progress_base, progress_span, 0.35 * t);
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                let h = relief[i];
+                let mut best_drop = 0.0_f32;
+                let mut best = -1_i32;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                        let drop = h - relief[j];
+                        if drop > best_drop {
+                            best_drop = drop;
+                            best = j as i32;
+                        }
+                    }
+                }
+                flow_direction[i] = best;
+            }
+        }
+
+        flow_accumulation.fill(1.0);
+        order.sort_by(|a, b| relief[*b].total_cmp(&relief[*a]));
+        for (rank, i) in order.iter().copied().enumerate() {
+            if rank % (WORLD_WIDTH * 4) == 0 {
+                progress.phase(
+                    progress_base,
+                    progress_span,
+                    0.35 + 0.25 * (rank as f32 / WORLD_SIZE as f32),
+                );
+            }
+            if relief[i] <= -25.0 {
+                continue;
+            }
+            let to = flow_direction[i];
+            if to >= 0 {
+                let j = to as usize;
+                let drop = (relief[i] - relief[j]).max(0.0);
+                flow_accumulation[j] += flow_accumulation[i] * (1.0 + drop / 1600.0);
+            }
+        }
+
+        let mut sorted_acc = flow_accumulation.clone();
+        sorted_acc.sort_by(|a, b| a.total_cmp(b));
+        let channel_ref = quantile_sorted(&sorted_acc, 0.992).max(1.0);
+
+        updated.copy_from_slice(relief);
+        for y in 0..WORLD_HEIGHT {
+            let t = (round as f32 + y as f32 / WORLD_HEIGHT as f32) / rounds as f32;
+            progress.phase(progress_base, progress_span, 0.6 + 0.4 * t);
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                let h = relief[i];
+                if h <= 8.0 {
+                    continue;
+                }
+
+                let mut max_drop = 0.0_f32;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                        max_drop = max_drop.max((h - relief[j]).max(0.0));
+                    }
+                }
+                if max_drop < 2.0 {
+                    continue;
+                }
+
+                let channel = ((flow_accumulation[i] / channel_ref) - 1.0).max(0.0).min(8.0);
+                if channel <= 0.0 {
+                    continue;
+                }
+
+                let slope_t = clampf(max_drop / 340.0, 0.0, 1.8);
+                let coast_t = 1.0 - smoothstep(60.0, 1900.0, h);
+                let incision = (7.5 + 26.0 * channel.powf(0.65) + 20.0 * slope_t.powf(0.7))
+                    * (0.4 + 0.6 * coast_t);
+                let cut = incision.min((h - 4.0).max(0.0));
+                if cut <= 0.0 {
+                    continue;
+                }
+
+                updated[i] = h - cut;
+                let to = flow_direction[i];
+                if to >= 0 {
+                    let j = to as usize;
+                    if relief[j] > 0.0 {
+                        updated[j] += cut * 0.04;
+                    }
+                }
+            }
+        }
+
+        relief.copy_from_slice(&updated);
+    }
+
+    progress.phase(progress_base, progress_span, 1.0);
 }
 
 fn apply_ocean_profile(
@@ -4237,6 +4383,11 @@ fn compute_relief(
     stabilize_landmass_topology(&mut relief, planet, detail);
     apply_coastal_detail(&mut relief, seed, cache);
     defuse_plate_linearity(&mut relief, plates, seed, cache, detail);
+    defuse_coastal_linearity(&mut relief, plates, seed_mix ^ 0x1F23_BA47, cache);
+    fracture_coastline_band(&mut relief, seed_mix ^ 0x7B91_5C31, cache);
+    warp_coastal_band(&mut relief, seed_mix ^ 0x6A31_91D7, cache);
+    break_straight_coasts(&mut relief, seed_mix ^ 0x2CD8_7A43, cache);
+    cleanup_coastal_speckles(&mut relief);
 
     let mut sorted_after_coast = relief.clone();
     sorted_after_coast.sort_by(|a, b| a.total_cmp(b));
@@ -4249,7 +4400,14 @@ fn compute_relief(
     if detail.erosion_rounds == 0 {
         defuse_orogenic_ribbons(&mut relief, seed_mix, cache, detail);
     }
-    progress.phase(progress_base, progress_span, 0.86);
+    carve_fluvial_valleys(
+        &mut relief,
+        detail,
+        progress,
+        progress_base + progress_span * 0.82,
+        progress_span * 0.08,
+    );
+    progress.phase(progress_base, progress_span, 0.9);
     apply_ocean_profile(
         &mut relief,
         &plates.boundary_types,
@@ -4259,17 +4417,18 @@ fn compute_relief(
         cache,
         detail,
         progress,
-        progress_base + progress_span * 0.86,
-        progress_span * 0.1,
+        progress_base + progress_span * 0.9,
+        progress_span * 0.08,
     );
     reshape_ocean_boundaries(
         &mut relief,
         &plates.boundary_types,
         &plates.boundary_strength,
     );
+    cleanup_coastal_speckles(&mut relief);
     suppress_subgrid_islands(&mut relief, planet);
     dampen_isolated_shallow_ocean(&mut relief);
-    progress.phase(progress_base, progress_span, 0.98);
+    progress.phase(progress_base, progress_span, 0.985);
 
     let mut sorted_final = relief.clone();
     sorted_final.sort_by(|a, b| a.total_cmp(b));
@@ -4458,6 +4617,8 @@ fn compute_hydrology(
     progress_span: f32,
 ) -> (Vec<i32>, Vec<f32>, Vec<f32>, Vec<u8>) {
     let mut flow_direction = vec![-1_i32; WORLD_SIZE];
+    let mut secondary_direction = vec![-1_i32; WORLD_SIZE];
+    let mut primary_share = vec![1.0_f32; WORLD_SIZE];
     let mut flow_accumulation = vec![1.0_f32; WORLD_SIZE];
 
     for y in 0..WORLD_HEIGHT {
@@ -4470,7 +4631,9 @@ fn compute_hydrology(
             let i = index(x, y);
             let h = heights[i];
             let mut best_drop = 0.0_f32;
+            let mut second_drop = 0.0_f32;
             let mut best = -1_i32;
+            let mut second = -1_i32;
 
             for oy in -1..=1 {
                 for ox in -1..=1 {
@@ -4480,13 +4643,25 @@ fn compute_hydrology(
                     let j = index_spherical(x as i32 + ox, y as i32 + oy);
                     let drop = h - heights[j];
                     if drop > best_drop {
+                        second_drop = best_drop;
+                        second = best;
                         best_drop = drop;
                         best = j as i32;
+                    } else if drop > second_drop {
+                        second_drop = drop;
+                        second = j as i32;
                     }
                 }
             }
 
             flow_direction[i] = best;
+            secondary_direction[i] = second;
+            if best >= 0 && second >= 0 {
+                let total = (best_drop + second_drop).max(1e-6);
+                primary_share[i] = clampf(best_drop / total, 0.55, 0.92);
+            } else {
+                primary_share[i] = 1.0;
+            }
         }
     }
 
@@ -4503,15 +4678,21 @@ fn compute_hydrology(
             );
         }
         let to = flow_direction[i];
+        let scale = 1.0 + slope[i] / 1000.0;
         if to >= 0 {
-            flow_accumulation[to as usize] += flow_accumulation[i] * (1.0 + slope[i] / 1000.0);
+            flow_accumulation[to as usize] += flow_accumulation[i] * primary_share[i] * scale;
+            let alt = secondary_direction[i];
+            if alt >= 0 {
+                let spill = (1.0 - primary_share[i]) * 0.9;
+                flow_accumulation[alt as usize] += flow_accumulation[i] * spill * scale;
+            }
         }
     }
     progress.phase(progress_base, progress_span, 0.83);
 
     let mut sorted = flow_accumulation.clone();
     sorted.sort_by(|a, b| b.total_cmp(a));
-    let threshold_index = ((sorted.len() as f32 * 0.985).floor() as usize).min(sorted.len() - 1);
+    let threshold_index = ((sorted.len() as f32 * 0.992).floor() as usize).min(sorted.len() - 1);
     let threshold = sorted[threshold_index].max(1.0);
 
     let mut rivers = vec![0.0_f32; WORLD_SIZE];
@@ -4525,8 +4706,8 @@ fn compute_hydrology(
                 0.83 + 0.17 * (i as f32 / WORLD_SIZE as f32),
             );
         }
-        rivers[i] = flow_accumulation[i] / threshold;
-        if flow_direction[i] < 0 && heights[i] < 0.0 && slope[i] < 40.0 {
+        rivers[i] = (flow_accumulation[i] / threshold).powf(0.9);
+        if flow_direction[i] < 0 && heights[i] > 0.0 && slope[i] < 25.0 {
             lakes[i] = 1;
         }
     }
@@ -4654,6 +4835,861 @@ fn compute_settlement(
         settlement[i] = ((comfort_t + comfort_p) / 2.0 - elevation_penalty).clamp(0.0, 1.0);
     }
     settlement
+}
+
+#[inline]
+fn grid_index(x: usize, y: usize, width: usize) -> usize {
+    y * width + x
+}
+
+#[inline]
+fn grid_index_clamped(x: i32, y: i32, width: usize, height: usize) -> usize {
+    let xx = x.clamp(0, width as i32 - 1) as usize;
+    let yy = y.clamp(0, height as i32 - 1) as usize;
+    grid_index(xx, yy, width)
+}
+
+fn count_edge_land_contacts(heights: &[f32], width: usize, height: usize) -> usize {
+    let mut count = 0_usize;
+    for x in 0..width {
+        if heights[grid_index(x, 0, width)] > 0.0 {
+            count += 1;
+        }
+        if heights[grid_index(x, height - 1, width)] > 0.0 {
+            count += 1;
+        }
+    }
+    for y in 0..height {
+        if heights[grid_index(0, y, width)] > 0.0 {
+            count += 1;
+        }
+        if heights[grid_index(width - 1, y, width)] > 0.0 {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn compute_coastal_exposure_grid(heights: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let mut coastal = vec![0.0_f32; heights.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let i = grid_index(x, y, width);
+            if heights[i] <= 0.0 {
+                continue;
+            }
+            let mut total = 0.0_f32;
+            let mut ocean = 0.0_f32;
+            for oy in -3..=3 {
+                for ox in -3..=3 {
+                    let nx = x as i32 + ox;
+                    let ny = y as i32 + oy;
+                    if nx < 0 || nx >= width as i32 || ny < 0 || ny >= height as i32 {
+                        continue;
+                    }
+                    total += 1.0;
+                    let j = grid_index(nx as usize, ny as usize, width);
+                    if heights[j] <= 0.0 {
+                        ocean += 1.0;
+                    }
+                }
+            }
+            coastal[i] = if total > 0.0 { ocean / total } else { 0.0 };
+        }
+    }
+    coastal
+}
+
+fn generate_tasmania_height_map(
+    cfg: &SimulationConfig,
+    detail: DetailProfile,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) -> Vec<f32> {
+    let width = ISLAND_WIDTH;
+    let height = ISLAND_HEIGHT;
+    let mut relief = vec![0.0_f32; ISLAND_SIZE];
+    let seed_phase = cfg.seed as f32 * 0.000_137;
+    let mantle = clampf(cfg.tectonics.mantle_heat / 100.0, 0.15, 1.25);
+    let plate_bias = clampf(cfg.tectonics.plate_speed_cm_per_year / 8.0, 0.2, 1.6);
+    let ridge_gain = 860.0 + 560.0 * mantle;
+    let roughness = 0.18 + 0.07 * plate_bias;
+
+    let warp_seed_a = hash_u32(cfg.seed ^ 0xA341_316C);
+    let warp_seed_b = hash_u32(cfg.seed ^ 0xC801_3EA4);
+    let coast_seed_a = hash_u32(cfg.seed ^ 0xAD90_77B1);
+    let coast_seed_b = hash_u32(cfg.seed ^ 0xF6A9_4E2D);
+    let ridge_seed = hash_u32(cfg.seed ^ 0x6B8B_4567);
+    let ridge_micro_seed = hash_u32(cfg.seed ^ 0x99F1_45D3);
+    let valley_seed = hash_u32(cfg.seed ^ 0xDE11_2C5A);
+    let terrain_seed = hash_u32(cfg.seed ^ 0x5A0B_B6E7);
+
+    let c = (-0.58_f32).cos();
+    let s = (-0.58_f32).sin();
+
+    for y in 0..height {
+        progress.phase(progress_base, progress_span, y as f32 / height as f32);
+        let v = ((y as f32 + 0.5) / height as f32) * 2.0 - 1.0;
+        for x in 0..width {
+            let u = ((x as f32 + 0.5) / width as f32) * 2.0 - 1.0;
+            let warp_x = value_noise3(
+                u * 2.9 + seed_phase * 0.71,
+                v * 2.9 - seed_phase * 0.37,
+                seed_phase * 0.29,
+                warp_seed_a,
+            );
+            let warp_y = value_noise3(
+                u * 2.9 - seed_phase * 0.48,
+                v * 2.9 + seed_phase * 0.62,
+                seed_phase * 0.31,
+                warp_seed_b,
+            );
+            let u2 = u + warp_x * 0.20;
+            let v2 = v + warp_y * 0.16;
+
+            let rx = u2 * c - v2 * s;
+            let ry = u2 * s + v2 * c;
+
+            let ellipse = ((rx / 0.90).powi(2) + (ry / 0.66).powi(2)).sqrt();
+            let coast_macro = value_noise3(
+                rx * 3.2 + 11.0,
+                ry * 3.2 - 8.0,
+                seed_phase * 1.9,
+                coast_seed_a,
+            );
+            let coast_micro = value_noise3(
+                rx * 8.8 - 6.0,
+                ry * 8.8 + 4.0,
+                seed_phase * 2.7,
+                coast_seed_b,
+            );
+            let coastal_rag = ridge(value_noise3(
+                rx * 6.4 + 2.0,
+                ry * 6.4 - 1.0,
+                seed_phase * 2.2,
+                ridge_seed,
+            ));
+            let shoreline = 1.0 - ellipse
+                + coast_macro * (0.20 + roughness * 0.1)
+                + coast_micro * 0.08
+                + coastal_rag * 0.10
+                - 0.028;
+
+            let i = grid_index(x, y, width);
+            if shoreline <= 0.0 {
+                let abyss = smoothstep(-0.86, 0.0, shoreline.abs());
+                let shelf = smoothstep(-0.10, 0.02, shoreline);
+                let deep = -95.0 - abyss * 980.0;
+                relief[i] = lerpf(deep, -14.0, shelf * 0.68);
+                continue;
+            }
+
+            let coast_ramp = smoothstep(0.0, 0.20, shoreline);
+            let interior = smoothstep(0.10, 0.86, shoreline);
+
+            let spine_a = (1.0 - (ry * 1.30 + rx * 0.14).abs()).max(0.0);
+            let spine_b = (1.0 - (ry * 1.16 - rx * 0.57 - 0.03).abs()).max(0.0);
+            let ridge_noise = ridge(value_noise3(
+                rx * 11.0 + 3.0,
+                ry * 11.0 - 5.0,
+                seed_phase * 4.2,
+                ridge_micro_seed,
+            ));
+            let ridge_core = spine_a.powf(1.8) * (0.85 + ridge_noise * 0.7)
+                + spine_b.powf(2.15) * (0.55 + ridge_noise * 0.5);
+
+            let terrain_macro = value_noise3(
+                rx * 3.9 + 15.0,
+                ry * 3.9 - 19.0,
+                seed_phase * 1.3,
+                terrain_seed,
+            );
+            let terrain_detail = ridge(value_noise3(
+                rx * 18.5 - 1.0,
+                ry * 18.5 + 6.0,
+                seed_phase * 6.1,
+                hash_u32(terrain_seed ^ 0x1A2B_3C4D),
+            ));
+            let valley_cut = ridge(value_noise3(
+                rx * 23.0 + 9.0,
+                ry * 23.0 - 11.0,
+                seed_phase * 7.6,
+                valley_seed,
+            ));
+
+            let mut h = 24.0 + shoreline.powf(1.08) * 530.0;
+            h += ridge_core * ridge_gain * interior;
+            h += (terrain_macro * 0.5 + 0.5) * 190.0 * coast_ramp;
+            h += terrain_detail.powf(1.22) * 230.0 * interior;
+            h -= valley_cut.powf(2.35) * (240.0 + cfg.tectonics.plate_count as f32 * 4.0) * interior;
+            relief[i] = h.max(1.0);
+        }
+    }
+
+    let smoothing_passes = detail.erosion_rounds.saturating_add(1).min(4);
+    if smoothing_passes > 0 {
+        let mut scratch = relief.clone();
+        for pass in 0..smoothing_passes {
+            for y in 0..height {
+                for x in 0..width {
+                    let i = grid_index(x, y, width);
+                    if relief[i] <= 0.0 {
+                        scratch[i] = relief[i];
+                        continue;
+                    }
+                    let mut sum = relief[i] * 2.0;
+                    let mut weight_sum = 2.0_f32;
+                    for oy in -1..=1 {
+                        for ox in -1..=1 {
+                            if ox == 0 && oy == 0 {
+                                continue;
+                            }
+                            let j =
+                                grid_index_clamped(x as i32 + ox, y as i32 + oy, width, height);
+                            if relief[j] <= 0.0 {
+                                continue;
+                            }
+                            let weight = if ox == 0 || oy == 0 { 1.0 } else { 0.72 };
+                            sum += relief[j] * weight;
+                            weight_sum += weight;
+                        }
+                    }
+                    let smoothed = sum / weight_sum.max(1e-6);
+                    let keep = (0.76 - pass as f32 * 0.08).clamp(0.35, 0.82);
+                    scratch[i] = lerpf(smoothed, relief[i], keep);
+                }
+            }
+            relief.copy_from_slice(&scratch);
+        }
+    }
+
+    relief
+}
+
+fn apply_events_island(
+    relief: &mut [f32],
+    events: &[WorldEventRecord],
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) {
+    if events.is_empty() {
+        progress.phase(progress_base, progress_span, 1.0);
+        return;
+    }
+
+    let width = ISLAND_WIDTH as i32;
+    let height = ISLAND_HEIGHT as i32;
+    for (event_index, event) in events.iter().enumerate() {
+        progress.phase(
+            progress_base,
+            progress_span,
+            event_index as f32 / events.len().max(1) as f32,
+        );
+
+        if event.kind == "oceanShift" {
+            let delta = event.magnitude * 0.12;
+            for h in relief.iter_mut() {
+                *h += delta;
+            }
+            continue;
+        }
+
+        let cx = clampf(
+            (event.longitude + 180.0) * ((ISLAND_WIDTH - 1) as f32) / 360.0,
+            0.0,
+            (ISLAND_WIDTH - 1) as f32,
+        ) as i32;
+        let cy = clampf(
+            (90.0 - event.latitude) * ((ISLAND_HEIGHT - 1) as f32) / 180.0,
+            0.0,
+            (ISLAND_HEIGHT - 1) as f32,
+        ) as i32;
+
+        let radius = if event.kind == "meteorite" {
+            ((event.diameter_km.max(0.4) * 0.85).round() as i32).max(2)
+        } else {
+            ((event.radius_km.max(60.0) / 52.0).round() as i32).max(3)
+        };
+
+        let amplitude = match event.kind.as_str() {
+            "meteorite" => -(120.0 + event.diameter_km * 32.0),
+            "rift" => -event.magnitude * 0.45,
+            "subduction" => event.magnitude * 0.38,
+            "uplift" => event.magnitude * 0.52,
+            _ => 0.0,
+        };
+        if amplitude.abs() < 0.01 {
+            continue;
+        }
+
+        let min_y = (cy - radius).max(0);
+        let max_y = (cy + radius).min(height - 1);
+        let min_x = (cx - radius).max(0);
+        let max_x = (cx + radius).min(width - 1);
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let dx = x - cx;
+                let dy = y - cy;
+                let dist = ((dx * dx + dy * dy) as f32).sqrt() / radius as f32;
+                if dist > 1.0 {
+                    continue;
+                }
+                let falloff = (1.0 - dist * dist).powf(1.6);
+                let i = grid_index(x as usize, y as usize, ISLAND_WIDTH);
+                relief[i] += amplitude * falloff;
+            }
+        }
+    }
+
+    progress.phase(progress_base, progress_span, 1.0);
+}
+
+fn compute_slope_grid(
+    heights: &[f32],
+    width: usize,
+    height: usize,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) -> (Vec<f32>, f32, f32) {
+    let mut slope = vec![0.0_f32; heights.len()];
+    let mut min_slope = f32::INFINITY;
+    let mut max_slope = 0.0_f32;
+
+    for y in 0..height {
+        progress.phase(progress_base, progress_span, y as f32 / height as f32);
+        for x in 0..width {
+            let i = grid_index(x, y, width);
+            let h = heights[i];
+            let mut max_drop = 0.0_f32;
+            for oy in -1..=1 {
+                for ox in -1..=1 {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let nx = x as i32 + ox;
+                    let ny = y as i32 + oy;
+                    if nx < 0 || nx >= width as i32 || ny < 0 || ny >= height as i32 {
+                        continue;
+                    }
+                    let j = grid_index(nx as usize, ny as usize, width);
+                    let dist = if ox == 0 || oy == 0 { 1.0 } else { 1.414_213_5 };
+                    let drop = (h - heights[j]).max(0.0) / dist;
+                    if drop > max_drop {
+                        max_drop = drop;
+                    }
+                }
+            }
+            slope[i] = max_drop;
+            min_slope = min_slope.min(max_drop);
+            max_slope = max_slope.max(max_drop);
+        }
+    }
+
+    if !min_slope.is_finite() {
+        min_slope = 0.0;
+    }
+    (slope, min_slope, max_slope)
+}
+
+fn compute_hydrology_grid(
+    heights: &[f32],
+    slope: &[f32],
+    width: usize,
+    height: usize,
+    detail: DetailProfile,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) -> (Vec<i32>, Vec<f32>, Vec<f32>, Vec<u8>) {
+    let size = heights.len();
+    let mut flow_direction = vec![-1_i32; size];
+    let mut indegree = vec![0_u32; size];
+    let mut flow_accumulation = vec![0.0_f32; size];
+    let mut lake_map = vec![0_u8; size];
+
+    for y in 0..height {
+        progress.phase(progress_base, progress_span * 0.42, y as f32 / height as f32);
+        for x in 0..width {
+            let i = grid_index(x, y, width);
+            if heights[i] <= 0.0 {
+                continue;
+            }
+            flow_accumulation[i] = 1.0;
+            let h = heights[i];
+            let mut best_gradient = 0.0_f32;
+            let mut best_index = None;
+
+            for oy in -1..=1 {
+                for ox in -1..=1 {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let nx = x as i32 + ox;
+                    let ny = y as i32 + oy;
+                    if nx < 0 || nx >= width as i32 || ny < 0 || ny >= height as i32 {
+                        continue;
+                    }
+                    let j = grid_index(nx as usize, ny as usize, width);
+                    let dist = if ox == 0 || oy == 0 { 1.0 } else { 1.414_213_5 };
+                    let gradient = (h - heights[j]).max(0.0) / dist;
+                    if gradient > best_gradient {
+                        best_gradient = gradient;
+                        best_index = Some(j);
+                    }
+                }
+            }
+
+            if let Some(j) = best_index {
+                flow_direction[i] = j as i32;
+                indegree[j] = indegree[j].saturating_add(1);
+            } else {
+                let mut touches_ocean = false;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let nx = x as i32 + ox;
+                        let ny = y as i32 + oy;
+                        if nx < 0 || nx >= width as i32 || ny < 0 || ny >= height as i32 {
+                            continue;
+                        }
+                        let j = grid_index(nx as usize, ny as usize, width);
+                        if heights[j] <= 0.0 {
+                            touches_ocean = true;
+                            break;
+                        }
+                    }
+                    if touches_ocean {
+                        break;
+                    }
+                }
+                if !touches_ocean && heights[i] > 20.0 {
+                    lake_map[i] = 1;
+                }
+            }
+        }
+    }
+
+    let mut queue = VecDeque::with_capacity(size);
+    for i in 0..size {
+        if heights[i] > 0.0 && indegree[i] == 0 {
+            queue.push_back(i);
+        }
+    }
+
+    let mut settled = 0_usize;
+    while let Some(i) = queue.pop_front() {
+        settled += 1;
+        if settled % (width * 4).max(1) == 0 {
+            let t = settled as f32 / size.max(1) as f32;
+            progress.phase(progress_base + progress_span * 0.42, progress_span * 0.33, t);
+        }
+        let next = flow_direction[i];
+        if next < 0 {
+            continue;
+        }
+        let j = next as usize;
+        flow_accumulation[j] += flow_accumulation[i];
+        if indegree[j] > 0 {
+            indegree[j] -= 1;
+            if indegree[j] == 0 {
+                queue.push_back(j);
+            }
+        }
+    }
+
+    for i in 0..size {
+        if heights[i] > 0.0 && indegree[i] > 0 {
+            flow_direction[i] = -1;
+            lake_map[i] = 1;
+        }
+    }
+
+    let max_acc = flow_accumulation
+        .iter()
+        .copied()
+        .fold(0.0_f32, f32::max)
+        .max(1.0);
+    let threshold =
+        ((size as f32) * (0.00018 + detail.fluvial_rounds as f32 * 0.00007)).max(22.0);
+
+    let mut river_map = vec![0.0_f32; size];
+    for i in 0..size {
+        if heights[i] <= 0.0 {
+            continue;
+        }
+        let acc_term =
+            ((flow_accumulation[i] - threshold).max(0.0) / (max_acc - threshold + 1.0)).powf(0.45);
+        let slope_term = slope[i] / (slope[i] + 35.0);
+        let mut river = acc_term * (0.34 + 0.86 * slope_term);
+        if lake_map[i] == 1 {
+            river = river.max(0.15);
+        }
+        river_map[i] = clampf(river, 0.0, 1.0);
+    }
+
+    progress.phase(progress_base, progress_span, 1.0);
+    (flow_direction, flow_accumulation, river_map, lake_map)
+}
+
+fn carve_fluvial_valleys_grid(
+    relief: &mut [f32],
+    flow_accumulation: &[f32],
+    river_map: &[f32],
+    detail: DetailProfile,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) {
+    let rounds = detail.fluvial_rounds.max(1);
+    let max_acc = flow_accumulation
+        .iter()
+        .copied()
+        .fold(0.0_f32, f32::max)
+        .max(1.0);
+    let mut scratch = relief.to_vec();
+
+    for round in 0..rounds {
+        let round_base = progress_base + progress_span * (round as f32 / rounds as f32);
+        let round_span = progress_span / rounds as f32;
+        for y in 0..ISLAND_HEIGHT {
+            progress.phase(round_base, round_span * 0.8, y as f32 / ISLAND_HEIGHT as f32);
+            for x in 0..ISLAND_WIDTH {
+                let i = grid_index(x, y, ISLAND_WIDTH);
+                let h = relief[i];
+                if h <= 8.0 {
+                    scratch[i] = h;
+                    continue;
+                }
+                let acc_n = (flow_accumulation[i] / max_acc).powf(0.52);
+                let river = river_map[i];
+                let raw_cut =
+                    acc_n * (0.28 + river * 1.55) * (24.0 + round as f32 * 11.0 + detail.erosion_rounds as f32 * 2.0);
+                let cut = raw_cut.min(h * 0.23);
+                let mut next = h - cut;
+                if h > 1600.0 {
+                    next = lerpf(next, h, 0.42);
+                }
+                scratch[i] = next.max(0.0);
+            }
+        }
+
+        for y in 0..ISLAND_HEIGHT {
+            progress.phase(
+                round_base + round_span * 0.8,
+                round_span * 0.2,
+                y as f32 / ISLAND_HEIGHT as f32,
+            );
+            for x in 0..ISLAND_WIDTH {
+                let i = grid_index(x, y, ISLAND_WIDTH);
+                if scratch[i] <= 0.0 {
+                    relief[i] = scratch[i];
+                    continue;
+                }
+                let mut sum = scratch[i] * 2.2;
+                let mut weight_sum = 2.2_f32;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = grid_index_clamped(
+                            x as i32 + ox,
+                            y as i32 + oy,
+                            ISLAND_WIDTH,
+                            ISLAND_HEIGHT,
+                        );
+                        if scratch[j] <= 0.0 {
+                            continue;
+                        }
+                        let w = if ox == 0 || oy == 0 { 1.0 } else { 0.7 };
+                        sum += scratch[j] * w;
+                        weight_sum += w;
+                    }
+                }
+                let avg = sum / weight_sum.max(1e-6);
+                relief[i] = lerpf(scratch[i], avg, 0.2);
+            }
+        }
+    }
+
+    progress.phase(progress_base, progress_span, 1.0);
+}
+
+fn compute_climate_grid(
+    planet: &PlanetInputs,
+    heights: &[f32],
+    slope: &[f32],
+    river_map: &[f32],
+    flow_accumulation: &[f32],
+    coastal_exposure: &[f32],
+    seed: u32,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) -> (Vec<f32>, Vec<f32>, f32, f32, f32, f32) {
+    let mut temperature = vec![0.0_f32; heights.len()];
+    let mut precipitation = vec![0.0_f32; heights.len()];
+    let mut min_temp = f32::INFINITY;
+    let mut max_temp = -f32::INFINITY;
+    let mut min_prec = f32::INFINITY;
+    let mut max_prec = -f32::INFINITY;
+
+    let temp_seed = hash_u32(seed ^ 0x71F1_2A8B);
+    let precip_seed = hash_u32(seed ^ 0x92E5_14C3);
+
+    for y in 0..ISLAND_HEIGHT {
+        progress.phase(progress_base, progress_span, y as f32 / ISLAND_HEIGHT as f32);
+        let lat = ((y as f32 + 0.5) / ISLAND_HEIGHT as f32 - 0.5).abs() * 2.0;
+        for x in 0..ISLAND_WIDTH {
+            let i = grid_index(x, y, ISLAND_WIDTH);
+            let h = heights[i].max(0.0);
+            let uvx = x as f32 / ISLAND_WIDTH as f32;
+            let uvy = y as f32 / ISLAND_HEIGHT as f32;
+
+            let temp_noise = value_noise3(
+                uvx * 7.2 + 4.0,
+                uvy * 7.2 - 6.0,
+                seed as f32 * 0.000_21,
+                temp_seed,
+            );
+            let precip_noise = value_noise3(
+                uvx * 8.6 - 9.0,
+                uvy * 8.6 + 7.0,
+                seed as f32 * 0.000_31,
+                precip_seed,
+            );
+
+            let base_temp = 25.0
+                - lat * (9.0 + planet.axial_tilt_deg * 0.09)
+                - h * (0.0054 + 0.00008 * planet.gravity);
+            let ocean_inertia = if heights[i] <= 0.0 { 1.6 } else { 0.0 };
+            let t = base_temp + temp_noise * 2.2 + ocean_inertia;
+            temperature[i] = t;
+            min_temp = min_temp.min(t);
+            max_temp = max_temp.max(t);
+
+            let west = heights[grid_index_clamped(
+                x as i32 - 1,
+                y as i32,
+                ISLAND_WIDTH,
+                ISLAND_HEIGHT,
+            )]
+            .max(0.0);
+            let east = heights[grid_index_clamped(
+                x as i32 + 1,
+                y as i32,
+                ISLAND_WIDTH,
+                ISLAND_HEIGHT,
+            )]
+            .max(0.0);
+            let uplift = (h - west).max(0.0);
+            let rain_shadow = (west - h).max(0.0) + 0.35 * (east - h).max(0.0);
+            let acc_term = (flow_accumulation[i].ln_1p() / 8.0).clamp(0.0, 1.0);
+            let slope_term = slope[i] / (slope[i] + 80.0);
+
+            let p = 340.0
+                + coastal_exposure[i] * 980.0
+                + river_map[i] * 540.0
+                + acc_term * 240.0
+                + uplift * 0.24
+                - rain_shadow * 0.2
+                + slope_term * 60.0
+                + (precip_noise * 0.5 + 0.5) * 190.0
+                - h * 0.047
+                + (planet.atmosphere_bar - 1.0) * 130.0;
+
+            let precip = clampf(p, 65.0, 3600.0);
+            precipitation[i] = precip;
+            min_prec = min_prec.min(precip);
+            max_prec = max_prec.max(precip);
+        }
+    }
+
+    (
+        temperature,
+        precipitation,
+        min_temp,
+        max_temp,
+        min_prec,
+        max_prec,
+    )
+}
+
+fn compute_biomes_grid(temperature: &[f32], precipitation: &[f32], heights: &[f32]) -> Vec<u8> {
+    let mut biomes = vec![0_u8; heights.len()];
+    for i in 0..heights.len() {
+        biomes[i] = classify_biome(temperature[i], precipitation[i], heights[i]);
+    }
+    biomes
+}
+
+fn compute_settlement_grid(
+    biomes: &[u8],
+    heights: &[f32],
+    temperature: &[f32],
+    precipitation: &[f32],
+    river_map: &[f32],
+    coastal_exposure: &[f32],
+) -> Vec<f32> {
+    let mut settlement = vec![0.0_f32; heights.len()];
+    for i in 0..heights.len() {
+        if biomes[i] == 0 {
+            continue;
+        }
+        let comfort_t = 1.0 - (temperature[i] - 17.0).abs() / 32.0;
+        let comfort_p = 1.0 - (precipitation[i] - 1200.0).abs() / 1800.0;
+        let elevation_penalty = heights[i].max(0.0) / 3000.0;
+        let river_bonus = river_map[i] * 0.42;
+        let coast_bonus = coastal_exposure[i] * 0.3;
+        settlement[i] = clampf(
+            comfort_t * 0.45 + comfort_p * 0.45 + river_bonus + coast_bonus - elevation_penalty,
+            0.0,
+            1.0,
+        );
+    }
+    settlement
+}
+
+fn run_tasmania_scope(
+    cfg: &SimulationConfig,
+    recomputed_layers: Vec<String>,
+    detail: DetailProfile,
+    progress: &mut ProgressTap<'_>,
+) -> WasmSimulationResult {
+    progress.emit(2.0);
+    let mut selected_seed = cfg.seed;
+    let mut relief = generate_tasmania_height_map(cfg, detail, progress, 2.0, 28.0);
+    let mut best_edge_contacts = count_edge_land_contacts(&relief, ISLAND_WIDTH, ISLAND_HEIGHT);
+    if best_edge_contacts > 0 {
+        for retry in 1..=8 {
+            let candidate_seed =
+                cfg.seed.wrapping_add((retry as u32).wrapping_mul(0x9E37_79B9));
+            let mut candidate_cfg = cfg.clone();
+            candidate_cfg.seed = candidate_seed;
+            let mut silent = ProgressTap::new(None);
+            let candidate = generate_tasmania_height_map(&candidate_cfg, detail, &mut silent, 0.0, 0.0);
+            let contacts = count_edge_land_contacts(&candidate, ISLAND_WIDTH, ISLAND_HEIGHT);
+            if contacts < best_edge_contacts {
+                best_edge_contacts = contacts;
+                selected_seed = candidate_seed;
+                relief = candidate;
+                if contacts == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    apply_events_island(&mut relief, &cfg.events, progress, 30.0, 6.0);
+
+    let (slope_map, _, _) =
+        compute_slope_grid(&relief, ISLAND_WIDTH, ISLAND_HEIGHT, progress, 36.0, 10.0);
+    let (_, flow_accumulation, river_map, _) = compute_hydrology_grid(
+        &relief,
+        &slope_map,
+        ISLAND_WIDTH,
+        ISLAND_HEIGHT,
+        detail,
+        progress,
+        46.0,
+        14.0,
+    );
+
+    carve_fluvial_valleys_grid(
+        &mut relief,
+        &flow_accumulation,
+        &river_map,
+        detail,
+        progress,
+        60.0,
+        10.0,
+    );
+
+    let (slope_map, min_slope, max_slope) =
+        compute_slope_grid(&relief, ISLAND_WIDTH, ISLAND_HEIGHT, progress, 70.0, 8.0);
+    let (flow_direction, flow_accumulation, river_map, lake_map) = compute_hydrology_grid(
+        &relief,
+        &slope_map,
+        ISLAND_WIDTH,
+        ISLAND_HEIGHT,
+        detail,
+        progress,
+        78.0,
+        9.0,
+    );
+
+    let coastal_exposure = compute_coastal_exposure_grid(&relief, ISLAND_WIDTH, ISLAND_HEIGHT);
+    let (
+        temperature_map,
+        precipitation_map,
+        min_temperature,
+        max_temperature,
+        min_precipitation,
+        max_precipitation,
+    ) = compute_climate_grid(
+        &cfg.planet,
+        &relief,
+        &slope_map,
+        &river_map,
+        &flow_accumulation,
+        &coastal_exposure,
+        selected_seed,
+        progress,
+        87.0,
+        9.0,
+    );
+
+    let biome_map = compute_biomes_grid(&temperature_map, &precipitation_map, &relief);
+    progress.emit(97.0);
+    let settlement_map = compute_settlement_grid(
+        &biome_map,
+        &relief,
+        &temperature_map,
+        &precipitation_map,
+        &river_map,
+        &coastal_exposure,
+    );
+    progress.emit(99.0);
+
+    let (min_height, max_height) = min_max(&relief);
+    let ocean_cells = relief.iter().filter(|&&h| h < 0.0).count() as f32;
+    let ocean_percent = 100.0 * ocean_cells / ISLAND_SIZE as f32;
+    let plates = vec![0_i16; ISLAND_SIZE];
+    let boundary_types = vec![0_i8; ISLAND_SIZE];
+
+    WasmSimulationResult {
+        width: ISLAND_WIDTH as u32,
+        height: ISLAND_HEIGHT as u32,
+        seed: selected_seed,
+        sea_level: 0.0,
+        radius_km: cfg.planet.radius_km,
+        ocean_percent,
+        recomputed_layers,
+        plates,
+        boundary_types,
+        height_map: relief,
+        slope_map,
+        river_map,
+        lake_map,
+        flow_direction,
+        flow_accumulation,
+        temperature_map,
+        precipitation_map,
+        biome_map,
+        settlement_map,
+        min_height,
+        max_height,
+        min_temperature,
+        max_temperature,
+        min_precipitation,
+        max_precipitation,
+        min_slope,
+        max_slope,
+    }
 }
 
 #[wasm_bindgen]
@@ -4871,11 +5907,19 @@ fn run_simulation_internal(
     progress.emit(1.0);
 
     cfg.events = cfg.events.into_iter().map(ensure_event_energy).collect();
-
-    let cache = world_cache();
     let recomputed_layers = evaluate_recompute(parse_reason(&reason));
     let preset = parse_generation_preset(cfg.generation_preset.as_deref());
     let detail = detail_profile(preset);
+    let scope = parse_scope(cfg.scope.as_deref());
+
+    if scope == GenerationScope::Tasmania {
+        let result = run_tasmania_scope(&cfg, recomputed_layers, detail, &mut progress);
+        // Keep progress <100 until JS wrapper and worker finish marshalling + posting result.
+        progress.emit(99.9);
+        return Ok(result);
+    }
+
+    let cache = world_cache();
 
     let plates_layer = compute_plates(
         &cfg.planet,

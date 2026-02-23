@@ -33,7 +33,7 @@ type ErrorMessage = {
 
 type WorkerOutput = ProgressMessage | ResultMessage | ErrorMessage;
 
-const scope = self as DedicatedWorkerGlobalScope;
+const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
 let runSimulationRustRef: typeof RunSimulationRustFn | null = null;
 let fetchPatched = false;
 
@@ -219,8 +219,8 @@ async function getRunSimulationRust(): Promise<typeof RunSimulationRustFn> {
   }
 
   patchFetchForAbsoluteAssetUrls();
-  const module = await import("@/lib/planet/rust-simulation");
-  runSimulationRustRef = module.runSimulationRust;
+  const wasmModule = await import("@/lib/planet/rust-simulation");
+  runSimulationRustRef = wasmModule.runSimulationRust;
   return runSimulationRustRef;
 }
 
@@ -249,7 +249,8 @@ scope.onmessage = async (event: MessageEvent<WorkerInput>) => {
 
   try {
     const runSimulationRust = await getRunSimulationRust();
-    const attempts = Math.max(1, Math.min(24, Math.floor(message.attempts ?? 1)));
+    const isIslandScope = message.config.scope === "tasmania";
+    const attempts = isIslandScope ? 1 : Math.max(1, Math.min(24, Math.floor(message.attempts ?? 1)));
     let seed = message.config.seed >>> 0;
     let bestResult: SimulationResult | null = null;
     let bestScore = -1e12;
@@ -269,9 +270,11 @@ scope.onmessage = async (event: MessageEvent<WorkerInput>) => {
         scope.postMessage(payload);
       });
 
-      const score = earthLikeScore(result, message.config.planet.oceanPercent);
-      if (score > bestScore || bestResult === null) {
-        bestScore = score;
+      const score = isIslandScope ? 0 : earthLikeScore(result, message.config.planet.oceanPercent);
+      if (bestResult === null || score > bestScore) {
+        if (!isIslandScope) {
+          bestScore = score;
+        }
         bestResult = result;
       }
 
@@ -296,7 +299,6 @@ scope.onmessage = async (event: MessageEvent<WorkerInput>) => {
     };
     const transfers = transferables(result);
     try {
-      // Prefer transfer for large typed arrays, but fall back if runtime rejects transfer options.
       scope.postMessage(payload as WorkerOutput, transfers);
     } catch {
       scope.postMessage(payload as WorkerOutput);

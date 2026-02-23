@@ -46,6 +46,7 @@ import {
   DEFAULT_SIMULATION,
   DEFAULT_TECTONICS,
   LAYER_GRAPH,
+  type GenerationScope,
   type LayerId,
   type RecomputeTrigger,
   type WorldEvent,
@@ -106,6 +107,9 @@ export default function HomePage() {
   const [generationPreset, setGenerationPreset] = useState<GenerationPresetId>(
     (DEFAULT_SIMULATION.generationPreset as GenerationPresetId) ?? "balanced",
   );
+  const [generationScope, setGenerationScope] = useState<GenerationScope>(
+    (DEFAULT_SIMULATION.scope as GenerationScope) ?? "planet",
+  );
   const [seedSearchPreset, setSeedSearchPreset] = useState<SeedSearchPresetId>("4");
   const [viewMode, setViewMode] = useState<ViewMode>("map");
   const [flatProjection, setFlatProjection] = useState<FlatProjection>("equirectangular");
@@ -139,6 +143,7 @@ export default function HomePage() {
         tectonics: DEFAULT_TECTONICS,
         events: [],
         generationPreset: (DEFAULT_SIMULATION.generationPreset as GenerationPresetId) ?? "balanced",
+        scope: (DEFAULT_SIMULATION.scope as GenerationScope) ?? "planet",
       },
       "global",
     ),
@@ -177,7 +182,6 @@ export default function HomePage() {
       setIsGenerating(false);
       setGenerationProgress(0);
       setGenerationError(message.message || "Ошибка генерации");
-      // eslint-disable-next-line no-console
       console.error(message.message);
     };
 
@@ -227,9 +231,12 @@ export default function HomePage() {
       tectonics,
       events,
       generationPreset,
+      scope: generationScope,
     };
     const searchAttempts =
-      SEED_SEARCH_PRESETS.find((item) => item.id === seedSearchPreset)?.attempts ?? 1;
+      generationScope === "tasmania"
+        ? 1
+        : (SEED_SEARCH_PRESETS.find((item) => item.id === seedSearchPreset)?.attempts ?? 1);
 
     const requestId = generationRequestIdRef.current + 1;
     generationRequestIdRef.current = requestId;
@@ -559,6 +566,25 @@ export default function HomePage() {
               <CardDescription className="text-slate-300">Параметры качества расчета мира</CardDescription>
             </CardHeader>
             <CardContent className="space-y-1.5">
+              <Label>Scope</Label>
+              <Select
+                value={generationScope}
+                onValueChange={(value) => {
+                  setGenerationScope(value as GenerationScope);
+                  setReason("global");
+                  setIsDirty(true);
+                }}
+                disabled={isGenerating}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select generation scope" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="planet">Planet</SelectItem>
+                  <SelectItem value="tasmania">Island (Tasmania test)</SelectItem>
+                </SelectContent>
+              </Select>
+              <div className="h-2" />
               <Label>Пресет генерации</Label>
               <Select
                 value={generationPreset}
@@ -581,7 +607,7 @@ export default function HomePage() {
               <Select
                 value={seedSearchPreset}
                 onValueChange={(value) => setSeedSearchPreset(value as SeedSearchPresetId)}
-                disabled={isGenerating}
+                disabled={isGenerating || generationScope === "tasmania"}
               >
                 <SelectTrigger>
                   <SelectValue placeholder="Select seed search mode" />
@@ -1019,4 +1045,5 @@ export default function HomePage() {
     </main>
   );
 }
+
 

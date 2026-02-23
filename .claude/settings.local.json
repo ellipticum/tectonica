@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "WebFetch(domain:sideshow.jpl.nasa.gov)",
+      "WebFetch(domain:www.eps.mcgill.ca)"
+    ]
+  }
+}
