@@ -15,7 +15,7 @@
 
 ### 2026-02-22
 
-1. Создана спецификация `terrain_blueprint/*`.
+1. Создана спецификация `docs/relief/*`.
 2. Зафиксирована целевая архитектура:
    - distributed deformation вместо boundary-stroke гор,
    - crust thickness + isostasy,

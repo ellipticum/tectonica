@@ -121,21 +121,23 @@ type ColorStop = {
 };
 
 const OCEAN_STOPS: ColorStop[] = [
-  { t: 0, color: [176, 206, 232] },
-  { t: 0.18, color: [146, 184, 220] },
-  { t: 0.45, color: [95, 145, 198] },
-  { t: 0.72, color: [48, 93, 155] },
-  { t: 1, color: [15, 40, 95] },
+  { t: 0, color: [198, 218, 230] },
+  { t: 0.16, color: [166, 196, 216] },
+  { t: 0.36, color: [125, 164, 197] },
+  { t: 0.58, color: [86, 127, 168] },
+  { t: 0.78, color: [52, 91, 135] },
+  { t: 1, color: [18, 43, 83] },
 ];
 
 const LAND_STOPS: ColorStop[] = [
-  { t: 0, color: [101, 196, 108] },
-  { t: 0.2, color: [168, 214, 112] },
-  { t: 0.42, color: [230, 213, 119] },
-  { t: 0.62, color: [216, 164, 95] },
-  { t: 0.8, color: [190, 116, 90] },
-  { t: 0.9, color: [210, 161, 166] },
-  { t: 1, color: [247, 245, 242] },
+  { t: 0, color: [202, 208, 161] },
+  { t: 0.14, color: [182, 194, 140] },
+  { t: 0.3, color: [156, 177, 118] },
+  { t: 0.48, color: [169, 166, 113] },
+  { t: 0.66, color: [158, 139, 95] },
+  { t: 0.8, color: [132, 108, 78] },
+  { t: 0.92, color: [96, 75, 56] },
+  { t: 1, color: [60, 45, 36] },
 ];
 
 const formatNum = (value: number) => value.toLocaleString("ru-RU", { maximumFractionDigits: 2 });
@@ -174,7 +176,7 @@ const heightColor = (value: number, min: number, max: number) => {
     return rgbCss(sampleStops(OCEAN_STOPS, 1));
   }
 
-  const t = clamp(value / Math.max(1, max), 0, 1);
+  const t = Math.pow(clamp(value / Math.max(1, max), 0, 1), 0.72);
   return rgbCss(sampleStops(LAND_STOPS, t));
 };
 
@@ -263,11 +265,11 @@ const buildLayerLegend = (layer: WorldDisplayLayer, result: SimulationResult): L
       { color: heightColor(vMin, vMin, vMax), label: `Глубокий океан (min ${formatNum(vMin)} м)` },
       { color: heightColor(vMin * 0.35, vMin, vMax), label: "Мелкая вода (светло-голубая)" },
       { color: heightColor(vMin * 0.75, vMin, vMax), label: "Глубокая вода (тёмно-голубая)" },
-      { color: heightColor(0, vMin, vMax), label: "Уровень моря: 0 м (тёмно-бледно-жёлтый)" },
-      { color: heightColor(vMax * 0.2, vMin, vMax), label: "Низины суши (приподнятая кора)" },
-      { color: heightColor(vMax * 0.55, vMin, vMax), label: "Хребты и холмы" },
-      { color: heightColor(vMax * 0.85, vMin, vMax), label: "Вершины (жёлтый)" },
-      { color: heightColor(vMax, vMin, vMax), label: `Пики: ~${formatNum(vMax)} м (белый)` },
+      { color: heightColor(0, vMin, vMax), label: "Уровень моря: 0 м (светлый оливково-песочный)" },
+      { color: heightColor(vMax * 0.2, vMin, vMax), label: "Низины суши (травянисто-оливковый)" },
+      { color: heightColor(vMax * 0.55, vMin, vMax), label: "Возвышенности (охристо-землистый)" },
+      { color: heightColor(vMax * 0.85, vMin, vMax), label: "Высокогорья (каштановый)" },
+      { color: heightColor(vMax, vMin, vMax), label: `Пики: ~${formatNum(vMax)} м (тёмно-каштановый)` },
     ];
   }
 

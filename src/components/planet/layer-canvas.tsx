@@ -62,21 +62,23 @@ type ColorStop = {
 };
 
 const OCEAN_STOPS: ColorStop[] = [
-  { t: 0, color: [176, 206, 232] },
-  { t: 0.18, color: [146, 184, 220] },
-  { t: 0.45, color: [95, 145, 198] },
-  { t: 0.72, color: [48, 93, 155] },
-  { t: 1, color: [15, 40, 95] },
+  { t: 0, color: [198, 218, 230] },
+  { t: 0.16, color: [166, 196, 216] },
+  { t: 0.36, color: [125, 164, 197] },
+  { t: 0.58, color: [86, 127, 168] },
+  { t: 0.78, color: [52, 91, 135] },
+  { t: 1, color: [18, 43, 83] },
 ];
 
 const LAND_STOPS: ColorStop[] = [
-  { t: 0, color: [101, 196, 108] },
-  { t: 0.2, color: [168, 214, 112] },
-  { t: 0.42, color: [230, 213, 119] },
-  { t: 0.62, color: [216, 164, 95] },
-  { t: 0.8, color: [190, 116, 90] },
-  { t: 0.9, color: [210, 161, 166] },
-  { t: 1, color: [247, 245, 242] },
+  { t: 0, color: [202, 208, 161] },
+  { t: 0.14, color: [182, 194, 140] },
+  { t: 0.3, color: [156, 177, 118] },
+  { t: 0.48, color: [169, 166, 113] },
+  { t: 0.66, color: [158, 139, 95] },
+  { t: 0.8, color: [132, 108, 78] },
+  { t: 0.92, color: [96, 75, 56] },
+  { t: 1, color: [60, 45, 36] },
 ];
 
 function sampleStops(stops: ColorStop[], t: number): [number, number, number] {
@@ -150,7 +152,68 @@ function sampleBilinear(
   ];
 }
 
-function heightToRgb(height: number, minHeight: number, maxHeight: number): [number, number, number] {
+function estimateLandToneRange(heightMap: Float32Array, maxHeight: number): { minRef: number; maxRef: number } {
+  if (maxHeight <= 0) {
+    return { minRef: 0, maxRef: 1 };
+  }
+
+  const bins = 2048;
+  const hist = new Uint32Array(bins);
+  const denom = Math.max(1, maxHeight);
+  let landCount = 0;
+  for (let i = 0; i < heightMap.length; i++) {
+    const h = heightMap[i];
+    if (h <= 0) continue;
+    const t = clamp(h / denom, 0, 1);
+    const bin = Math.min(bins - 1, Math.floor(t * (bins - 1)));
+    hist[bin] += 1;
+    landCount += 1;
+  }
+
+  if (landCount < 16) {
+    return { minRef: 0, maxRef: denom };
+  }
+
+  const qLow = Math.floor(landCount * 0.02);
+  const qHigh = Math.floor(landCount * 0.98);
+
+  let acc = 0;
+  let lowBin = 0;
+  for (let i = 0; i < bins; i++) {
+    acc += hist[i] ?? 0;
+    if (acc >= qLow) {
+      lowBin = i;
+      break;
+    }
+  }
+
+  acc = 0;
+  let highBin = bins - 1;
+  for (let i = 0; i < bins; i++) {
+    acc += hist[i] ?? 0;
+    if (acc >= qHigh) {
+      highBin = i;
+      break;
+    }
+  }
+
+  let minRef = (lowBin / (bins - 1)) * denom;
+  let maxRef = (highBin / (bins - 1)) * denom;
+  if (maxRef - minRef < 120) {
+    minRef = 0;
+    maxRef = denom;
+  }
+
+  return { minRef, maxRef };
+}
+
+function heightToRgb(
+  height: number,
+  minHeight: number,
+  maxHeight: number,
+  landMinRef: number,
+  landMaxRef: number,
+): [number, number, number] {
   if (height < 0) {
     const depthT = Math.pow(clamp(-height / Math.max(1, -minHeight), 0, 1), 0.68);
     return sampleStops(OCEAN_STOPS, depthT);
@@ -158,8 +221,45 @@ function heightToRgb(height: number, minHeight: number, maxHeight: number): [num
 
   if (maxHeight <= 0) return OCEAN_STOPS[0]?.color ?? [168, 221, 255];
 
-  const landT = clamp(height / Math.max(1, maxHeight), 0, 1);
-  return sampleStops(LAND_STOPS, landT);
+  const landTLinear = clamp((height - landMinRef) / Math.max(1, landMaxRef - landMinRef), 0, 1);
+  const landT = Math.pow(landTLinear, 0.72);
+  let color = sampleStops(LAND_STOPS, landT);
+
+  if (height >= 0 && height < 260) {
+    const coastT = clamp(1 - height / 260, 0, 1);
+    color = lerpColor(color, [214, 198, 156], 0.16 * coastT);
+  }
+
+  return color;
+}
+
+function landHillshade(heightMap: Float32Array, width: number, height: number, x: number, y: number): number {
+  const yUp = Math.max(0, y - 1);
+  const yDown = Math.min(height - 1, y + 1);
+  const xLeft = (x - 1 + width) % width;
+  const xRight = (x + 1) % width;
+  const left = heightMap[y * width + xLeft] ?? 0;
+  const right = heightMap[y * width + xRight] ?? 0;
+  const up = heightMap[yUp * width + x] ?? 0;
+  const down = heightMap[yDown * width + x] ?? 0;
+
+  const dzdx = (right - left) * 0.5;
+  const dzdy = (down - up) * 0.5;
+  const k = 1 / 1800;
+  let nx = -dzdx * k;
+  let ny = -dzdy * k;
+  let nz = 1;
+  const nLen = Math.hypot(nx, ny, nz) || 1;
+  nx /= nLen;
+  ny /= nLen;
+  nz /= nLen;
+
+  const lx = -0.45;
+  const ly = -0.6;
+  const lz = 0.66;
+  const lLen = Math.hypot(lx, ly, lz) || 1;
+  const dot = clamp((nx * lx + ny * ly + nz * lz) / lLen, 0, 1);
+  return clamp(0.9 + (dot - 0.55) * 0.2, 0.82, 1.04);
 }
 
 export function PlanetLayerCanvas({
@@ -181,6 +281,10 @@ export function PlanetLayerCanvas({
   const minPrec = result.stats.minPrecipitation;
   const maxPrec = result.stats.maxPrecipitation;
   const smoothRadius = previewScale >= 1 ? 0 : previewScale >= 0.5 ? 1 : 2;
+  const landToneRange = useMemo(
+    () => estimateLandToneRange(result.heightMap, maxHeight),
+    [maxHeight, result.heightMap],
+  );
 
   const basePixels = useMemo(() => {
     const pixels = new Uint8ClampedArray(width * height * 4);
@@ -216,7 +320,19 @@ export function PlanetLayerCanvas({
           heightValue = sum / Math.max(1, count);
         }
 
-        [r, g, b] = heightToRgb(heightValue, minHeight, maxHeight);
+        [r, g, b] = heightToRgb(
+          heightValue,
+          minHeight,
+          maxHeight,
+          landToneRange.minRef,
+          landToneRange.maxRef,
+        );
+        if (heightValue >= 0) {
+          const shade = landHillshade(result.heightMap, width, height, x, y);
+          r = Math.round(clamp(r * shade, 0, 255));
+          g = Math.round(clamp(g * shade, 0, 255));
+          b = Math.round(clamp(b * shade, 0, 255));
+        }
       }
 
       if (layer === "slope") {
@@ -299,6 +415,8 @@ export function PlanetLayerCanvas({
     plateCount,
     result,
     smoothRadius,
+    landToneRange.maxRef,
+    landToneRange.minRef,
     width,
   ]);
 

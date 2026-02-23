@@ -34,25 +34,118 @@ function sampleStops(stops, t) {
   return stops[stops.length - 1].color;
 }
 
+function lerpColor(a, b, t) {
+  const k = clamp(t, 0, 1);
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * k),
+    Math.round(a[1] + (b[1] - a[1]) * k),
+    Math.round(a[2] + (b[2] - a[2]) * k),
+  ];
+}
+
 const OCEAN_STOPS = [
-  { t: 0, color: [176, 206, 232] },
-  { t: 0.18, color: [146, 184, 220] },
-  { t: 0.45, color: [95, 145, 198] },
-  { t: 0.72, color: [48, 93, 155] },
-  { t: 1, color: [15, 40, 95] },
+  { t: 0, color: [198, 218, 230] },
+  { t: 0.16, color: [166, 196, 216] },
+  { t: 0.36, color: [125, 164, 197] },
+  { t: 0.58, color: [86, 127, 168] },
+  { t: 0.78, color: [52, 91, 135] },
+  { t: 1, color: [18, 43, 83] },
 ];
 
 const LAND_STOPS = [
-  { t: 0, color: [101, 196, 108] },
-  { t: 0.2, color: [168, 214, 112] },
-  { t: 0.42, color: [230, 213, 119] },
-  { t: 0.62, color: [216, 164, 95] },
-  { t: 0.8, color: [190, 116, 90] },
-  { t: 0.9, color: [210, 161, 166] },
-  { t: 1, color: [247, 245, 242] },
+  { t: 0, color: [202, 208, 161] },
+  { t: 0.14, color: [182, 194, 140] },
+  { t: 0.3, color: [156, 177, 118] },
+  { t: 0.48, color: [169, 166, 113] },
+  { t: 0.66, color: [158, 139, 95] },
+  { t: 0.8, color: [132, 108, 78] },
+  { t: 0.92, color: [96, 75, 56] },
+  { t: 1, color: [60, 45, 36] },
 ];
 
-function heightColor(value, min, max) {
+function estimateLandToneRange(heightMap, maxHeight) {
+  if (maxHeight <= 0) {
+    return { minRef: 0, maxRef: 1 };
+  }
+  const bins = 2048;
+  const hist = new Uint32Array(bins);
+  const denom = Math.max(1, maxHeight);
+  let landCount = 0;
+  for (let i = 0; i < heightMap.length; i++) {
+    const h = heightMap[i];
+    if (h <= 0) continue;
+    const t = clamp(h / denom, 0, 1);
+    const bin = Math.min(bins - 1, Math.floor(t * (bins - 1)));
+    hist[bin] += 1;
+    landCount += 1;
+  }
+
+  if (landCount < 16) {
+    return { minRef: 0, maxRef: denom };
+  }
+
+  const qLow = Math.floor(landCount * 0.02);
+  const qHigh = Math.floor(landCount * 0.98);
+
+  let acc = 0;
+  let lowBin = 0;
+  for (let i = 0; i < bins; i++) {
+    acc += hist[i] || 0;
+    if (acc >= qLow) {
+      lowBin = i;
+      break;
+    }
+  }
+
+  acc = 0;
+  let highBin = bins - 1;
+  for (let i = 0; i < bins; i++) {
+    acc += hist[i] || 0;
+    if (acc >= qHigh) {
+      highBin = i;
+      break;
+    }
+  }
+
+  let minRef = (lowBin / (bins - 1)) * denom;
+  let maxRef = (highBin / (bins - 1)) * denom;
+  if (maxRef - minRef < 120) {
+    minRef = 0;
+    maxRef = denom;
+  }
+  return { minRef, maxRef };
+}
+
+function landHillshade(heightMap, width, height, x, y) {
+  const yUp = Math.max(0, y - 1);
+  const yDown = Math.min(height - 1, y + 1);
+  const xLeft = (x - 1 + width) % width;
+  const xRight = (x + 1) % width;
+  const left = heightMap[y * width + xLeft] || 0;
+  const right = heightMap[y * width + xRight] || 0;
+  const up = heightMap[yUp * width + x] || 0;
+  const down = heightMap[yDown * width + x] || 0;
+
+  const dzdx = (right - left) * 0.5;
+  const dzdy = (down - up) * 0.5;
+  const k = 1 / 1800;
+  let nx = -dzdx * k;
+  let ny = -dzdy * k;
+  let nz = 1;
+  const nLen = Math.hypot(nx, ny, nz) || 1;
+  nx /= nLen;
+  ny /= nLen;
+  nz /= nLen;
+
+  const lx = -0.45;
+  const ly = -0.6;
+  const lz = 0.66;
+  const lLen = Math.hypot(lx, ly, lz) || 1;
+  const dot = clamp((nx * lx + ny * ly + nz * lz) / lLen, 0, 1);
+  return clamp(0.9 + (dot - 0.55) * 0.2, 0.82, 1.04);
+}
+
+function heightColor(value, min, max, landMinRef, landMaxRef) {
   if (value < 0 && max > 0) {
     const t = Math.pow(clamp(-value / Math.max(1, -min), 0, 1), 0.68);
     return sampleStops(OCEAN_STOPS, t);
@@ -60,8 +153,14 @@ function heightColor(value, min, max) {
   if (max <= 0) {
     return sampleStops(OCEAN_STOPS, 1);
   }
-  const t = clamp(value / Math.max(1, max), 0, 1);
-  return sampleStops(LAND_STOPS, t);
+  const tLinear = clamp((value - landMinRef) / Math.max(1, landMaxRef - landMinRef), 0, 1);
+  const t = Math.pow(tLinear, 0.72);
+  let color = sampleStops(LAND_STOPS, t);
+  if (value >= 0 && value < 260) {
+    const coastT = clamp(1 - value / 260, 0, 1);
+    color = lerpColor(color, [214, 198, 156], 0.16 * coastT);
+  }
+  return color;
 }
 
 function biomeColor(id) {
@@ -244,12 +343,33 @@ function run() {
 
   const minH = meta.stats.minHeight;
   const maxH = meta.stats.maxHeight;
+  const landToneRange = estimateLandToneRange(heightMap, maxH);
 
-  writeBmp(path.join(runDir, 'height_preview.bmp'), width, height, (i) => {
-    return heightColor(heightMap[i], minH, maxH);
+  writeBmp(path.join(runDir, 'height_preview.bmp'), width, height, (i, x, y) => {
+    const h = heightMap[i];
+    const base = heightColor(h, minH, maxH, landToneRange.minRef, landToneRange.maxRef);
+    if (h < 0) {
+      return base;
+    }
+    const shade = landHillshade(heightMap, width, height, x, y);
+    return [
+      Math.round(clamp(base[0] * shade, 0, 255)),
+      Math.round(clamp(base[1] * shade, 0, 255)),
+      Math.round(clamp(base[2] * shade, 0, 255)),
+    ];
   });
-  writeJpg(path.join(runDir, 'height_preview.jpg'), width, height, (i) => {
-    return heightColor(heightMap[i], minH, maxH);
+  writeJpg(path.join(runDir, 'height_preview.jpg'), width, height, (i, x, y) => {
+    const h = heightMap[i];
+    const base = heightColor(h, minH, maxH, landToneRange.minRef, landToneRange.maxRef);
+    if (h < 0) {
+      return base;
+    }
+    const shade = landHillshade(heightMap, width, height, x, y);
+    return [
+      Math.round(clamp(base[0] * shade, 0, 255)),
+      Math.round(clamp(base[1] * shade, 0, 255)),
+      Math.round(clamp(base[2] * shade, 0, 255)),
+    ];
   });
 
   writeBmp(path.join(runDir, 'plates_preview.bmp'), width, height, (i) => {

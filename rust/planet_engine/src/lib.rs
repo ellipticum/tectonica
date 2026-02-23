@@ -185,6 +185,53 @@ fn index_spherical(x: i32, y: i32) -> usize {
     index(sx, sy)
 }
 
+#[inline]
+fn plate_velocity_xy_from_omega(
+    omega_x: f32,
+    omega_y: f32,
+    omega_z: f32,
+    sx: f32,
+    sy: f32,
+    sz: f32,
+    radius_cm: f32,
+) -> (f32, f32) {
+    // v3 = (omega x r) * R. Here omega is angular velocity, r is unit sphere position.
+    let vx3 = (omega_y * sz - omega_z * sy) * radius_cm;
+    let vy3 = (omega_z * sx - omega_x * sz) * radius_cm;
+    let vz3 = (omega_x * sy - omega_y * sx) * radius_cm;
+
+    let cos_lat = (sx * sx + sy * sy).sqrt().max(1e-6);
+    let ex = -sy / cos_lat;
+    let ey = sx / cos_lat;
+    let nx = -sz * sx / cos_lat;
+    let ny = -sz * sy / cos_lat;
+    let nz = cos_lat;
+
+    let east = vx3 * ex + vy3 * ey;
+    let north = vx3 * nx + vy3 * ny + vz3 * nz;
+    // Map Y grows to the south, so invert north.
+    (east, -north)
+}
+
+#[inline]
+fn plate_velocity_xy_at_cell(
+    plate: &PlateVector,
+    sx: f32,
+    sy: f32,
+    sz: f32,
+    radius_cm: f32,
+) -> (f32, f32) {
+    plate_velocity_xy_from_omega(
+        plate.omega_x,
+        plate.omega_y,
+        plate.omega_z,
+        sx,
+        sy,
+        sz,
+        radius_cm,
+    )
+}
+
 fn quantile_sorted(sorted_values: &[f32], q: f32) -> f32 {
     if sorted_values.is_empty() {
         return 0.0;
@@ -334,6 +381,7 @@ struct DetailProfile {
     max_kernel_radius: i32,
     fault_iterations: usize,
     fault_smooth_passes: usize,
+    plate_evolution_steps: usize,
 }
 
 fn parse_generation_preset(value: Option<&str>) -> GenerationPreset {
@@ -354,6 +402,7 @@ fn detail_profile(preset: GenerationPreset) -> DetailProfile {
             max_kernel_radius: 3,
             fault_iterations: 720,
             fault_smooth_passes: 1,
+            plate_evolution_steps: 2,
         },
         GenerationPreset::Fast => DetailProfile {
             buoyancy_smooth_passes: 6,
@@ -362,6 +411,7 @@ fn detail_profile(preset: GenerationPreset) -> DetailProfile {
             max_kernel_radius: 4,
             fault_iterations: 1300,
             fault_smooth_passes: 1,
+            plate_evolution_steps: 4,
         },
         GenerationPreset::Detailed => DetailProfile {
             buoyancy_smooth_passes: 18,
@@ -370,6 +420,7 @@ fn detail_profile(preset: GenerationPreset) -> DetailProfile {
             max_kernel_radius: 6,
             fault_iterations: 3400,
             fault_smooth_passes: 2,
+            plate_evolution_steps: 10,
         },
         GenerationPreset::Balanced => DetailProfile {
             buoyancy_smooth_passes: 14,
@@ -378,6 +429,7 @@ fn detail_profile(preset: GenerationPreset) -> DetailProfile {
             max_kernel_radius: 5,
             fault_iterations: 2600,
             fault_smooth_passes: 2,
+            plate_evolution_steps: 7,
         },
     }
 }
@@ -429,6 +481,9 @@ struct PlateSpec {
     speed: f32,
     dir_x: f32,
     dir_y: f32,
+    omega_x: f32,
+    omega_y: f32,
+    omega_z: f32,
     heat: f32,
     buoyancy: f32,
 }
@@ -436,8 +491,9 @@ struct PlateSpec {
 #[derive(Clone)]
 struct PlateVector {
     speed: f32,
-    dir_x: f32,
-    dir_y: f32,
+    omega_x: f32,
+    omega_y: f32,
+    omega_z: f32,
     heat: f32,
     buoyancy: f32,
 }
@@ -514,6 +570,34 @@ impl MinCostQueue {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DistanceNode {
+    cost: f32,
+    index: usize,
+}
+
+impl PartialEq for DistanceNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.cost.to_bits() == other.cost.to_bits() && self.index == other.index
+    }
+}
+
+impl Eq for DistanceNode {}
+
+impl PartialOrd for DistanceNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DistanceNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.cost
+            .total_cmp(&other.cost)
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct GrowthParam {
     drift_x: f32,
@@ -580,15 +664,25 @@ fn build_irregular_plate_field(plates: &[PlateSpec], seed: u32, cache: &WorldCac
     let mut growth_rng = Rng::new(seed ^ 0x9e37_79b9);
     let mut queue = MinCostQueue::new();
 
+    let plate_size_bias: Vec<f32> = (0..plates.len())
+        .map(|_| {
+            let a = random_range(&mut growth_rng, 0.7, 1.55);
+            let b = random_range(&mut growth_rng, 0.76, 1.34);
+            clampf((a * b).powf(0.74), 0.55, 1.95)
+        })
+        .collect();
+
     let growth_params: Vec<GrowthParam> = plates
         .iter()
-        .map(|plate| {
+        .enumerate()
+        .map(|(pid, plate)| {
             let len = (plate.dir_x.hypot(plate.dir_y)).max(1.0);
+            let size_bias = plate_size_bias[pid];
             GrowthParam {
                 drift_x: plate.dir_x / len,
                 drift_y: plate.dir_y / len,
-                spread: random_range(&mut growth_rng, 0.85, 1.25),
-                roughness: random_range(&mut growth_rng, 0.28, 1.05),
+                spread: random_range(&mut growth_rng, 0.82, 1.22) / size_bias.powf(0.36),
+                roughness: random_range(&mut growth_rng, 0.26, 1.08) * (0.88 + 0.24 * size_bias),
                 freq_a: random_range(&mut growth_rng, 0.045, 0.145),
                 freq_b: random_range(&mut growth_rng, 0.055, 0.16),
                 freq_c: random_range(&mut growth_rng, 0.08, 0.22),
@@ -599,7 +693,29 @@ fn build_irregular_plate_field(plates: &[PlateSpec], seed: u32, cache: &WorldCac
         })
         .collect();
 
+    let mut structural_field = vec![0.0_f32; WORLD_SIZE];
+    let seed_phase = seed as f32 * 0.00131;
+    for i in 0..WORLD_SIZE {
+        let sx = cache.x_by_cell[i];
+        let sy = cache.y_by_cell[i];
+        let sz = cache.z_by_cell[i];
+        let low = spherical_fbm(
+            sx * 0.95 + 9.0,
+            sy * 0.95 - 7.0,
+            sz * 0.95 + 5.0,
+            seed_phase + 13.0,
+        );
+        let mid = spherical_fbm(
+            sx * 2.15 - 17.0,
+            sy * 2.15 + 19.0,
+            sz * 2.15 - 11.0,
+            seed_phase + 41.0,
+        );
+        structural_field[i] = clampf(0.5 + 0.5 * (0.62 * low + 0.38 * mid), 0.0, 1.0);
+    }
+
     for (plate_id, plate) in plates.iter().enumerate() {
+        let size_bias = plate_size_bias[plate_id];
         let seed_index =
             nearest_free_index(lat_lon_to_index(plate.lat, plate.lon), &occupied_seeds);
         occupied_seeds[seed_index] = 1;
@@ -609,6 +725,90 @@ fn build_irregular_plate_field(plates: &[PlateSpec], seed: u32, cache: &WorldCac
             index: seed_index,
             plate: plate_id as i16,
         });
+
+        // Additional nuclei per plate break radial Voronoi-like slicing and create
+        // more natural non-convex macro-plate shapes.
+        let nuclei = (2 + (growth_rng.next_f32() * (2.6 + size_bias * 1.8)).floor() as i32)
+            .clamp(2, 7) as usize;
+        let drift_len = plate.dir_x.hypot(plate.dir_y).max(1e-5);
+        let drift_x = plate.dir_x / drift_len;
+        let drift_y = plate.dir_y / drift_len;
+        let perp_x = -drift_y;
+        let perp_y = drift_x;
+        let sx = seed_index % WORLD_WIDTH;
+        let sy = seed_index / WORLD_WIDTH;
+        for _ in 0..nuclei {
+            let along = random_range(&mut growth_rng, 24.0, 190.0)
+                * if growth_rng.next_f32() < 0.5 { -1.0 } else { 1.0 };
+            let across = random_range(&mut growth_rng, -78.0, 78.0);
+            let tx = sx as f32 + drift_x * along + perp_x * across;
+            let ty = sy as f32 + drift_y * along + perp_y * across;
+            let nucleus = nearest_free_index(
+                index_spherical(tx.round() as i32, ty.round() as i32),
+                &occupied_seeds,
+            );
+            occupied_seeds[nucleus] = 1;
+            let start_cost = random_range(&mut growth_rng, 0.1, 2.8);
+            if start_cost + 1e-6 < open_cost[nucleus] {
+                open_cost[nucleus] = start_cost;
+                queue.push(FrontierNode {
+                    cost: start_cost,
+                    index: nucleus,
+                    plate: plate_id as i16,
+                });
+            }
+        }
+
+        // Historical nuclei: emulate long-lived plate migration and fragmentation.
+        let mut path_x = sx as f32;
+        let mut path_y = sy as f32;
+        let mut path_dx = drift_x;
+        let mut path_dy = drift_y;
+        let mut path_perp_x = -path_dy;
+        let mut path_perp_y = path_dx;
+        let history_steps = (6 + (growth_rng.next_f32() * (8.0 + size_bias * 4.0)).floor() as i32)
+            .clamp(6, 18) as usize;
+        for step in 0..history_steps {
+            let bend = random_range(&mut growth_rng, -0.34, 0.34)
+                + ((step as f32 * 0.57 + seed_phase * 7.0 + plate_id as f32).sin() * 0.16);
+            let ndx = path_dx + path_perp_x * bend;
+            let ndy = path_dy + path_perp_y * bend;
+            let nlen = ndx.hypot(ndy).max(1e-5);
+            path_dx = ndx / nlen;
+            path_dy = ndy / nlen;
+            path_perp_x = -path_dy;
+            path_perp_y = path_dx;
+
+            let step_len = random_range(&mut growth_rng, 22.0, 86.0)
+                * (0.86 + 0.26 * size_bias)
+                * (0.9 + 0.22 * growth_rng.next_f32());
+            path_x += path_dx * step_len;
+            path_y += path_dy * step_len;
+
+            let branch_count = if growth_rng.next_f32() < 0.62 { 2 } else { 3 };
+            for _ in 0..branch_count {
+                let across = random_range(&mut growth_rng, -104.0, 104.0)
+                    * (0.35 + 0.65 * growth_rng.next_f32());
+                let along_jitter = random_range(&mut growth_rng, -20.0, 20.0);
+                let tx = path_x + path_dx * along_jitter + path_perp_x * across;
+                let ty = path_y + path_dy * along_jitter + path_perp_y * across;
+                let nucleus = nearest_free_index(
+                    index_spherical(tx.round() as i32, ty.round() as i32),
+                    &occupied_seeds,
+                );
+                occupied_seeds[nucleus] = 1;
+                let start_cost = random_range(&mut growth_rng, 0.18, 3.4)
+                    * (0.84 + 0.36 * (1.0 - size_bias * 0.35).max(0.35));
+                if start_cost + 1e-6 < open_cost[nucleus] {
+                    open_cost[nucleus] = start_cost;
+                    queue.push(FrontierNode {
+                        cost: start_cost,
+                        index: nucleus,
+                        plate: plate_id as i16,
+                    });
+                }
+            }
+        }
     }
 
     const STEPS: [(i32, i32, f32); 8] = [
@@ -661,8 +861,16 @@ fn build_irregular_plate_field(plates: &[PlateSpec], seed: u32, cache: &WorldCac
             let rough_factor = 1.0 + gp.roughness * (0.22 * wave_a + 0.18 * wave_b);
             let drift_align = dx as f32 * gp.drift_x + dy as f32 * gp.drift_y;
             let drift_factor = 1.03 - 0.12 * drift_align;
+            let structural = structural_field[j];
+            let structure_factor = clampf(
+                0.62 + 0.98 * structural + (0.36 - gp.roughness * 0.17),
+                0.45,
+                1.9,
+            );
             let polar_factor = 1.0 + (lat.abs() / 90.0) * 0.1;
-            let step_cost = (w * gp.spread * rough_factor * drift_factor * polar_factor).max(0.08);
+            let step_cost =
+                (w * gp.spread * rough_factor * drift_factor * structure_factor * polar_factor)
+                    .max(0.08);
             let next_cost = node.cost + step_cost;
 
             if next_cost + 1e-6 < open_cost[j] {
@@ -708,9 +916,444 @@ fn build_irregular_plate_field(plates: &[PlateSpec], seed: u32, cache: &WorldCac
     plate_field
 }
 
+fn cleanup_plate_fragments(plate_field: &mut [i16], min_component_cells: usize) {
+    if min_component_cells <= 1 {
+        return;
+    }
+    let max_plate = plate_field
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(0) as usize
+        + 1;
+    if max_plate <= 1 {
+        return;
+    }
+
+    let mut visited = vec![0_u8; WORLD_SIZE];
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    let mut component: Vec<usize> = Vec::new();
+    let mut neighbor_counts = vec![0_usize; max_plate];
+    let mut touched_neighbors: Vec<usize> = Vec::new();
+
+    for start in 0..WORLD_SIZE {
+        if visited[start] != 0 {
+            continue;
+        }
+        visited[start] = 1;
+        queue.push_back(start);
+        component.clear();
+        touched_neighbors.clear();
+        let pid = plate_field[start];
+
+        while let Some(i) = queue.pop_front() {
+            component.push(i);
+            let x = i % WORLD_WIDTH;
+            let y = i / WORLD_WIDTH;
+            for oy in -1..=1 {
+                for ox in -1..=1 {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                    let qid = plate_field[j];
+                    if qid == pid {
+                        if visited[j] == 0 {
+                            visited[j] = 1;
+                            queue.push_back(j);
+                        }
+                    } else if qid >= 0 {
+                        let q = qid as usize;
+                        if neighbor_counts[q] == 0 {
+                            touched_neighbors.push(q);
+                        }
+                        neighbor_counts[q] += 1;
+                    }
+                }
+            }
+        }
+
+        if component.len() < min_component_cells && !touched_neighbors.is_empty() {
+            let mut best_plate = touched_neighbors[0];
+            let mut best_count = neighbor_counts[best_plate];
+            for &q in touched_neighbors.iter().skip(1) {
+                if neighbor_counts[q] > best_count {
+                    best_count = neighbor_counts[q];
+                    best_plate = q;
+                }
+            }
+            for &i in component.iter() {
+                plate_field[i] = best_plate as i16;
+            }
+        }
+
+        for &q in touched_neighbors.iter() {
+            neighbor_counts[q] = 0;
+        }
+    }
+}
+
+fn cleanup_plate_fragments_relative(
+    plate_field: &mut [i16],
+    keep_ratio_of_largest: f32,
+    min_component_cells: usize,
+) {
+    let max_plate = plate_field
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(0) as usize
+        + 1;
+    if max_plate <= 1 {
+        return;
+    }
+
+    let mut largest = vec![0_usize; max_plate];
+    let mut visited = vec![0_u8; WORLD_SIZE];
+    let mut queue: VecDeque<usize> = VecDeque::new();
+
+    for start in 0..WORLD_SIZE {
+        if visited[start] != 0 {
+            continue;
+        }
+        visited[start] = 1;
+        queue.push_back(start);
+        let pid = plate_field[start];
+        let mut size = 0_usize;
+        while let Some(i) = queue.pop_front() {
+            size += 1;
+            let x = i % WORLD_WIDTH;
+            let y = i / WORLD_WIDTH;
+            for oy in -1..=1 {
+                for ox in -1..=1 {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                    if visited[j] == 0 && plate_field[j] == pid {
+                        visited[j] = 1;
+                        queue.push_back(j);
+                    }
+                }
+            }
+        }
+        if pid >= 0 {
+            let p = pid as usize;
+            if size > largest[p] {
+                largest[p] = size;
+            }
+        }
+    }
+
+    visited.fill(0);
+    let mut component: Vec<usize> = Vec::new();
+    let mut neighbor_counts = vec![0_usize; max_plate];
+    let mut touched_neighbors: Vec<usize> = Vec::new();
+    let ratio = clampf(keep_ratio_of_largest, 0.0, 1.0);
+
+    for start in 0..WORLD_SIZE {
+        if visited[start] != 0 {
+            continue;
+        }
+        visited[start] = 1;
+        queue.push_back(start);
+        component.clear();
+        touched_neighbors.clear();
+        let pid = plate_field[start];
+
+        while let Some(i) = queue.pop_front() {
+            component.push(i);
+            let x = i % WORLD_WIDTH;
+            let y = i / WORLD_WIDTH;
+            for oy in -1..=1 {
+                for ox in -1..=1 {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                    let qid = plate_field[j];
+                    if qid == pid {
+                        if visited[j] == 0 {
+                            visited[j] = 1;
+                            queue.push_back(j);
+                        }
+                    } else if qid >= 0 {
+                        let q = qid as usize;
+                        if neighbor_counts[q] == 0 {
+                            touched_neighbors.push(q);
+                        }
+                        neighbor_counts[q] += 1;
+                    }
+                }
+            }
+        }
+
+        let mut should_reassign = false;
+        if pid >= 0 {
+            let p = pid as usize;
+            let limit = (largest[p] as f32 * ratio).round() as usize;
+            let min_keep = min_component_cells.max(limit);
+            if component.len() < min_keep {
+                should_reassign = true;
+            }
+        }
+
+        if should_reassign && !touched_neighbors.is_empty() {
+            let mut best_plate = touched_neighbors[0];
+            let mut best_count = neighbor_counts[best_plate];
+            for &q in touched_neighbors.iter().skip(1) {
+                if neighbor_counts[q] > best_count {
+                    best_count = neighbor_counts[q];
+                    best_plate = q;
+                }
+            }
+            for &i in component.iter() {
+                plate_field[i] = best_plate as i16;
+            }
+        }
+
+        for &q in touched_neighbors.iter() {
+            neighbor_counts[q] = 0;
+        }
+    }
+}
+
+#[inline]
+fn accumulate_plate_vote(
+    candidate: i16,
+    contribution: f32,
+    best_label: &mut i16,
+    best_score: &mut f32,
+    second_label: &mut i16,
+    second_score: &mut f32,
+) {
+    if contribution <= 0.0 {
+        return;
+    }
+    if *best_label == candidate {
+        *best_score += contribution;
+        return;
+    }
+    if *second_label == candidate {
+        *second_score += contribution;
+        if *second_score > *best_score {
+            std::mem::swap(best_label, second_label);
+            std::mem::swap(best_score, second_score);
+        }
+        return;
+    }
+    if contribution > *best_score {
+        *second_label = *best_label;
+        *second_score = *best_score;
+        *best_label = candidate;
+        *best_score = contribution;
+    } else if contribution > *second_score {
+        *second_label = candidate;
+        *second_score = contribution;
+    }
+}
+
+fn evolve_plate_field(
+    plate_field: &mut [i16],
+    plate_vectors: &[PlateVector],
+    planet: &PlanetInputs,
+    detail: DetailProfile,
+    seed: u32,
+    cache: &WorldCache,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) {
+    let steps = detail.plate_evolution_steps.max(1);
+    let plate_count = plate_vectors.len().max(1);
+    let radius_cm = (planet.radius_km.max(1000.0) * 100_000.0).max(1.0);
+    let cm_per_lat_cell = (std::f32::consts::PI * radius_cm / WORLD_HEIGHT as f32).max(1.0);
+    let cm_per_lon_eq_cell = (2.0 * std::f32::consts::PI * radius_cm / WORLD_WIDTH as f32).max(1.0);
+    let mut cm_per_lon_by_y = vec![0.0_f32; WORLD_HEIGHT];
+    for y in 0..WORLD_HEIGHT {
+        let lat_deg = 90.0 - (y as f32 + 0.5) * (180.0 / WORLD_HEIGHT as f32);
+        let cos_lat = (lat_deg * RADIANS).cos().abs();
+        cm_per_lon_by_y[y] = (cm_per_lon_eq_cell * cos_lat).max(cm_per_lat_cell * 0.2);
+    }
+
+    let mut rng = Rng::new(seed ^ 0xC2B2_AE35);
+    let mut next = vec![-1_i16; WORLD_SIZE];
+    let mut best_label = vec![-1_i16; WORLD_SIZE];
+    let mut second_label = vec![-1_i16; WORLD_SIZE];
+    let mut best_score = vec![0.0_f32; WORLD_SIZE];
+    let mut second_score = vec![0.0_f32; WORLD_SIZE];
+    let mut relaxed = vec![0_i16; WORLD_SIZE];
+
+    for step in 0..steps {
+        best_label.fill(-1);
+        second_label.fill(-1);
+        best_score.fill(0.0);
+        second_score.fill(0.0);
+
+        let age_norm = step as f32 / steps.max(1) as f32;
+        let step_years =
+            random_range(&mut rng, 900_000.0, 3_400_000.0) * (0.92 + 0.32 * age_norm);
+        let memory_keep = 0.5 + 0.18 * (1.0 - age_norm);
+        let structural_phase = seed as f32 * 0.0019 + step as f32 * 1.71;
+
+        for i in 0..WORLD_SIZE {
+            let pid = plate_field[i];
+            if pid < 0 {
+                continue;
+            }
+            let p = pid as usize;
+            let y = i / WORLD_WIDTH;
+            let x = i % WORLD_WIDTH;
+            let sx = cache.x_by_cell[i];
+            let sy = cache.y_by_cell[i];
+            let sz = cache.z_by_cell[i];
+            let (vx, vy) = plate_velocity_xy_at_cell(&plate_vectors[p], sx, sy, sz, radius_cm);
+            let dx_cells = vx * step_years / cm_per_lon_by_y[y];
+            let dy_cells = vy * step_years / cm_per_lat_cell;
+            let fx = x as f32 + dx_cells;
+            let fy = y as f32 + dy_cells;
+            let x0 = fx.floor();
+            let y0 = fy.floor();
+            let tx = fx - x0;
+            let ty = fy - y0;
+            let x0i = x0 as i32;
+            let y0i = y0 as i32;
+
+            let weights = [
+                (0, 0, (1.0 - tx) * (1.0 - ty)),
+                (1, 0, tx * (1.0 - ty)),
+                (0, 1, (1.0 - tx) * ty),
+                (1, 1, tx * ty),
+            ];
+
+            for (ox, oy, w) in weights {
+                if w <= 1e-6 {
+                    continue;
+                }
+                let j = index_spherical(x0i + ox, y0i + oy);
+                let mut s = w;
+                if plate_field[j] == pid {
+                    s *= memory_keep;
+                } else {
+                    s *= 0.92;
+                }
+                let sxj = cache.x_by_cell[j];
+                let syj = cache.y_by_cell[j];
+                let szj = cache.z_by_cell[j];
+                let structural = 0.5
+                    + 0.5
+                        * ((sxj * 4.6 + syj * 3.8 + szj * 2.9 + structural_phase).sin() * 0.6
+                            + (syj * 5.1 - szj * 3.6 + sxj * 2.4 - structural_phase * 1.3).cos()
+                                * 0.4);
+                s *= clampf(0.82 + 0.4 * structural, 0.62, 1.28);
+                accumulate_plate_vote(
+                    pid,
+                    s,
+                    &mut best_label[j],
+                    &mut best_score[j],
+                    &mut second_label[j],
+                    &mut second_score[j],
+                );
+            }
+        }
+
+        for i in 0..WORLD_SIZE {
+            let old = plate_field[i];
+            let mut chosen = best_label[i];
+            if chosen < 0 {
+                chosen = old;
+            } else {
+                let b = best_score[i];
+                let s = second_score[i];
+                if s > 1e-5 && (b - s).abs() <= 0.08 {
+                    if old == chosen || old == second_label[i] {
+                        chosen = old;
+                    } else if second_label[i] >= 0 {
+                        chosen = second_label[i];
+                    }
+                }
+            }
+            next[i] = if chosen >= 0 { chosen } else { 0 };
+        }
+        plate_field.copy_from_slice(&next);
+
+        let relax_passes = 1 + (detail.max_kernel_radius as usize / 5).min(1);
+        for _ in 0..relax_passes {
+            for y in 0..WORLD_HEIGHT {
+                for x in 0..WORLD_WIDTH {
+                    let i = index(x, y);
+                    let pid = plate_field[i];
+                    let mut labels = [-1_i16; 9];
+                    let mut counts = [0_u8; 9];
+                    let mut used = 0_usize;
+
+                    for oy in -1..=1 {
+                        for ox in -1..=1 {
+                            if ox == 0 && oy == 0 {
+                                continue;
+                            }
+                            let q = plate_field[index_spherical(x as i32 + ox, y as i32 + oy)];
+                            let mut found = false;
+                            for k in 0..used {
+                                if labels[k] == q {
+                                    counts[k] = counts[k].saturating_add(1);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found && used < labels.len() {
+                                labels[used] = q;
+                                counts[used] = 1;
+                                used += 1;
+                            }
+                        }
+                    }
+
+                    let mut own_count = 0_u8;
+                    let mut best_pid = pid;
+                    let mut best_count = 0_u8;
+                    for k in 0..used {
+                        if labels[k] == pid {
+                            own_count = counts[k];
+                        }
+                        if counts[k] > best_count {
+                            best_count = counts[k];
+                            best_pid = labels[k];
+                        }
+                    }
+
+                    if best_pid >= 0 && best_pid != pid && best_count >= 5 && own_count <= 2 {
+                        relaxed[i] = best_pid;
+                    } else {
+                        relaxed[i] = pid;
+                    }
+                }
+            }
+            plate_field.copy_from_slice(&relaxed);
+        }
+
+        let min_abs = clampf(
+            WORLD_SIZE as f32 / (plate_count as f32 * 640.0),
+            140.0,
+            960.0,
+        ) as usize;
+        cleanup_plate_fragments(plate_field, min_abs);
+        cleanup_plate_fragments_relative(plate_field, 0.38, min_abs * 4);
+
+        progress.phase(
+            progress_base,
+            progress_span,
+            (step as f32 + 1.0) / steps as f32,
+        );
+    }
+}
+
 fn compute_plates(
-    _planet: &PlanetInputs,
+    planet: &PlanetInputs,
     tectonics: &TectonicInputs,
+    detail: DetailProfile,
     seed: u32,
     cache: &WorldCache,
     progress: &mut ProgressTap<'_>,
@@ -720,19 +1363,53 @@ fn compute_plates(
     let plate_count = tectonics.plate_count.clamp(2, 20) as usize;
     let mut rng = Rng::new(seed.wrapping_add((plate_count as u32).wrapping_mul(7_919)));
     let mut plates: Vec<PlateSpec> = Vec::with_capacity(plate_count);
+    let radius_cm = (planet.radius_km.max(1000.0) * 100_000.0).max(1.0);
 
     for _ in 0..plate_count {
         let lat = random_range(&mut rng, -90.0, 90.0);
         let lon = random_range(&mut rng, -180.0, 180.0);
         let speed =
             (random_range(&mut rng, 0.5, 1.5) * tectonics.plate_speed_cm_per_year).max(0.001);
-        let dir = random_range(&mut rng, 0.0, std::f32::consts::PI * 2.0);
+
+        let pole_z = random_range(&mut rng, -1.0, 1.0);
+        let pole_lon = random_range(&mut rng, -std::f32::consts::PI, std::f32::consts::PI);
+        let pole_r = (1.0 - pole_z * pole_z).max(0.0).sqrt();
+        let pole_x = pole_r * pole_lon.cos();
+        let pole_y = pole_r * pole_lon.sin();
+        let spin_sign = if rng.next_f32() < 0.5 { -1.0 } else { 1.0 };
+        let omega_mag = (speed / radius_cm) * random_range(&mut rng, 0.82, 1.24);
+        let omega_x = pole_x * omega_mag * spin_sign;
+        let omega_y = pole_y * omega_mag * spin_sign;
+        let omega_z = pole_z * omega_mag * spin_sign;
+
+        let lat_r = lat * RADIANS;
+        let lon_r = lon * RADIANS;
+        let cos_lat = lat_r.cos();
+        let sx = cos_lat * lon_r.cos();
+        let sy = cos_lat * lon_r.sin();
+        let sz = lat_r.sin();
+        let (mut drift_x, mut drift_y) =
+            plate_velocity_xy_from_omega(omega_x, omega_y, omega_z, sx, sy, sz, radius_cm);
+        let drift_speed = drift_x.hypot(drift_y);
+        if drift_speed < 0.05 {
+            let dir = random_range(&mut rng, 0.0, std::f32::consts::PI * 2.0);
+            drift_x = dir.cos() * speed;
+            drift_y = dir.sin() * speed;
+        } else {
+            let scale = speed / drift_speed.max(1e-4);
+            drift_x *= scale;
+            drift_y *= scale;
+        }
+
         plates.push(PlateSpec {
             lat,
             lon,
             speed,
-            dir_x: dir.cos() * speed,
-            dir_y: dir.sin() * speed,
+            dir_x: drift_x,
+            dir_y: drift_y,
+            omega_x,
+            omega_y,
+            omega_z,
             heat: random_range(
                 &mut rng,
                 (tectonics.mantle_heat * 0.5).max(1.0),
@@ -742,18 +1419,39 @@ fn compute_plates(
         });
     }
 
-    let plate_field = build_irregular_plate_field(&plates, seed, cache);
-
     let plate_vectors: Vec<PlateVector> = plates
         .iter()
         .map(|plate| PlateVector {
             speed: plate.speed,
-            dir_x: plate.dir_x,
-            dir_y: plate.dir_y,
+            omega_x: plate.omega_x,
+            omega_y: plate.omega_y,
+            omega_z: plate.omega_z,
             heat: plate.heat,
             buoyancy: plate.buoyancy,
         })
         .collect();
+
+    let mut plate_field = build_irregular_plate_field(&plates, seed, cache);
+    let min_fragment_cells = clampf(
+        WORLD_SIZE as f32 / (plate_count as f32 * 420.0),
+        240.0,
+        1800.0,
+    ) as usize;
+    cleanup_plate_fragments(&mut plate_field, min_fragment_cells);
+    cleanup_plate_fragments_relative(&mut plate_field, 0.42, min_fragment_cells * 5);
+    evolve_plate_field(
+        &mut plate_field,
+        &plate_vectors,
+        planet,
+        detail,
+        seed ^ 0x85EB_CA6B,
+        cache,
+        progress,
+        progress_base,
+        progress_span * 0.45,
+    );
+    cleanup_plate_fragments(&mut plate_field, min_fragment_cells);
+    cleanup_plate_fragments_relative(&mut plate_field, 0.5, min_fragment_cells * 6);
 
     let mut boundary_types = vec![0_i8; WORLD_SIZE];
     let mut boundary_normal_x = vec![0.0_f32; WORLD_SIZE];
@@ -773,12 +1471,24 @@ fn compute_plates(
     ];
 
     for y in 0..WORLD_HEIGHT {
-        progress.phase(progress_base, progress_span, y as f32 / WORLD_HEIGHT as f32);
+        progress.phase(
+            progress_base + progress_span * 0.45,
+            progress_span * 0.55,
+            y as f32 / WORLD_HEIGHT as f32,
+        );
         for x in 0..WORLD_WIDTH {
             let i = index(x, y);
             let plate_a = plate_field[i] as usize;
             let a = &plate_vectors[plate_a];
-            let mut score = 0.0_f32;
+            let sx = cache.x_by_cell[i];
+            let sy = cache.y_by_cell[i];
+            let sz = cache.z_by_cell[i];
+            let (vax, vay) = plate_velocity_xy_at_cell(a, sx, sy, sz, radius_cm);
+
+            let mut conv_sum = 0.0_f32;
+            let mut div_sum = 0.0_f32;
+            let mut shear_sum = 0.0_f32;
+            let mut wsum = 0.0_f32;
             let mut normal_x = 0.0_f32;
             let mut normal_y = 0.0_f32;
             let mut has_different_neighbor = false;
@@ -791,29 +1501,66 @@ fn compute_plates(
                 }
                 has_different_neighbor = true;
                 let b = &plate_vectors[plate_b];
-                let rel_x = b.dir_x - a.dir_x;
-                let rel_y = b.dir_y - a.dir_y;
-                let edge_score = (rel_x * dx as f32 + rel_y * dy as f32) * w;
-                if edge_score.abs() > score.abs() {
-                    score = edge_score;
-                    normal_x = dx as f32;
-                    normal_y = dy as f32;
-                }
+                let (vbx, vby) = plate_velocity_xy_at_cell(b, sx, sy, sz, radius_cm);
+                let rel_x = vbx - vax;
+                let rel_y = vby - vay;
+                let n_len = (dx as f32).hypot(dy as f32).max(1.0);
+                let nx = dx as f32 / n_len;
+                let ny = dy as f32 / n_len;
+                let tx = -ny;
+                let ty = nx;
+                let vn = rel_x * nx + rel_y * ny;
+                let vt = rel_x * tx + rel_y * ty;
+                let conv = (-vn).max(0.0);
+                let div = vn.max(0.0);
+                conv_sum += conv * w;
+                div_sum += div * w;
+                shear_sum += vt.abs() * w;
+                normal_x += nx * conv.max(div) * w;
+                normal_y += ny * conv.max(div) * w;
+                wsum += w;
             }
 
-            boundary_normal_x[i] = normal_x;
-            boundary_normal_y[i] = normal_y;
-            boundary_strength[i] = clampf(score.abs() / boundary_scale, 0.0, 1.0);
-
-            if score > 0.2 * boundary_scale {
-                boundary_types[i] = 1;
-            } else if score < -0.2 * boundary_scale {
-                boundary_types[i] = 2;
-            } else if has_different_neighbor {
-                boundary_types[i] = 3;
-            } else {
+            if !has_different_neighbor {
                 boundary_types[i] = 0;
+                boundary_normal_x[i] = 0.0;
+                boundary_normal_y[i] = 0.0;
+                boundary_strength[i] = 0.0;
+                continue;
             }
+
+            let denom = wsum.max(1e-6);
+            let conv = conv_sum / denom;
+            let div = div_sum / denom;
+            let shear = shear_sum / denom;
+
+            let n_len = normal_x.hypot(normal_y);
+            if n_len > 1e-5 {
+                boundary_normal_x[i] = normal_x / n_len;
+                boundary_normal_y[i] = normal_y / n_len;
+            } else {
+                boundary_normal_x[i] = 0.0;
+                boundary_normal_y[i] = 1.0;
+            }
+
+            let strength = conv.max(div).max(shear * 0.82);
+            boundary_strength[i] = clampf(strength / boundary_scale, 0.0, 1.0);
+
+            let conv_thresh = boundary_scale * 0.14;
+            let div_thresh = boundary_scale * 0.14;
+            let shear_thresh = boundary_scale * 0.18;
+            boundary_types[i] = if conv > conv_thresh && conv >= div * 0.95 && conv >= shear * 0.75
+            {
+                1
+            } else if div > div_thresh && div >= conv * 0.95 && div >= shear * 0.75 {
+                2
+            } else if shear > shear_thresh {
+                3
+            } else if conv >= div {
+                1
+            } else {
+                2
+            };
         }
     }
     progress.phase(progress_base, progress_span, 1.0);
@@ -1579,6 +2326,47 @@ fn clean_landmask_components(mask: &mut [u8], min_land_cells: usize, min_inland_
     }
 }
 
+fn compute_component_sizes_for_mask(mask: &[u8], target: u8) -> Vec<usize> {
+    let mut sizes = vec![0_usize; WORLD_SIZE];
+    let mut visited = vec![0_u8; WORLD_SIZE];
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    let mut component: Vec<usize> = Vec::new();
+
+    for start in 0..WORLD_SIZE {
+        if mask[start] != target || visited[start] != 0 {
+            continue;
+        }
+        visited[start] = 1;
+        queue.push_back(start);
+        component.clear();
+
+        while let Some(i) = queue.pop_front() {
+            component.push(i);
+            let x = i % WORLD_WIDTH;
+            let y = i / WORLD_WIDTH;
+            for oy in -1..=1 {
+                for ox in -1..=1 {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                    if visited[j] == 0 && mask[j] == target {
+                        visited[j] = 1;
+                        queue.push_back(j);
+                    }
+                }
+            }
+        }
+
+        let size = component.len();
+        for &i in component.iter() {
+            sizes[i] = size;
+        }
+    }
+
+    sizes
+}
+
 fn smooth_landmask(mask: &mut [u8], passes: usize) {
     if passes == 0 {
         return;
@@ -1690,6 +2478,83 @@ fn stabilize_landmass_topology(relief: &mut [f32], planet: &PlanetInputs, detail
     }
 
     blend_topology_edges(relief);
+}
+
+fn suppress_subgrid_islands(relief: &mut [f32], planet: &PlanetInputs) {
+    let mut landmask = vec![0_u8; WORLD_SIZE];
+    for i in 0..WORLD_SIZE {
+        if relief[i] >= 0.0 {
+            landmask[i] = 1;
+        }
+    }
+
+    let min_land_cells = clampf(
+        WORLD_SIZE as f32 * (0.00014 + (planet.ocean_percent / 100.0) * 0.00006),
+        180.0,
+        2400.0,
+    ) as usize;
+    let min_inland_water_cells = clampf(
+        WORLD_SIZE as f32 * (0.00014 + (1.0 - planet.ocean_percent / 100.0) * 0.00007),
+        200.0,
+        2600.0,
+    ) as usize;
+    clean_landmask_components(&mut landmask, min_land_cells, min_inland_water_cells);
+
+    for i in 0..WORLD_SIZE {
+        if landmask[i] == 1 {
+            if relief[i] < 0.0 {
+                relief[i] = relief[i] * 0.24 + 24.0;
+            }
+        } else if relief[i] >= 0.0 {
+            relief[i] = relief[i] * 0.24 - 24.0;
+        }
+    }
+
+    blend_topology_edges(relief);
+}
+
+fn dampen_isolated_shallow_ocean(relief: &mut [f32]) {
+    let mut next = relief.to_vec();
+    for _ in 0..2 {
+        for y in 0..WORLD_HEIGHT {
+            for x in 0..WORLD_WIDTH {
+                let i = index(x, y);
+                let h = relief[i];
+                if h >= 0.0 || h <= -260.0 {
+                    continue;
+                }
+
+                let mut land_neighbors = 0_i32;
+                let mut ocean_neighbors = 0_i32;
+                let mut ocean_sum = 0.0_f32;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        if ox == 0 && oy == 0 {
+                            continue;
+                        }
+                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
+                        if relief[j] >= 0.0 {
+                            land_neighbors += 1;
+                        } else {
+                            ocean_neighbors += 1;
+                            ocean_sum += relief[j];
+                        }
+                    }
+                }
+
+                if land_neighbors > 0 || ocean_neighbors < 6 {
+                    continue;
+                }
+
+                let avg = ocean_sum / ocean_neighbors.max(1) as f32;
+                let target = avg.min(-220.0);
+                let shallow_t = smoothstep(-260.0, -30.0, h);
+                let mix = 0.22 + 0.46 * shallow_t;
+                next[i] = h * (1.0 - mix) + target * mix;
+            }
+        }
+        relief.copy_from_slice(&next);
+    }
 }
 
 fn defuse_plate_linearity(
@@ -2088,8 +2953,41 @@ fn apply_ocean_profile(
     progress_base: f32,
     progress_span: f32,
 ) {
-    let mut distance_to_coast = vec![-1_i32; WORLD_SIZE];
-    let mut queue: VecDeque<usize> = VecDeque::new();
+    let mut distance_to_coast = vec![f32::INFINITY; WORLD_SIZE];
+    let mut is_ocean = vec![false; WORLD_SIZE];
+    let mut queue: BinaryHeap<Reverse<DistanceNode>> = BinaryHeap::new();
+    let km_lat_step = (KILOMETERS_PER_DEGREE * (180.0 / WORLD_HEIGHT as f32) * planet.radius_km
+        / 6371.0)
+        .max(0.01);
+    let km_lon_equator = (KILOMETERS_PER_DEGREE * (360.0 / WORLD_WIDTH as f32) * planet.radius_km
+        / 6371.0)
+        .max(0.01);
+    let km_equator_cell =
+        ((2.0 * std::f32::consts::PI * planet.radius_km) / WORLD_WIDTH as f32).max(0.01);
+    let mut lon_step_by_y = vec![0.0_f32; WORLD_HEIGHT];
+    for y in 0..WORLD_HEIGHT {
+        let lat_deg = 90.0 - (y as f32 + 0.5) * (180.0 / WORLD_HEIGHT as f32);
+        let lon_step = km_lon_equator * (lat_deg * RADIANS).cos().abs();
+        lon_step_by_y[y] = lon_step.max(km_lat_step * 0.22);
+    }
+
+    let mut land_mask = vec![0_u8; WORLD_SIZE];
+    for i in 0..WORLD_SIZE {
+        if relief[i] >= 0.0 {
+            land_mask[i] = 1;
+        }
+    }
+    let land_component_sizes = compute_component_sizes_for_mask(&land_mask, 1);
+    let major_land_component = clampf(
+        WORLD_SIZE as f32 * (0.00034 + (planet.ocean_percent / 100.0) * 0.00025),
+        420.0,
+        5200.0,
+    ) as usize;
+    let minor_land_component = (major_land_component / 5).max(65);
+
+    let mut ocean_cells = 0_usize;
+    let mut major_seed_count = 0_usize;
+    let mut minor_coast_seeds: Vec<(usize, f32)> = Vec::new();
 
     for y in 0..WORLD_HEIGHT {
         progress.phase(
@@ -2102,8 +3000,11 @@ fn apply_ocean_profile(
             if relief[i] >= 0.0 {
                 continue;
             }
+            is_ocean[i] = true;
+            ocean_cells += 1;
 
             let mut is_coast_adjacent = false;
+            let mut adjacent_land_component = 0_usize;
             for oy in -1..=1 {
                 for ox in -1..=1 {
                     if ox == 0 && oy == 0 {
@@ -2112,6 +3013,8 @@ fn apply_ocean_profile(
                     let j = index_spherical(x as i32 + ox, y as i32 + oy);
                     if relief[j] >= 0.0 {
                         is_coast_adjacent = true;
+                        adjacent_land_component =
+                            adjacent_land_component.max(land_component_sizes[j]);
                         break;
                     }
                 }
@@ -2121,45 +3024,121 @@ fn apply_ocean_profile(
             }
 
             if is_coast_adjacent {
-                distance_to_coast[i] = 0;
-                queue.push_back(i);
+                if adjacent_land_component >= major_land_component {
+                    distance_to_coast[i] = 0.0;
+                    queue.push(Reverse(DistanceNode { cost: 0.0, index: i }));
+                    major_seed_count += 1;
+                } else if adjacent_land_component >= minor_land_component {
+                    // Small islands should not generate unrealistically wide continental shelves.
+                    // Start them with a positive distance penalty so shelf influence decays quickly.
+                    let size_t = clampf(
+                        adjacent_land_component as f32 / major_land_component.max(1) as f32,
+                        0.0,
+                        1.0,
+                    );
+                    let start_penalty = km_equator_cell * (0.45 + (1.0 - size_t) * 2.4);
+                    minor_coast_seeds.push((i, start_penalty));
+                }
             }
         }
     }
 
-    const FLOW_STEPS: [(i32, i32); 8] = [
-        (1, 0),
-        (-1, 0),
-        (0, 1),
-        (0, -1),
-        (1, 1),
-        (-1, 1),
-        (1, -1),
-        (-1, -1),
+    const FLOW_STEPS: [(i32, i32, f32, f32); 24] = [
+        (1, 0, 1.0, 0.0),
+        (-1, 0, 1.0, 0.0),
+        (0, 1, 0.0, 1.0),
+        (0, -1, 0.0, 1.0),
+        (1, 1, 1.0, 1.0),
+        (-1, 1, 1.0, 1.0),
+        (1, -1, 1.0, 1.0),
+        (-1, -1, 1.0, 1.0),
+        (2, 0, 2.0, 0.0),
+        (-2, 0, 2.0, 0.0),
+        (0, 2, 0.0, 2.0),
+        (0, -2, 0.0, 2.0),
+        (2, 1, 2.0, 1.0),
+        (-2, 1, 2.0, 1.0),
+        (2, -1, 2.0, 1.0),
+        (-2, -1, 2.0, 1.0),
+        (1, 2, 1.0, 2.0),
+        (-1, 2, 1.0, 2.0),
+        (1, -2, 1.0, 2.0),
+        (-1, -2, 1.0, 2.0),
+        (2, 2, 2.0, 2.0),
+        (-2, 2, 2.0, 2.0),
+        (2, -2, 2.0, 2.0),
+        (-2, -2, 2.0, 2.0),
     ];
 
-    while let Some(i) = queue.pop_front() {
-        let x = i % WORLD_WIDTH;
-        let y = i / WORLD_WIDTH;
-        let next_dist = distance_to_coast[i] + 1;
+    if major_seed_count == 0 && minor_coast_seeds.is_empty() {
+        for i in 0..WORLD_SIZE {
+            if is_ocean[i] {
+                distance_to_coast[i] = 0.0;
+            }
+        }
+    } else {
+        if major_seed_count == 0 {
+            for (idx, penalty) in minor_coast_seeds.iter().copied() {
+                let cost = penalty * 0.35;
+                if cost < distance_to_coast[idx] {
+                    distance_to_coast[idx] = cost;
+                    queue.push(Reverse(DistanceNode { cost, index: idx }));
+                }
+            }
+        } else {
+            for (idx, penalty) in minor_coast_seeds.iter().copied() {
+                let cost = penalty * 1.25;
+                if cost < distance_to_coast[idx] {
+                    distance_to_coast[idx] = cost;
+                    queue.push(Reverse(DistanceNode { cost, index: idx }));
+                }
+            }
+        }
 
-        for (dx, dy) in FLOW_STEPS {
-            let j = index_spherical(x as i32 + dx, y as i32 + dy);
-            if relief[j] >= 0.0 || distance_to_coast[j] >= 0 {
+        let mut settled = 0_usize;
+        while let Some(Reverse(node)) = queue.pop() {
+            if node.cost > distance_to_coast[node.index] + 1e-5 {
                 continue;
             }
-            distance_to_coast[j] = next_dist;
-            queue.push_back(j);
+            settled += 1;
+            if settled % (WORLD_WIDTH * 6) == 0 {
+                let t = settled as f32 / ocean_cells.max(1) as f32;
+                progress.phase(progress_base, progress_span, 0.1 + 0.1 * t.min(1.0));
+            }
+            let x = node.index % WORLD_WIDTH;
+            let y = node.index / WORLD_WIDTH;
+
+            for (dx, dy, mx, my) in FLOW_STEPS {
+                let j = index_spherical(x as i32 + dx, y as i32 + dy);
+                if !is_ocean[j] {
+                    continue;
+                }
+                let jy = j / WORLD_WIDTH;
+                let step_lon = lon_step_by_y[jy];
+                let step = ((mx * step_lon).powi(2) + (my * km_lat_step).powi(2)).sqrt();
+                let next_dist = node.cost + step;
+                if next_dist + 1e-5 < distance_to_coast[j] {
+                    distance_to_coast[j] = next_dist;
+                    queue.push(Reverse(DistanceNode {
+                        cost: next_dist,
+                        index: j,
+                    }));
+                }
+            }
         }
     }
     progress.phase(progress_base, progress_span, 0.2);
 
-    let mut max_distance = 1_i32;
+    let mut max_distance_km = km_lat_step.max(km_lon_equator);
     for i in 0..WORLD_SIZE {
-        if relief[i] < 0.0 && distance_to_coast[i] > max_distance {
-            max_distance = distance_to_coast[i];
+        if is_ocean[i] {
+            let d = distance_to_coast[i];
+            if d.is_finite() {
+                max_distance_km = max_distance_km.max(d);
+            }
         }
     }
+    let max_distance = (max_distance_km / km_equator_cell).max(1.0);
 
     let shelf_cells = clampf(4.8 + (planet.radius_km / 6371.0 - 1.0) * 1.2, 3.8, 8.4);
     let slope_cells = clampf(15.0 + (planet.ocean_percent - 67.0) * 0.08, 11.0, 23.0);
@@ -2181,7 +3160,12 @@ fn apply_ocean_profile(
             continue;
         }
 
-        let d = distance_to_coast[i].max(0) as f32;
+        let d_km = if distance_to_coast[i].is_finite() {
+            distance_to_coast[i]
+        } else {
+            max_distance_km
+        };
+        let d = (d_km / km_equator_cell).max(0.0);
         let sx = cache.x_by_cell[i];
         let sy = cache.y_by_cell[i];
         let sz = cache.z_by_cell[i];
@@ -2267,7 +3251,7 @@ fn apply_ocean_profile(
             -245.0 - (abyssal_base - 245.0) * t.powf(0.74)
         } else {
             let t = clampf(
-                (d - local_shelf - local_slope) / (max_distance as f32 + 1.0),
+                (d - local_shelf - local_slope) / (max_distance + 1.0),
                 0.0,
                 1.0,
             );
@@ -2338,6 +3322,7 @@ fn compute_relief(
     progress_span: f32,
 ) -> ReliefResult {
     let mut relief = vec![0.0_f32; WORLD_SIZE];
+    let radius_cm = (planet.radius_km.max(1000.0) * 100_000.0).max(1.0);
 
     let seed_mix = (((planet.radius_km * 1000.0) as i32)
         ^ ((tectonics.plate_speed_cm_per_year * 1000.0) as i32)
@@ -2487,6 +3472,7 @@ fn compute_relief(
         let mut local_wsum = 0.0_f32;
         let land_a = plate_landness[plate_id];
         let a = &plates.plate_vectors[plate_id];
+        let (a_vx, a_vy) = plate_velocity_xy_at_cell(a, sx, sy, sz, radius_cm);
         for (dx, dy, w) in LOCAL_NEIGHBORS {
             let j = index_spherical((i % WORLD_WIDTH) as i32 + dx, (i / WORLD_WIDTH) as i32 + dy);
             let plate_b = plates.plate_field[j] as usize;
@@ -2495,8 +3481,9 @@ fn compute_relief(
             }
 
             let b = &plates.plate_vectors[plate_b];
-            let rel_x = b.dir_x - a.dir_x;
-            let rel_y = b.dir_y - a.dir_y;
+            let (b_vx, b_vy) = plate_velocity_xy_at_cell(b, sx, sy, sz, radius_cm);
+            let rel_x = b_vx - a_vx;
+            let rel_y = b_vy - a_vy;
             let n_len = (dx as f32).hypot(dy as f32).max(1.0);
             let nx = dx as f32 / n_len;
             let ny = dy as f32 / n_len;
@@ -2578,8 +3565,8 @@ fn compute_relief(
             _ => {}
         }
 
-        velocity_x[i] = plates.plate_vectors[plate_id].dir_x;
-        velocity_y[i] = plates.plate_vectors[plate_id].dir_y;
+        velocity_x[i] = a_vx;
+        velocity_y[i] = a_vy;
     }
 
     let collision_smooth_passes = (detail.max_kernel_radius as usize / 2 + 2).clamp(2, 6);
@@ -3280,6 +4267,8 @@ fn compute_relief(
         &plates.boundary_types,
         &plates.boundary_strength,
     );
+    suppress_subgrid_islands(&mut relief, planet);
+    dampen_isolated_shallow_ocean(&mut relief);
     progress.phase(progress_base, progress_span, 0.98);
 
     let mut sorted_final = relief.clone();
@@ -3288,6 +4277,8 @@ fn compute_relief(
     for h in relief.iter_mut() {
         *h -= final_recenter;
     }
+    suppress_subgrid_islands(&mut relief, planet);
+    dampen_isolated_shallow_ocean(&mut relief);
     progress.phase(progress_base, progress_span, 1.0);
 
     ReliefResult { relief, sea_level }
@@ -3889,6 +4880,7 @@ fn run_simulation_internal(
     let plates_layer = compute_plates(
         &cfg.planet,
         &cfg.tectonics,
+        detail,
         cfg.seed,
         cache,
         &mut progress,
