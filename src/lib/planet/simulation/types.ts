@@ -84,28 +84,35 @@ export const LAYER_GRAPH: LayerSpec[] = [
   },
 ];
 
+// Whittaker biome classification — 12 types matching Rust classify_biome_whittaker()
 export const BIOME_NAMES = [
-  "РћРєРµР°РЅ",
-  "РўСѓРЅРґСЂР°",
-  "РЎСѓР±С‚СЂРѕРїРёС‡РµСЃРєРёР№ Р»РµСЃ",
-  "Р›РµСЃ",
-  "РЎР°РІР°РЅРЅР°",
-  "РџСѓСЃС‚С‹РЅСЏ",
-  "РЎС‚РµРїСЊ",
-  "Р’С‹СЃРѕРєРѕРіРѕСЂСЊРµ",
-  "РўР°Р№РіР°",
+  "Океан",           // 0 — Ocean
+  "Тундра",          // 1 — Tundra/Ice
+  "Тайга",           // 2 — Boreal/Taiga
+  "Лес",             // 3 — Temperate Forest
+  "Луга",            // 4 — Temperate Grassland
+  "Средиземноморье", // 5 — Mediterranean
+  "Тропический лес", // 6 — Tropical Rainforest
+  "Саванна",         // 7 — Tropical Savanna
+  "Пустыня",         // 8 — Desert
+  "Субтропический лес", // 9 — Subtropical Forest
+  "Высокогорье",     // 10 — Alpine
+  "Степь",           // 11 — Steppe
 ];
 
 export const BIOME_COLORS: Record<number, [number, number, number]> = {
-  0: [17, 42, 82],
-  1: [204, 213, 238],
-  2: [34, 139, 87],
-  3: [21, 109, 61],
-  4: [196, 168, 84],
-  5: [219, 179, 94],
-  6: [132, 173, 93],
-  7: [130, 106, 74],
-  8: [63, 104, 61],
+  0:  [17,  42,  82],   // Ocean — deep blue
+  1:  [204, 213, 238],  // Tundra — icy white-blue
+  2:  [63,  104, 61],   // Boreal/Taiga — dark conifer green
+  3:  [21,  109, 61],   // Temperate Forest — rich green
+  4:  [196, 168, 84],   // Temperate Grassland — golden-green
+  5:  [168, 142, 60],   // Mediterranean — olive gold
+  6:  [1,   87,  50],   // Tropical Rainforest — deep emerald
+  7:  [132, 173, 93],   // Tropical Savanna — warm grass green
+  8:  [219, 179, 94],   // Desert — sandy yellow
+  9:  [34,  139, 87],   // Subtropical Forest — teal green
+  10: [130, 106, 74],   // Alpine — rocky brown
+  11: [178, 162, 108],  // Steppe — dry grass tan
 };
 
 export type WorldDisplayLayer =
