@@ -47,6 +47,7 @@ import {
   DEFAULT_TECTONICS,
   LAYER_GRAPH,
   type GenerationScope,
+  type IslandType,
   type LayerId,
   type RecomputeTrigger,
   type WorldEvent,
@@ -110,6 +111,8 @@ export default function HomePage() {
   const [generationScope, setGenerationScope] = useState<GenerationScope>(
     (DEFAULT_SIMULATION.scope as GenerationScope) ?? "planet",
   );
+  const [islandType, setIslandType] = useState<IslandType>("continental");
+  const [islandScaleKm, setIslandScaleKm] = useState(400);
   const [seedSearchPreset, setSeedSearchPreset] = useState<SeedSearchPresetId>("4");
   const [viewMode, setViewMode] = useState<ViewMode>("map");
   const [flatProjection, setFlatProjection] = useState<FlatProjection>("equirectangular");
@@ -232,9 +235,13 @@ export default function HomePage() {
       events,
       generationPreset,
       scope: generationScope,
+      ...(generationScope === "island" && {
+        islandType,
+        islandScaleKm,
+      }),
     };
     const searchAttempts =
-      generationScope === "tasmania"
+      generationScope === "island"
         ? 1
         : (SEED_SEARCH_PRESETS.find((item) => item.id === seedSearchPreset)?.attempts ?? 1);
 
@@ -292,7 +299,14 @@ export default function HomePage() {
     () => PREVIEW_PRESETS.find((item) => item.id === previewMode) ?? PREVIEW_PRESETS[0],
     [previewMode],
   );
-  const projectionMode: ProjectionMode = viewMode === "globe" ? "orthographic" : flatProjection;
+  // Island scope is a flat grid — orthographic and mercator don't apply.
+  const effectiveViewMode: ViewMode = generationScope === "island" ? "map" : viewMode;
+  const projectionMode: ProjectionMode =
+    generationScope === "island"
+      ? "equirectangular"
+      : effectiveViewMode === "globe"
+        ? "orthographic"
+        : flatProjection;
   const deferredDisplayLayer = useDeferredValue(displayLayer);
   const deferredProjectionMode = useDeferredValue(projectionMode);
   const deferredPreviewScale = useDeferredValue(preview.scale);
@@ -581,9 +595,48 @@ export default function HomePage() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="planet">Planet</SelectItem>
-                  <SelectItem value="tasmania">Island (Tasmania test)</SelectItem>
+                  <SelectItem value="island">Island</SelectItem>
                 </SelectContent>
               </Select>
+              {generationScope === "island" && (
+                <>
+                  <div className="h-2" />
+                  <Label>Тип острова</Label>
+                  <Select
+                    value={islandType}
+                    onValueChange={(value) => {
+                      setIslandType(value as IslandType);
+                      setIsDirty(true);
+                    }}
+                    disabled={isGenerating}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="continental">Континентальный фрагмент</SelectItem>
+                      <SelectItem value="arc">Островная дуга</SelectItem>
+                      <SelectItem value="hotspot">Горячая точка</SelectItem>
+                      <SelectItem value="rift">Рифтовый</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <div className="h-2" />
+                  <Label>Масштаб острова (км)</Label>
+                  <Input
+                    type="number"
+                    min={50}
+                    max={2000}
+                    step={50}
+                    value={islandScaleKm}
+                    onChange={(e) => {
+                      const v = Math.max(50, Math.min(2000, Number(e.target.value) || 400));
+                      setIslandScaleKm(v);
+                      setIsDirty(true);
+                    }}
+                    disabled={isGenerating}
+                  />
+                </>
+              )}
               <div className="h-2" />
               <Label>Пресет генерации</Label>
               <Select
@@ -607,7 +660,7 @@ export default function HomePage() {
               <Select
                 value={seedSearchPreset}
                 onValueChange={(value) => setSeedSearchPreset(value as SeedSearchPresetId)}
-                disabled={isGenerating || generationScope === "tasmania"}
+                disabled={isGenerating || generationScope === "island"}
               >
                 <SelectTrigger>
                   <SelectValue placeholder="Select seed search mode" />
@@ -901,10 +954,10 @@ export default function HomePage() {
               <CardDescription className="text-slate-300">Слой, проекция и центр камеры</CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
-              <Tabs value={viewMode} onValueChange={(value) => setViewMode(value as ViewMode)}>
+              <Tabs value={effectiveViewMode} onValueChange={(value) => setViewMode(value as ViewMode)}>
                 <TabsList className="grid w-full grid-cols-2">
                   <TabsTrigger value="map">Карта</TabsTrigger>
-                  <TabsTrigger value="globe">Глобус</TabsTrigger>
+                  <TabsTrigger value="globe" disabled={generationScope === "island"}>Глобус</TabsTrigger>
                 </TabsList>
               </Tabs>
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">

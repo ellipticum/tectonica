@@ -249,7 +249,7 @@ scope.onmessage = async (event: MessageEvent<WorkerInput>) => {
 
   try {
     const runSimulationRust = await getRunSimulationRust();
-    const isIslandScope = message.config.scope === "tasmania";
+    const isIslandScope = message.config.scope === "island";
     const attempts = isIslandScope ? 1 : Math.max(1, Math.min(24, Math.floor(message.attempts ?? 1)));
     let seed = message.config.seed >>> 0;
     let bestResult: SimulationResult | null = null;

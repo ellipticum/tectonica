@@ -8,7 +8,8 @@ export type LayerId =
   | "settlement";
 
 export type RecomputeTrigger = "global" | "tectonics" | "events";
-export type GenerationScope = "planet" | "tasmania";
+export type GenerationScope = "planet" | "island";
+export type IslandType = "continental" | "arc" | "hotspot" | "rift";
 
 export interface LayerSpec {
   id: LayerId;
@@ -171,6 +172,10 @@ export interface SimulationConfig {
   events: WorldEventRecord[];
   generationPreset?: "ultra" | "fast" | "balanced" | "detailed";
   scope?: GenerationScope;
+  /** Island tectonic type (only used when scope === "island") */
+  islandType?: IslandType;
+  /** Physical width of the island grid in km (50–2000). Default: 400. */
+  islandScaleKm?: number;
 }
 
 export interface SimulationStats {

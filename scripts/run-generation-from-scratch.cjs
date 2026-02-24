@@ -12,7 +12,7 @@ const { run_simulation_with_progress } = require(pkgPath);
 
 const EXPECTED_SIZE = {
   planet: { width: 2048, height: 1024 },
-  tasmania: { width: 1024, height: 512 },
+  island: { width: 1024, height: 512 },
 };
 
 function clamp(v, min, max) {
@@ -238,6 +238,8 @@ function run() {
   const seed = Number(process.env.SEED || Math.floor(Math.random() * 2_147_483_647));
   const generationPreset = process.env.PRESET || 'detailed';
   const scope = process.env.SCOPE || 'planet';
+  const islandType = process.env.ISLAND_TYPE || 'continental';
+  const islandScaleKm = Number(process.env.ISLAND_SCALE_KM || 400);
 
   const config = {
     seed,
@@ -259,6 +261,7 @@ function run() {
     events: [],
     generationPreset,
     scope,
+    ...(scope === 'island' && { islandType, islandScaleKm }),
   };
 
   let last = -1;
@@ -337,7 +340,7 @@ function run() {
   const minH = meta.stats.minHeight;
   const maxH = meta.stats.maxHeight;
   const landToneRange = estimateLandToneRange(heightMap, maxH);
-  const wrapXForHillshade = scope !== 'tasmania';
+  const wrapXForHillshade = scope !== 'island';
 
   writeBmp(path.join(runDir, 'height_preview.bmp'), width, height, (i, x, y) => {
     const h = heightMap[i];

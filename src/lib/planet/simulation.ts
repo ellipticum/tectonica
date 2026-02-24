@@ -6,6 +6,7 @@ export {
   LAYER_GRAPH,
   type EventKind,
   type GenerationScope,
+  type IslandType,
   type HeightExportPayload,
   type LayerId,
   type LayerSpec,
