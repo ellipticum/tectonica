@@ -10,7 +10,6 @@ const WORLD_HEIGHT: usize = 1024;
 const WORLD_SIZE: usize = WORLD_WIDTH * WORLD_HEIGHT;
 const ISLAND_WIDTH: usize = 1024;
 const ISLAND_HEIGHT: usize = 512;
-const ISLAND_SIZE: usize = ISLAND_WIDTH * ISLAND_HEIGHT;
 const RADIANS: f32 = std::f32::consts::PI / 180.0;
 const KILOMETERS_PER_DEGREE: f32 = 111.319_490_793;
 
@@ -42,20 +41,6 @@ fn clampf(value: f32, min: f32, max: f32) -> f32 {
     } else {
         value
     }
-}
-
-#[inline]
-fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
-    if (edge1 - edge0).abs() < 1e-6 {
-        return if x < edge0 { 0.0 } else { 1.0 };
-    }
-    let t = clampf((x - edge0) / (edge1 - edge0), 0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-#[inline]
-fn ridge(value: f32) -> f32 {
-    (1.0 - value.abs()).max(0.0)
 }
 
 #[inline]
@@ -235,18 +220,6 @@ fn plate_velocity_xy_at_cell(
     )
 }
 
-fn quantile_sorted(sorted_values: &[f32], q: f32) -> f32 {
-    if sorted_values.is_empty() {
-        return 0.0;
-    }
-
-    let t = clampf(q, 0.0, 1.0) * (sorted_values.len() as f32 - 1.0);
-    let lo = t.floor() as usize;
-    let hi = (lo + 1).min(sorted_values.len() - 1);
-    let k = t - lo as f32;
-    sorted_values[lo] * (1.0 - k) + sorted_values[hi] * k
-}
-
 fn min_max(values: &[f32]) -> (f32, f32) {
     let mut min = f32::INFINITY;
     let mut max = -f32::INFINITY;
@@ -349,12 +322,6 @@ impl GridConfig {
         y * self.width + x
     }
 
-    /// Reverse: index → (x, y).
-    #[inline]
-    fn index_to_xy(&self, i: usize) -> (usize, usize) {
-        (i % self.width, i / self.width)
-    }
-
     /// Neighbor with wrapping strategy: spherical wrap or clamp.
     #[inline]
     fn neighbor(&self, x: i32, y: i32) -> usize {
@@ -368,16 +335,6 @@ impl GridConfig {
         }
     }
 
-    /// Area of a single cell in km², accounting for latitude on a sphere.
-    #[inline]
-    fn cell_area_km2(&self, y: usize) -> f32 {
-        if self.is_spherical {
-            let lat_rad = (0.5 - (y as f32 + 0.5) / self.height as f32) * std::f32::consts::PI;
-            self.km_per_cell_x * self.km_per_cell_y * lat_rad.cos().abs()
-        } else {
-            self.km_per_cell_x * self.km_per_cell_y
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -426,42 +383,40 @@ impl CellCache {
         Self { noise_x, noise_y, noise_z, lat_deg, lon_deg: lon_deg_v }
     }
 
-    /// Build cache for island scope — flat grid with synthetic 3D coords for noise.
-    /// `center_lat_deg` is the latitude of the island center (affects climate).
-    /// `seed_phase` provides a unique z-offset so different islands get different noise.
-    fn for_island(grid: &GridConfig, center_lat_deg: f32, seed_phase: f32) -> Self {
-        let w = grid.width as f32;
-        let h = grid.height as f32;
-        let total_height_km = grid.height as f32 * grid.km_per_cell_y;
-
+    /// Build cache for a cropped island region at a known planetary position.
+    /// `center_lat_deg` / `center_lon_deg` are the planet-space coordinates
+    /// of the island center.  The island grid covers `grid.width * km_per_cell_x`
+    /// km in longitude and `grid.height * km_per_cell_y` km in latitude.
+    fn for_island_crop(grid: &GridConfig, center_lat_deg: f32, center_lon_deg: f32) -> Self {
         let mut noise_x = vec![0.0_f32; grid.size];
         let mut noise_y = vec![0.0_f32; grid.size];
-        let mut noise_z = vec![seed_phase; grid.size];
-        let mut lat_deg = vec![0.0_f32; grid.size];
+        let mut noise_z = vec![0.0_f32; grid.size];
+        let mut lat_deg_v = vec![0.0_f32; grid.size];
         let mut lon_deg_v = vec![0.0_f32; grid.size];
 
+        // Total span in degrees
+        let lat_span = (grid.height as f32 * grid.km_per_cell_y) / 111.0; // 111 km/deg
+        let cos_center = (center_lat_deg * RADIANS).cos().abs().max(0.05);
+        let lon_span = (grid.width as f32 * grid.km_per_cell_x) / (111.0 * cos_center);
+
         for y in 0..grid.height {
-            let y_km = (y as f32 + 0.5) * grid.km_per_cell_y - total_height_km * 0.5;
-            let lat_offset_deg = y_km / 111.0;
-            let lat = center_lat_deg - lat_offset_deg;
-
+            let lat = center_lat_deg + (0.5 - (y as f32 + 0.5) / grid.height as f32) * lat_span;
+            let lat_rad = lat * RADIANS;
+            let cos_lat = lat_rad.cos();
             for x in 0..grid.width {
+                let lon = center_lon_deg
+                    + ((x as f32 + 0.5) / grid.width as f32 - 0.5) * lon_span;
+                let lon_rad = lon * RADIANS;
                 let i = grid.index(x, y);
-
-                // Normalize coordinates to [-1, 1] to match planet-scope spherical
-                // coordinate range. This ensures the noise functions (spherical_fbm,
-                // value_noise3) produce continent-scale features rather than
-                // microscale texture (which would happen if we used x_km/R_earth ≈ 0.06).
-                noise_x[i] = 2.0 * (x as f32 + 0.5) / w - 1.0;
-                noise_y[i] = 2.0 * (y as f32 + 0.5) / h - 1.0;
-                noise_z[i] = seed_phase;
-
-                lat_deg[i] = lat;
-                lon_deg_v[i] = (x as f32 / w - 0.5) * 10.0;
+                noise_x[i] = cos_lat * lon_rad.cos();
+                noise_y[i] = cos_lat * lon_rad.sin();
+                noise_z[i] = lat_rad.sin();
+                lat_deg_v[i] = lat;
+                lon_deg_v[i] = lon;
             }
         }
 
-        Self { noise_x, noise_y, noise_z, lat_deg, lon_deg: lon_deg_v }
+        Self { noise_x, noise_y, noise_z, lat_deg: lat_deg_v, lon_deg: lon_deg_v }
     }
 }
 
@@ -556,13 +511,9 @@ enum GenerationPreset {
 
 #[derive(Clone, Copy)]
 struct DetailProfile {
-    buoyancy_smooth_passes: usize,
     erosion_rounds: usize,
     fluvial_rounds: usize,
-    ocean_smooth_passes: usize,
     max_kernel_radius: i32,
-    fault_iterations: usize,
-    fault_smooth_passes: usize,
     plate_evolution_steps: usize,
 }
 
@@ -578,43 +529,27 @@ fn parse_generation_preset(value: Option<&str>) -> GenerationPreset {
 fn detail_profile(preset: GenerationPreset) -> DetailProfile {
     match preset {
         GenerationPreset::Ultra => DetailProfile {
-            buoyancy_smooth_passes: 1,
             erosion_rounds: 0,
             fluvial_rounds: 0,
-            ocean_smooth_passes: 0,
             max_kernel_radius: 3,
-            fault_iterations: 720,
-            fault_smooth_passes: 1,
             plate_evolution_steps: 2,
         },
         GenerationPreset::Fast => DetailProfile {
-            buoyancy_smooth_passes: 6,
             erosion_rounds: 1,
             fluvial_rounds: 1,
-            ocean_smooth_passes: 1,
             max_kernel_radius: 4,
-            fault_iterations: 1300,
-            fault_smooth_passes: 1,
             plate_evolution_steps: 4,
         },
         GenerationPreset::Detailed => DetailProfile {
-            buoyancy_smooth_passes: 18,
             erosion_rounds: 3,
             fluvial_rounds: 3,
-            ocean_smooth_passes: 3,
             max_kernel_radius: 6,
-            fault_iterations: 3400,
-            fault_smooth_passes: 2,
             plate_evolution_steps: 10,
         },
         GenerationPreset::Balanced => DetailProfile {
-            buoyancy_smooth_passes: 14,
             erosion_rounds: 2,
             fluvial_rounds: 2,
-            ocean_smooth_passes: 2,
             max_kernel_radius: 5,
-            fault_iterations: 2600,
-            fault_smooth_passes: 2,
             plate_evolution_steps: 7,
         },
     }
@@ -632,15 +567,6 @@ fn parse_scope(value: Option<&str>) -> GenerationScope {
     match value.unwrap_or("planet") {
         "island" | "tasmania" => GenerationScope::Island,
         _ => GenerationScope::Planet,
-    }
-}
-
-fn parse_island_type(value: Option<&str>) -> IslandType {
-    match value.unwrap_or("continental") {
-        "arc" => IslandType::Arc,
-        "hotspot" => IslandType::Hotspot,
-        "rift" => IslandType::Rift,
-        _ => IslandType::Continental,
     }
 }
 
@@ -680,7 +606,6 @@ fn ensure_event_energy(mut event: WorldEventRecord) -> WorldEventRecord {
 struct PlateSpec {
     lat: f32,
     lon: f32,
-    speed: f32,
     dir_x: f32,
     dir_y: f32,
     omega_x: f32,
@@ -692,7 +617,6 @@ struct PlateSpec {
 
 #[derive(Clone)]
 struct PlateVector {
-    speed: f32,
     omega_x: f32,
     omega_y: f32,
     omega_z: f32,
@@ -704,8 +628,6 @@ struct PlateVector {
 struct ComputePlatesResult {
     plate_field: Vec<i16>,
     boundary_types: Vec<i8>,
-    boundary_normal_x: Vec<f32>,
-    boundary_normal_y: Vec<f32>,
     boundary_strength: Vec<f32>,
     plate_vectors: Vec<PlateVector>,
 }
@@ -769,34 +691,6 @@ impl MinCostQueue {
 
     fn pop(&mut self) -> Option<FrontierNode> {
         self.data.pop().map(|Reverse(node)| node)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct DistanceNode {
-    cost: f32,
-    index: usize,
-}
-
-impl PartialEq for DistanceNode {
-    fn eq(&self, other: &Self) -> bool {
-        self.cost.to_bits() == other.cost.to_bits() && self.index == other.index
-    }
-}
-
-impl Eq for DistanceNode {}
-
-impl PartialOrd for DistanceNode {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DistanceNode {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.cost
-            .total_cmp(&other.cost)
-            .then_with(|| self.index.cmp(&other.index))
     }
 }
 
@@ -1606,7 +1500,6 @@ fn compute_plates(
         plates.push(PlateSpec {
             lat,
             lon,
-            speed,
             dir_x: drift_x,
             dir_y: drift_y,
             omega_x,
@@ -1624,7 +1517,6 @@ fn compute_plates(
     let plate_vectors: Vec<PlateVector> = plates
         .iter()
         .map(|plate| PlateVector {
-            speed: plate.speed,
             omega_x: plate.omega_x,
             omega_y: plate.omega_y,
             omega_z: plate.omega_z,
@@ -1656,8 +1548,6 @@ fn compute_plates(
     cleanup_plate_fragments_relative(&mut plate_field, 0.5, min_fragment_cells * 6);
 
     let mut boundary_types = vec![0_i8; WORLD_SIZE];
-    let mut boundary_normal_x = vec![0.0_f32; WORLD_SIZE];
-    let mut boundary_normal_y = vec![0.0_f32; WORLD_SIZE];
     let mut boundary_strength = vec![0.0_f32; WORLD_SIZE];
     let boundary_scale = (tectonics.plate_speed_cm_per_year * 1.25).max(1.2);
 
@@ -1725,8 +1615,6 @@ fn compute_plates(
 
             if !has_different_neighbor {
                 boundary_types[i] = 0;
-                boundary_normal_x[i] = 0.0;
-                boundary_normal_y[i] = 0.0;
                 boundary_strength[i] = 0.0;
                 continue;
             }
@@ -1738,11 +1626,7 @@ fn compute_plates(
 
             let n_len = normal_x.hypot(normal_y);
             if n_len > 1e-5 {
-                boundary_normal_x[i] = normal_x / n_len;
-                boundary_normal_y[i] = normal_y / n_len;
             } else {
-                boundary_normal_x[i] = 0.0;
-                boundary_normal_y[i] = 1.0;
             }
 
             let strength = conv.max(div).max(shear * 0.82);
@@ -1770,1873 +1654,9 @@ fn compute_plates(
     ComputePlatesResult {
         plate_field,
         boundary_types,
-        boundary_normal_x,
-        boundary_normal_y,
         boundary_strength,
         plate_vectors,
     }
-}
-
-fn build_fault_backbone(
-    seed: u32,
-    iterations: usize,
-    smooth_passes: usize,
-    grid: &GridConfig,
-    progress: &mut ProgressTap<'_>,
-    progress_base: f32,
-    progress_span: f32,
-) -> Vec<f32> {
-    let width = grid.width;
-    let height = grid.height;
-    let width_i32 = width as i32;
-    let height_i32 = height as i32;
-    let x_half = width / 2;
-
-    // Column-major storage (x-major) to match classic worldgen fault accumulation.
-    let mut fault_col = vec![f32::NAN; grid.size];
-    for x in 0..width {
-        fault_col[x * height] = 0.0;
-    }
-
-    let mut sin_iter_phi = vec![0.0_f32; width * 2];
-    let step = 2.0 * std::f32::consts::PI / width as f32;
-    for i in 0..width {
-        let s = (i as f32 * step).sin();
-        sin_iter_phi[i] = s;
-        sin_iter_phi[i + width] = s;
-    }
-
-    let mut rng = Rng::new(seed ^ 0xA341_316C);
-    let y_div2 = height as f32 * 0.5;
-    let y_div_pi = height as f32 / std::f32::consts::PI;
-
-    let fault_iterations = iterations.max(1);
-    for iter in 0..fault_iterations {
-        if iter % 24 == 0 {
-            let t = iter as f32 / fault_iterations as f32;
-            progress.phase(progress_base, progress_span, 0.8 * t);
-        }
-
-        let flag_negative = rng.next_f32() < 0.5;
-        let alpha = (rng.next_f32() - 0.5) * std::f32::consts::PI;
-        let beta = (rng.next_f32() - 0.5) * std::f32::consts::PI;
-        let cos_term = clampf(alpha.cos() * beta.cos(), -1.0, 1.0);
-        let tan_b = cos_term.acos().tan();
-        let xsi = (width as f32 * 0.5 - (width as f32 / std::f32::consts::PI) * beta).round() as i32;
-
-        for phi in 0..x_half {
-            let sin_idx = (xsi - phi as i32 + width_i32).clamp(0, (2 * width - 1) as i32) as usize;
-            let theta = (y_div_pi * (sin_iter_phi[sin_idx] * tan_b).atan() + y_div2).round() as i32;
-            let y = theta.clamp(0, height_i32 - 1) as usize;
-            let idx = phi * height + y;
-            let delta = if flag_negative { -1.0 } else { 1.0 };
-            if fault_col[idx].is_nan() {
-                fault_col[idx] = delta;
-            } else {
-                fault_col[idx] += delta;
-            }
-        }
-    }
-    progress.phase(progress_base, progress_span, 0.82);
-
-    // Mirror the second hemisphere from the first (same trick as classic algorithm).
-    let offset = x_half * height;
-    for x in 0..x_half {
-        let row = x * height;
-        for y in 1..height {
-            fault_col[row + offset + (height - y)] = fault_col[row + y];
-        }
-    }
-
-    // Integrate step-lines into signed relief profile for each longitude.
-    for x in 0..width {
-        let row = x * height;
-        let mut acc = if fault_col[row].is_nan() {
-            0.0
-        } else {
-            fault_col[row]
-        };
-        fault_col[row] = acc;
-        for y in 1..height {
-            let cur = fault_col[row + y];
-            if !cur.is_nan() {
-                acc += cur;
-            }
-            fault_col[row + y] = acc;
-        }
-    }
-
-    let mut min_v = f32::INFINITY;
-    let mut max_v = -f32::INFINITY;
-    for &v in fault_col.iter() {
-        if v.is_nan() {
-            continue;
-        }
-        min_v = min_v.min(v);
-        max_v = max_v.max(v);
-    }
-    let mid = (min_v + max_v) * 0.5;
-    let half_span = ((max_v - min_v) * 0.5).max(1e-4);
-
-    let mut field = vec![0.0_f32; grid.size];
-    for y in 0..height {
-        for x in 0..width {
-            let v = fault_col[x * height + y];
-            let n = clampf((v - mid) / half_span, -1.0, 1.0);
-            field[grid.index(x, y)] = n;
-        }
-    }
-    progress.phase(progress_base, progress_span, 0.9);
-
-    if smooth_passes == 0 {
-        progress.phase(progress_base, progress_span, 1.0);
-        return field;
-    }
-
-    let mut scratch = field.clone();
-    for pass in 0..smooth_passes {
-        for y in 0..grid.height {
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let mut sum = field[i] * 0.46;
-                let mut wsum = 0.46;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
-                        let w = if ox == 0 || oy == 0 { 0.1 } else { 0.065 };
-                        sum += field[j] * w;
-                        wsum += w;
-                    }
-                }
-                scratch[i] = sum / wsum.max(1e-6);
-            }
-        }
-        field.copy_from_slice(&scratch);
-        let t = (pass as f32 + 1.0) / smooth_passes as f32;
-        progress.phase(progress_base, progress_span, 0.9 + 0.1 * t);
-    }
-
-    field
-}
-
-fn build_continent_blob_field(seed: u32, grid: &GridConfig, cell_cache: &CellCache) -> Vec<f32> {
-    #[derive(Clone, Copy)]
-    struct Blob {
-        x: f32,
-        y: f32,
-        z: f32,
-        amp: f32,
-        sharpness: f32,
-    }
-
-    let mut rng = Rng::new(seed ^ 0x85EB_CA6B);
-    let pos_count = 13usize;
-    let neg_count = 9usize;
-    let mut blobs: Vec<Blob> = Vec::with_capacity(pos_count + neg_count);
-
-    let mut make_blob = |amp_min: f32, amp_max: f32, sh_min: f32, sh_max: f32| -> Blob {
-        let z = random_range(&mut rng, -1.0, 1.0);
-        let lon = random_range(
-            &mut rng,
-            -std::f32::consts::PI,
-            std::f32::consts::PI,
-        );
-        let r = (1.0 - z * z).max(0.0).sqrt();
-        Blob {
-            x: r * lon.cos(),
-            y: r * lon.sin(),
-            z,
-            amp: random_range(&mut rng, amp_min, amp_max),
-            sharpness: random_range(&mut rng, sh_min, sh_max),
-        }
-    };
-
-    for _ in 0..pos_count {
-        blobs.push(make_blob(0.65, 1.3, 3.8, 9.4));
-    }
-    for _ in 0..neg_count {
-        blobs.push(make_blob(-1.15, -0.42, 5.5, 13.0));
-    }
-
-    let mut out = vec![0.0_f32; grid.size];
-    let mut min_v = f32::INFINITY;
-    let mut max_v = -f32::INFINITY;
-
-    for i in 0..grid.size {
-        let sx = cell_cache.noise_x[i];
-        let sy = cell_cache.noise_y[i];
-        let sz = cell_cache.noise_z[i];
-        let mut sum = 0.0_f32;
-
-        for blob in blobs.iter() {
-            let dot = clampf(sx * blob.x + sy * blob.y + sz * blob.z, -1.0, 1.0);
-            let kernel = ((dot - 1.0) * blob.sharpness).exp();
-            sum += blob.amp * kernel;
-        }
-
-        // Mild extra isotropic perturbation to avoid perfect radial blobs.
-        let jitter = (sx * 2.9 + sy * 3.4 + sz * 2.1 + seed as f32 * 0.0011).sin() * 0.12
-            + (sy * 3.1 - sz * 2.6 + sx * 2.4 - seed as f32 * 0.0013).cos() * 0.08;
-        let v = sum + jitter;
-        min_v = min_v.min(v);
-        max_v = max_v.max(v);
-        out[i] = v;
-    }
-
-    let mid = (min_v + max_v) * 0.5;
-    let half = ((max_v - min_v) * 0.5).max(1e-5);
-    for v in out.iter_mut() {
-        *v = clampf((*v - mid) / half, -1.0, 1.0);
-    }
-
-    out
-}
-
-fn build_continentality_field(
-    seed: u32,
-    grid: &GridConfig,
-    cell_cache: &CellCache,
-    buoyancy: &[f32],
-    blob_backbone: &[f32],
-    smooth_passes: usize,
-) -> Vec<f32> {
-    let mut field = vec![0.0_f32; grid.size];
-    let seed_phase = seed as f32 * 0.00131;
-
-    for i in 0..grid.size {
-        let sx = cell_cache.noise_x[i];
-        let sy = cell_cache.noise_y[i];
-        let sz = cell_cache.noise_z[i];
-        let warp_a = spherical_fbm(
-            sx * 1.15 + 3.0,
-            sy * 1.15 - 5.0,
-            sz * 1.15 + 7.0,
-            seed_phase + 11.0,
-        );
-        let warp_b = spherical_fbm(
-            sx * 1.7 - 13.0,
-            sy * 1.7 + 17.0,
-            sz * 1.7 - 19.0,
-            seed_phase + 29.0,
-        );
-        let warp_c = spherical_fbm(
-            sx * 2.2 + 23.0,
-            sy * 2.2 - 7.0,
-            sz * 2.2 + 31.0,
-            seed_phase + 47.0,
-        );
-        let wx = sx + 0.36 * warp_a + 0.2 * warp_b + 0.12 * warp_c;
-        let wy = sy + 0.36 * warp_b + 0.2 * warp_c + 0.12 * warp_a;
-        let wz = sz + 0.3 * warp_c + 0.16 * (warp_a - warp_b);
-
-        let low = spherical_fbm(wx * 0.7, wy * 0.7, wz * 0.7, seed_phase + 37.0);
-        let mid = spherical_fbm(wx * 1.45, wy * 1.45, wz * 1.45, seed_phase + 53.0);
-        let high = spherical_fbm(wx * 2.95, wy * 2.95, wz * 2.95, seed_phase + 71.0);
-        let ridgeish = ridge(spherical_fbm(
-            wx * 2.1 + 17.0,
-            wy * 2.1 - 19.0,
-            wz * 2.1 + 11.0,
-            seed_phase + 83.0,
-        )) * 2.0
-            - 1.0;
-        let fine = spherical_fbm(
-            wx * 5.1 - 41.0,
-            wy * 5.1 + 37.0,
-            wz * 5.1 - 29.0,
-            seed_phase + 97.0,
-        );
-        field[i] = low * 0.48
-            + mid * 0.32
-            + high * 0.16
-            + ridgeish * 0.04
-            + fine * 0.03
-            + buoyancy[i] * 0.03
-            + blob_backbone[i] * 0.01;
-    }
-
-    if smooth_passes > 0 {
-        let mut next = field.clone();
-        for _ in 0..smooth_passes {
-            for y in 0..grid.height {
-                for x in 0..grid.width {
-                    let i = grid.index(x, y);
-                    let mut sum = field[i] * 0.36;
-                    let mut wsum = 0.36;
-                    for oy in -1..=1 {
-                        for ox in -1..=1 {
-                            if ox == 0 && oy == 0 {
-                                continue;
-                            }
-                            let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
-                            let w = if ox == 0 || oy == 0 { 0.11 } else { 0.07 };
-                            sum += field[j] * w;
-                            wsum += w;
-                        }
-                    }
-                    next[i] = sum / wsum.max(1e-6);
-                }
-            }
-            field.copy_from_slice(&next);
-        }
-    }
-
-    let (min_v, max_v) = min_max(&field);
-    let mid = (min_v + max_v) * 0.5;
-    let half = ((max_v - min_v) * 0.5).max(1e-6);
-    for v in field.iter_mut() {
-        *v = clampf((*v - mid) / half, -1.0, 1.0);
-    }
-
-    field
-}
-
-fn normalize_height_range(relief: &mut [f32], planet: &PlanetInputs, tectonics: &TectonicInputs) {
-    let mut land_heights: Vec<f32> = Vec::new();
-    let mut ocean_depths: Vec<f32> = Vec::new();
-
-    for &h in relief.iter() {
-        if h > 0.0 {
-            land_heights.push(h);
-        } else if h < 0.0 {
-            ocean_depths.push(-h);
-        }
-    }
-
-    if land_heights.len() < 8 || ocean_depths.len() < 8 {
-        return;
-    }
-
-    land_heights.sort_by(|a, b| a.total_cmp(b));
-    ocean_depths.sort_by(|a, b| a.total_cmp(b));
-
-    let land_ref = quantile_sorted(&land_heights, 0.995).max(1.0);
-    let ocean_ref = quantile_sorted(&ocean_depths, 0.995).max(1.0);
-
-    let speed_factor = clampf(tectonics.plate_speed_cm_per_year / 5.0, 0.35, 2.8);
-    let heat_factor = clampf(tectonics.mantle_heat / 55.0, 0.45, 2.2);
-    let gravity_factor = clampf(9.81 / planet.gravity.max(1.0), 0.45, 2.4);
-    let ocean_factor = clampf(planet.ocean_percent / 67.0, 0.45, 1.9);
-
-    let target_land_max = clampf(
-        4300.0 * speed_factor.powf(0.45) * heat_factor.powf(0.32) * gravity_factor.powf(0.62),
-        1200.0,
-        6600.0,
-    );
-    let target_ocean_depth = clampf(
-        7500.0 * speed_factor.powf(0.5) * heat_factor.powf(0.35) * ocean_factor.powf(0.55),
-        1400.0,
-        12000.0,
-    );
-    let land_gamma = clampf(
-        1.9 + 0.07 * speed_factor + 0.03 * heat_factor - 0.1 * gravity_factor,
-        1.68,
-        2.4,
-    );
-    let ocean_gamma = clampf(0.9 + 0.06 * ocean_factor - 0.05 * speed_factor, 0.74, 1.02);
-
-    for h in relief.iter_mut() {
-        if *h > 0.0 {
-            let n = (*h / land_ref).max(0.0);
-            let core = clampf(n, 0.0, 1.0).powf(land_gamma);
-            let tail = (n - 1.0).max(0.0);
-            *h = clampf(
-                core * target_land_max + tail * target_land_max * 0.14,
-                -12000.0,
-                9000.0,
-            );
-        } else if *h < 0.0 {
-            let d = (-*h / ocean_ref).max(0.0);
-            let core = clampf(d, 0.0, 1.0).powf(ocean_gamma);
-            let tail = (d - 1.0).max(0.0);
-            *h = clampf(
-                -(core * target_ocean_depth + tail * target_ocean_depth * 0.34),
-                -12000.0,
-                9000.0,
-            );
-        }
-    }
-}
-
-fn defuse_orogenic_ribbons(relief: &mut [f32], seed: u32, cache: &WorldCache, detail: DetailProfile) {
-    let passes = if detail.erosion_rounds >= 2 { 2 } else { 1 };
-    let mut next = relief.to_vec();
-    let seed_phase = seed as f32 * 0.00153;
-
-    for pass in 0..passes {
-        for y in 0..WORLD_HEIGHT {
-            for x in 0..WORLD_WIDTH {
-                let i = index(x, y);
-                let h = relief[i];
-                if h < 700.0 {
-                    next[i] = h;
-                    continue;
-                }
-
-                let sx = cache.x_by_cell[i];
-                let sy = cache.y_by_cell[i];
-                let sz = cache.z_by_cell[i];
-                let cluster_noise = 0.5
-                    + 0.5
-                        * ((sx * 4.6 + sy * 3.9 + sz * 3.3 + seed_phase + pass as f32 * 1.9).sin()
-                            * 0.58
-                            + (sy * 5.1 - sz * 3.8 + sx * 2.7 - seed_phase * 1.2).cos() * 0.42);
-                let cluster = smoothstep(0.28, 0.88, cluster_noise);
-
-                let mut sum = h * 0.38;
-                let mut wsum = 0.38;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                        if relief[j] < 0.0 {
-                            continue;
-                        }
-                        let w = if ox == 0 || oy == 0 { 0.1 } else { 0.066 };
-                        sum += relief[j] * w;
-                        wsum += w;
-                    }
-                }
-                let avg = sum / wsum.max(1e-6);
-                let ridge_excess = (h - avg).max(0.0);
-
-                let east = relief[index_spherical(x as i32 + 1, y as i32)].max(0.0);
-                let west = relief[index_spherical(x as i32 - 1, y as i32)].max(0.0);
-                let north = relief[index_spherical(x as i32, y as i32 - 1)].max(0.0);
-                let south = relief[index_spherical(x as i32, y as i32 + 1)].max(0.0);
-                let ne = relief[index_spherical(x as i32 + 1, y as i32 - 1)].max(0.0);
-                let nw = relief[index_spherical(x as i32 - 1, y as i32 - 1)].max(0.0);
-                let se = relief[index_spherical(x as i32 + 1, y as i32 + 1)].max(0.0);
-                let sw = relief[index_spherical(x as i32 - 1, y as i32 + 1)].max(0.0);
-
-                let d0 = (east - west).abs();
-                let d1 = (north - south).abs();
-                let d2 = (ne - sw).abs();
-                let d3 = (nw - se).abs();
-                let dominant = d0.max(d1).max(d2).max(d3);
-                let dir_sum = d0 + d1 + d2 + d3;
-                let linearness = if dominant > 1e-4 {
-                    clampf((dominant * 4.0 - dir_sum) / dominant, 0.0, 1.0)
-                } else {
-                    0.0
-                };
-
-                let mix = clampf(
-                    0.1
-                        + 0.34 * (1.0 - cluster)
-                        + 0.22 * linearness
-                        + 0.18 * clampf(ridge_excess / 900.0, 0.0, 1.0),
-                    0.0,
-                    0.76,
-                );
-                let perturb = ((sx * 10.3 + sy * 8.2 + sz * 6.1 + seed_phase).sin() * 0.55
-                    + (sy * 9.4 - sz * 7.6 + sx * 5.7 - seed_phase * 1.37).cos() * 0.45)
-                    * (18.0 + 58.0 * cluster);
-                let target = avg + perturb - linearness * 70.0 * (1.0 - cluster);
-                let mut reshaped = h * (1.0 - mix) + target * mix;
-                if linearness > 0.55 {
-                    reshaped = reshaped.min(avg + 1200.0 + 420.0 * cluster);
-                }
-                reshaped = reshaped.max(h * 0.4);
-                next[i] = reshaped;
-            }
-        }
-        relief.copy_from_slice(&next);
-    }
-}
-
-fn reshape_ocean_boundaries(relief: &mut [f32], boundary_types: &[i8], boundary_strength: &[f32]) {
-    let mut deepest = 0.0_f32;
-    for &h in relief.iter() {
-        if h < 0.0 {
-            deepest = deepest.max(-h);
-        }
-    }
-    let depth_scale = deepest.max(1.0);
-
-    for i in 0..WORLD_SIZE {
-        if relief[i] >= 0.0 || relief[i] > -2200.0 {
-            continue;
-        }
-
-        let x = i % WORLD_WIDTH;
-        let y = i / WORLD_WIDTH;
-        let mut conv = 0.0_f32;
-        let mut div = 0.0_f32;
-        let mut transform = 0.0_f32;
-        let mut wsum = 0.0_f32;
-        for oy in -1..=1 {
-            for ox in -1..=1 {
-                let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                let t = boundary_types[j];
-                if t == 0 {
-                    continue;
-                }
-                let s = clampf(boundary_strength[j], 0.0, 1.0);
-                let w = if ox == 0 && oy == 0 {
-                    1.0
-                } else if ox == 0 || oy == 0 {
-                    0.62
-                } else {
-                    0.44
-                };
-                let value = s * w;
-                if t == 1 {
-                    conv += value;
-                } else if t == 2 {
-                    div += value;
-                } else if t == 3 {
-                    transform += value;
-                }
-                wsum += w;
-            }
-        }
-        if wsum < 1e-4 {
-            continue;
-        }
-        conv /= wsum;
-        div /= wsum;
-        transform /= wsum;
-
-        let depth_t = clampf(-relief[i] / depth_scale, 0.0, 1.0);
-
-        if div > 0.08 {
-            let uplift = (60.0 + 260.0 * div) * (0.62 + 0.38 * (1.0 - depth_t));
-            relief[i] = (relief[i] + uplift).min(-15.0);
-        } else if transform > 0.08 {
-            let uplift = (14.0 + 65.0 * transform) * (0.6 + 0.4 * (1.0 - depth_t));
-            relief[i] += uplift;
-        }
-        if conv > 0.1 {
-            let trench = (45.0 + 220.0 * conv) * (0.54 + 0.46 * depth_t);
-            relief[i] -= trench;
-        }
-    }
-
-    let mut ocean_smoothed = relief.to_vec();
-    for _ in 0..2 {
-        for y in 0..WORLD_HEIGHT {
-            for x in 0..WORLD_WIDTH {
-                let i = index(x, y);
-                if relief[i] >= 0.0 {
-                    continue;
-                }
-                let mut sum = relief[i] * 3.9;
-                let mut wsum = 3.9;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                        if relief[j] >= 0.0 {
-                            continue;
-                        }
-                        let w = if ox == 0 || oy == 0 { 0.72 } else { 0.54 };
-                        sum += relief[j] * w;
-                        wsum += w;
-                    }
-                }
-                ocean_smoothed[i] = sum / wsum.max(1e-6);
-            }
-        }
-        for i in 0..WORLD_SIZE {
-            if relief[i] < 0.0 {
-                relief[i] = ocean_smoothed[i];
-            }
-        }
-    }
-}
-
-fn apply_coastal_detail(relief: &mut [f32], seed: u32, cache: &WorldCache) {
-    for i in 0..WORLD_SIZE {
-        let h = relief[i];
-        let near_sea = (-h.abs() / 900.0).exp();
-        if near_sea < 0.035 {
-            continue;
-        }
-
-        let sx = cache.x_by_cell[i];
-        let sy = cache.y_by_cell[i];
-        let sz = cache.z_by_cell[i];
-        let seed_phase = seed as f32 * 0.00091;
-        let warp_x =
-            sx + 0.22 * (sy * 6.1 + seed_phase).sin() + 0.14 * (sz * 7.4 - seed_phase * 1.7).cos();
-        let warp_y = sy
-            + 0.2 * (sz * 5.8 - seed_phase * 1.2).sin()
-            + 0.12 * (sx * 6.9 + seed_phase * 0.8).cos();
-        let warp_z = sz
-            + 0.18 * (sx * 5.2 + seed_phase * 1.5).sin()
-            + 0.1 * (sy * 7.2 - seed_phase * 0.6).cos();
-        let micro = (warp_x * 7.6 + warp_y * 6.4 + warp_z * 5.1 + seed_phase * 1.9).sin() * 0.62
-            + (warp_y * 8.1 - warp_z * 5.7 + warp_x * 4.6 - seed_phase * 1.3).cos() * 0.38;
-        let macro_n = spherical_fbm(
-            warp_x * 0.95 + 2.7,
-            warp_y * 0.95 - 3.1,
-            warp_z * 0.95 + 1.9,
-            seed_phase * 9.2,
-        );
-        let coast_weight = near_sea.powf(1.08);
-        let delta = coast_weight * (macro_n * 26.0 + micro * 14.0);
-        if h >= 0.0 {
-            relief[i] = (h + delta).max(8.0);
-        } else {
-            relief[i] = (h + delta).min(-8.0);
-        }
-    }
-}
-
-fn cleanup_coastal_speckles(relief: &mut [f32]) {
-    let mut next = relief.to_vec();
-
-    for y in 0..WORLD_HEIGHT {
-        for x in 0..WORLD_WIDTH {
-            let i = index(x, y);
-            let h = relief[i];
-            if h.abs() > 260.0 {
-                continue;
-            }
-
-            let mut land = 0;
-            let mut water = 0;
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    if ox == 0 && oy == 0 {
-                        continue;
-                    }
-                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                    if relief[j] >= 0.0 {
-                        land += 1;
-                    } else {
-                        water += 1;
-                    }
-                }
-            }
-
-            if h >= 0.0 && water >= 7 {
-                next[i] = next[i].min(-18.0 - h.abs() * 0.15);
-            } else if h < 0.0 && land >= 7 {
-                next[i] = next[i].max(18.0 + h.abs() * 0.15);
-            }
-        }
-    }
-
-    relief.copy_from_slice(&next);
-}
-
-fn clean_landmask_components(mask: &mut [u8], min_land_cells: usize, min_inland_water_cells: usize) {
-    let mut visited = vec![0_u8; WORLD_SIZE];
-    let mut queue: VecDeque<usize> = VecDeque::new();
-    let mut component: Vec<usize> = Vec::new();
-
-    // Remove tiny land islands.
-    for start in 0..WORLD_SIZE {
-        if mask[start] != 1 || visited[start] != 0 {
-            continue;
-        }
-        visited[start] = 1;
-        queue.push_back(start);
-        component.clear();
-        while let Some(i) = queue.pop_front() {
-            component.push(i);
-            let x = i % WORLD_WIDTH;
-            let y = i / WORLD_WIDTH;
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    if ox == 0 && oy == 0 {
-                        continue;
-                    }
-                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                    if visited[j] == 0 && mask[j] == 1 {
-                        visited[j] = 1;
-                        queue.push_back(j);
-                    }
-                }
-            }
-        }
-        if component.len() < min_land_cells {
-            for &i in component.iter() {
-                mask[i] = 0;
-            }
-        }
-    }
-
-    // Find largest water body (global ocean candidate).
-    visited.fill(0);
-    let mut largest_water = 0_usize;
-    for start in 0..WORLD_SIZE {
-        if mask[start] != 0 || visited[start] != 0 {
-            continue;
-        }
-        visited[start] = 1;
-        queue.push_back(start);
-        let mut size = 0_usize;
-        while let Some(i) = queue.pop_front() {
-            size += 1;
-            let x = i % WORLD_WIDTH;
-            let y = i / WORLD_WIDTH;
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    if ox == 0 && oy == 0 {
-                        continue;
-                    }
-                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                    if visited[j] == 0 && mask[j] == 0 {
-                        visited[j] = 1;
-                        queue.push_back(j);
-                    }
-                }
-            }
-        }
-        largest_water = largest_water.max(size);
-    }
-
-    // Fill tiny inland seas/lakes but keep major water bodies.
-    visited.fill(0);
-    for start in 0..WORLD_SIZE {
-        if mask[start] != 0 || visited[start] != 0 {
-            continue;
-        }
-        visited[start] = 1;
-        queue.push_back(start);
-        component.clear();
-        while let Some(i) = queue.pop_front() {
-            component.push(i);
-            let x = i % WORLD_WIDTH;
-            let y = i / WORLD_WIDTH;
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    if ox == 0 && oy == 0 {
-                        continue;
-                    }
-                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                    if visited[j] == 0 && mask[j] == 0 {
-                        visited[j] = 1;
-                        queue.push_back(j);
-                    }
-                }
-            }
-        }
-        let size = component.len();
-        if size < min_inland_water_cells && size < largest_water / 18 {
-            for &i in component.iter() {
-                mask[i] = 1;
-            }
-        }
-    }
-}
-
-fn compute_component_sizes_for_mask(mask: &[u8], target: u8) -> Vec<usize> {
-    let mut sizes = vec![0_usize; WORLD_SIZE];
-    let mut visited = vec![0_u8; WORLD_SIZE];
-    let mut queue: VecDeque<usize> = VecDeque::new();
-    let mut component: Vec<usize> = Vec::new();
-
-    for start in 0..WORLD_SIZE {
-        if mask[start] != target || visited[start] != 0 {
-            continue;
-        }
-        visited[start] = 1;
-        queue.push_back(start);
-        component.clear();
-
-        while let Some(i) = queue.pop_front() {
-            component.push(i);
-            let x = i % WORLD_WIDTH;
-            let y = i / WORLD_WIDTH;
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    if ox == 0 && oy == 0 {
-                        continue;
-                    }
-                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                    if visited[j] == 0 && mask[j] == target {
-                        visited[j] = 1;
-                        queue.push_back(j);
-                    }
-                }
-            }
-        }
-
-        let size = component.len();
-        for &i in component.iter() {
-            sizes[i] = size;
-        }
-    }
-
-    sizes
-}
-
-fn smooth_landmask(mask: &mut [u8], passes: usize) {
-    if passes == 0 {
-        return;
-    }
-    let mut next = mask.to_vec();
-    for _ in 0..passes {
-        for y in 0..WORLD_HEIGHT {
-            for x in 0..WORLD_WIDTH {
-                let i = index(x, y);
-                let mut land_neighbors = 0_i32;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                        if mask[j] == 1 {
-                            land_neighbors += 1;
-                        }
-                    }
-                }
-
-                let cur = mask[i];
-                next[i] = if cur == 1 {
-                    if land_neighbors <= 2 {
-                        0
-                    } else {
-                        1
-                    }
-                } else if land_neighbors >= 6 {
-                    1
-                } else {
-                    0
-                };
-            }
-        }
-        mask.copy_from_slice(&next);
-    }
-}
-
-fn blend_topology_edges(relief: &mut [f32]) {
-    let mut next = relief.to_vec();
-    for _ in 0..2 {
-        for y in 0..WORLD_HEIGHT {
-            for x in 0..WORLD_WIDTH {
-                let i = index(x, y);
-                let sign_i = relief[i] >= 0.0;
-                let mut opposite = 0_u8;
-                let mut sum = relief[i] * 0.45;
-                let mut wsum = 0.45;
-
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                        let sign_j = relief[j] >= 0.0;
-                        if sign_i != sign_j {
-                            opposite += 1;
-                        }
-                        let w = if ox == 0 || oy == 0 { 0.14 } else { 0.09 };
-                        sum += relief[j] * w;
-                        wsum += w;
-                    }
-                }
-
-                if opposite >= 3 {
-                    next[i] = sum / wsum.max(1e-6);
-                } else {
-                    next[i] = relief[i];
-                }
-            }
-        }
-        relief.copy_from_slice(&next);
-    }
-}
-
-fn stabilize_landmass_topology(relief: &mut [f32], planet: &PlanetInputs, detail: DetailProfile) {
-    let mut landmask = vec![0_u8; WORLD_SIZE];
-    for i in 0..WORLD_SIZE {
-        landmask[i] = if relief[i] >= 0.0 { 1 } else { 0 };
-    }
-
-    let smooth_passes = if detail.erosion_rounds >= 2 { 3 } else { 2 };
-    smooth_landmask(&mut landmask, smooth_passes);
-
-    let min_land_cells = clampf(
-        WORLD_SIZE as f32
-            * (0.0008 + (planet.ocean_percent / 100.0) * 0.0010),
-        650.0,
-        9_500.0,
-    ) as usize;
-    let min_inland_water_cells = clampf(
-        WORLD_SIZE as f32 * (0.0009 + (1.0 - planet.ocean_percent / 100.0) * 0.0010),
-        700.0,
-        10_000.0,
-    ) as usize;
-    clean_landmask_components(&mut landmask, min_land_cells, min_inland_water_cells);
-
-    for i in 0..WORLD_SIZE {
-        if landmask[i] == 1 {
-            if relief[i] < 0.0 {
-                relief[i] = relief[i] * 0.3 + 70.0;
-            }
-        } else if relief[i] >= 0.0 {
-            relief[i] = relief[i] * 0.25 - 75.0;
-        }
-    }
-
-    blend_topology_edges(relief);
-}
-
-fn suppress_subgrid_islands(relief: &mut [f32], planet: &PlanetInputs) {
-    let mut landmask = vec![0_u8; WORLD_SIZE];
-    for i in 0..WORLD_SIZE {
-        if relief[i] >= 0.0 {
-            landmask[i] = 1;
-        }
-    }
-
-    let min_land_cells = clampf(
-        WORLD_SIZE as f32 * (0.00014 + (planet.ocean_percent / 100.0) * 0.00006),
-        180.0,
-        2400.0,
-    ) as usize;
-    let min_inland_water_cells = clampf(
-        WORLD_SIZE as f32 * (0.00014 + (1.0 - planet.ocean_percent / 100.0) * 0.00007),
-        200.0,
-        2600.0,
-    ) as usize;
-    clean_landmask_components(&mut landmask, min_land_cells, min_inland_water_cells);
-
-    for i in 0..WORLD_SIZE {
-        if landmask[i] == 1 {
-            if relief[i] < 0.0 {
-                relief[i] = relief[i] * 0.24 + 24.0;
-            }
-        } else if relief[i] >= 0.0 {
-            relief[i] = relief[i] * 0.24 - 24.0;
-        }
-    }
-
-    blend_topology_edges(relief);
-}
-
-fn dampen_isolated_shallow_ocean(relief: &mut [f32]) {
-    let mut next = relief.to_vec();
-    for _ in 0..2 {
-        for y in 0..WORLD_HEIGHT {
-            for x in 0..WORLD_WIDTH {
-                let i = index(x, y);
-                let h = relief[i];
-                if h >= 0.0 || h <= -260.0 {
-                    continue;
-                }
-
-                let mut land_neighbors = 0_i32;
-                let mut ocean_neighbors = 0_i32;
-                let mut ocean_sum = 0.0_f32;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                        if relief[j] >= 0.0 {
-                            land_neighbors += 1;
-                        } else {
-                            ocean_neighbors += 1;
-                            ocean_sum += relief[j];
-                        }
-                    }
-                }
-
-                if land_neighbors > 0 || ocean_neighbors < 6 {
-                    continue;
-                }
-
-                let avg = ocean_sum / ocean_neighbors.max(1) as f32;
-                let target = avg.min(-220.0);
-                let shallow_t = smoothstep(-260.0, -30.0, h);
-                let mix = 0.22 + 0.46 * shallow_t;
-                next[i] = h * (1.0 - mix) + target * mix;
-            }
-        }
-        relief.copy_from_slice(&next);
-    }
-}
-
-fn defuse_plate_linearity(
-    relief: &mut [f32],
-    plates: &ComputePlatesResult,
-    seed: u32,
-    cache: &WorldCache,
-    detail: DetailProfile,
-) {
-    let strength_scale = if detail.buoyancy_smooth_passes >= 20 {
-        1.0
-    } else if detail.buoyancy_smooth_passes >= 12 {
-        0.85
-    } else {
-        0.65
-    };
-
-    let mut imprint = vec![0.0_f32; WORLD_SIZE];
-    for i in 0..WORLD_SIZE {
-        if relief[i] < -1600.0 {
-            continue;
-        }
-        let base = clampf(plates.boundary_strength[i], 0.0, 1.0);
-        let k = match plates.boundary_types[i] {
-            1 => 1.0,
-            2 => 0.78,
-            3 => 0.58,
-            _ => 0.0,
-        };
-        imprint[i] = base * k;
-    }
-
-    let mut imprint_next = imprint.clone();
-    for _ in 0..3 {
-        for y in 0..WORLD_HEIGHT {
-            for x in 0..WORLD_WIDTH {
-                let i = index(x, y);
-                let mut sum = imprint[i] * 0.5;
-                let mut wsum = 0.5;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                        let w = if ox == 0 || oy == 0 { 0.11 } else { 0.07 };
-                        sum += imprint[j] * w;
-                        wsum += w;
-                    }
-                }
-                imprint_next[i] = sum / wsum.max(1e-6);
-            }
-        }
-        imprint.copy_from_slice(&imprint_next);
-    }
-
-    let mut softened = relief.to_vec();
-    let seed_phase = seed as f32 * 0.0017;
-    for y in 0..WORLD_HEIGHT {
-        for x in 0..WORLD_WIDTH {
-            let i = index(x, y);
-            let mask = clampf(imprint[i] * strength_scale, 0.0, 1.0);
-            if mask < 0.08 || relief[i] < -2400.0 {
-                continue;
-            }
-
-            let mut sum = relief[i] * 0.42;
-            let mut wsum = 0.42;
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    if ox == 0 && oy == 0 {
-                        continue;
-                    }
-                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                    let w = if ox == 0 || oy == 0 { 0.1 } else { 0.065 };
-                    sum += relief[j] * w;
-                    wsum += w;
-                }
-            }
-            let avg = sum / wsum.max(1e-6);
-            let sx = cache.x_by_cell[i];
-            let sy = cache.y_by_cell[i];
-            let sz = cache.z_by_cell[i];
-            let depth_softener = smoothstep(-2400.0, 220.0, relief[i]);
-            let perturb = ((sx * 12.1 + sy * 9.4 + sz * 8.3 + seed_phase).sin() * 0.58
-                + (sy * 13.4 - sz * 7.8 + sx * 6.1 - seed_phase * 1.4).cos() * 0.42)
-                * (14.0 + 74.0 * mask)
-                * depth_softener;
-            let mix = clampf(0.16 + 0.6 * mask, 0.0, 0.84) * depth_softener;
-            let blended = relief[i] * (1.0 - mix) + (avg + perturb) * mix;
-            softened[i] = if relief[i] >= 0.0 {
-                blended.max(10.0)
-            } else {
-                blended.min(-10.0)
-            };
-        }
-    }
-
-    relief.copy_from_slice(&softened);
-}
-
-fn defuse_coastal_linearity(
-    relief: &mut [f32],
-    plates: &ComputePlatesResult,
-    seed: u32,
-    cache: &WorldCache,
-) {
-    let mut imprint = vec![0.0_f32; WORLD_SIZE];
-    for i in 0..WORLD_SIZE {
-        let k = match plates.boundary_types[i] {
-            1 => 1.0,
-            2 => 0.85,
-            3 => 0.7,
-            _ => 0.0,
-        };
-        imprint[i] = clampf(plates.boundary_strength[i], 0.0, 1.0) * k;
-    }
-
-    let mut blur = imprint.clone();
-    for _ in 0..2 {
-        for y in 0..WORLD_HEIGHT {
-            for x in 0..WORLD_WIDTH {
-                let i = index(x, y);
-                let mut sum = imprint[i] * 0.42;
-                let mut wsum = 0.42;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                        let w = if ox == 0 || oy == 0 { 0.1 } else { 0.062 };
-                        sum += imprint[j] * w;
-                        wsum += w;
-                    }
-                }
-                blur[i] = sum / wsum.max(1e-6);
-            }
-        }
-        imprint.copy_from_slice(&blur);
-    }
-
-    let mut next = relief.to_vec();
-    let seed_phase = seed as f32 * 0.00123;
-    for y in 0..WORLD_HEIGHT {
-        for x in 0..WORLD_WIDTH {
-            let i = index(x, y);
-            let h = relief[i];
-            if h.abs() > 920.0 {
-                continue;
-            }
-
-            let mask = imprint[i];
-            if mask < 0.1 {
-                continue;
-            }
-
-            let coast = 1.0 - smoothstep(120.0, 920.0, h.abs());
-            if coast <= 0.0 {
-                continue;
-            }
-
-            let sx = cache.x_by_cell[i];
-            let sy = cache.y_by_cell[i];
-            let sz = cache.z_by_cell[i];
-            let macro_n = spherical_fbm(
-                sx * 1.05 + 5.7,
-                sy * 1.05 - 4.1,
-                sz * 1.05 + 3.3,
-                seed_phase + 17.0,
-            );
-            let micro_n = spherical_fbm(
-                sx * 3.4 + 11.0,
-                sy * 3.4 - 7.0,
-                sz * 3.4 + 9.0,
-                seed_phase + 41.0,
-            );
-
-            let mut sum = h * 0.34;
-            let mut wsum = 0.34;
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    if ox == 0 && oy == 0 {
-                        continue;
-                    }
-                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                    if h >= 0.0 && relief[j] < -350.0 {
-                        continue;
-                    }
-                    if h < 0.0 && relief[j] > 350.0 {
-                        continue;
-                    }
-                    let w = if ox == 0 || oy == 0 { 0.11 } else { 0.07 };
-                    sum += relief[j] * w;
-                    wsum += w;
-                }
-            }
-            let avg = sum / wsum.max(1e-6);
-
-            let jitter = (macro_n * 290.0 + micro_n * 120.0) * coast * (0.5 + 0.62 * mask);
-            let mix = clampf(0.14 + 0.56 * mask * coast, 0.0, 0.78);
-            let mut v = h * (1.0 - mix) + (avg + jitter) * mix;
-            if h >= 0.0 {
-                v = v.max(-120.0);
-            } else {
-                v = v.min(120.0);
-            }
-            next[i] = v;
-        }
-    }
-
-    relief.copy_from_slice(&next);
-}
-
-fn break_straight_coasts(relief: &mut [f32], seed: u32, cache: &WorldCache) {
-    let mut next = relief.to_vec();
-    let seed_phase = seed as f32 * 0.00097;
-
-    for y in 0..WORLD_HEIGHT {
-        for x in 0..WORLD_WIDTH {
-            let i = index(x, y);
-            let h = relief[i];
-            if h.abs() > 620.0 {
-                continue;
-            }
-
-            let east = relief[index_spherical(x as i32 + 1, y as i32)];
-            let west = relief[index_spherical(x as i32 - 1, y as i32)];
-            let north = relief[index_spherical(x as i32, y as i32 - 1)];
-            let south = relief[index_spherical(x as i32, y as i32 + 1)];
-            let gx = east - west;
-            let gy = south - north;
-            let gl = gx.hypot(gy);
-            if gl < 14.0 {
-                continue;
-            }
-            let nx = gx / gl;
-            let ny = gy / gl;
-
-            let mut coh_sum = 0.0_f32;
-            let mut coh_count = 0.0_f32;
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    if ox == 0 && oy == 0 {
-                        continue;
-                    }
-                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                    if relief[j].abs() > 420.0 {
-                        continue;
-                    }
-                    let je = relief[index_spherical(x as i32 + ox + 1, y as i32 + oy)];
-                    let jw = relief[index_spherical(x as i32 + ox - 1, y as i32 + oy)];
-                    let jn = relief[index_spherical(x as i32 + ox, y as i32 + oy - 1)];
-                    let js = relief[index_spherical(x as i32 + ox, y as i32 + oy + 1)];
-                    let jgx = je - jw;
-                    let jgy = js - jn;
-                    let jgl = jgx.hypot(jgy);
-                    if jgl < 12.0 {
-                        continue;
-                    }
-                    let jnx = jgx / jgl;
-                    let jny = jgy / jgl;
-                    coh_sum += (nx * jnx + ny * jny).abs();
-                    coh_count += 1.0;
-                }
-            }
-
-            if coh_count < 3.0 {
-                continue;
-            }
-            let coherence = coh_sum / coh_count;
-            if coherence < 0.58 {
-                continue;
-            }
-
-            let coast = 1.0 - smoothstep(40.0, 620.0, h.abs());
-            let sx = cache.x_by_cell[i];
-            let sy = cache.y_by_cell[i];
-            let sz = cache.z_by_cell[i];
-            let jitter = spherical_fbm(
-                sx * 2.4 + 7.0,
-                sy * 2.4 - 9.0,
-                sz * 2.4 + 11.0,
-                seed_phase + 23.0,
-            );
-            let gain = ((coherence - 0.58) / 0.42).clamp(0.0, 1.0);
-            next[i] = h + jitter * 460.0 * coast * gain;
-        }
-    }
-
-    relief.copy_from_slice(&next);
-}
-
-fn fracture_coastline_band(relief: &mut [f32], seed: u32, cache: &WorldCache) {
-    let seed_phase = seed as f32 * 0.00191;
-    for i in 0..WORLD_SIZE {
-        let h = relief[i];
-        if h.abs() > 1200.0 {
-            continue;
-        }
-
-        let coast = 1.0 - smoothstep(90.0, 1200.0, h.abs());
-        if coast <= 0.0 {
-            continue;
-        }
-
-        let sx = cache.x_by_cell[i];
-        let sy = cache.y_by_cell[i];
-        let sz = cache.z_by_cell[i];
-        let n1 = spherical_fbm(
-            sx * 2.9 + 9.0,
-            sy * 2.9 - 5.0,
-            sz * 2.9 + 2.0,
-            seed_phase + 13.0,
-        );
-        let n2 = spherical_fbm(
-            sx * 6.2 - 17.0,
-            sy * 6.2 + 11.0,
-            sz * 6.2 - 7.0,
-            seed_phase + 31.0,
-        );
-        let n3 = ridge(spherical_fbm(
-            sx * 4.3 + 21.0,
-            sy * 4.3 - 19.0,
-            sz * 4.3 + 15.0,
-            seed_phase + 57.0,
-        )) * 2.0
-            - 1.0;
-        let signal = n1 * 0.52 + n2 * 0.33 + n3 * 0.15;
-        relief[i] += signal * 560.0 * coast;
-    }
-}
-
-fn warp_coastal_band(relief: &mut [f32], seed: u32, cache: &WorldCache) {
-    let mut next = relief.to_vec();
-    let seed_phase = seed as f32 * 0.00137;
-
-    for y in 0..WORLD_HEIGHT {
-        for x in 0..WORLD_WIDTH {
-            let i = index(x, y);
-            let h = relief[i];
-            if h.abs() > 950.0 {
-                continue;
-            }
-
-            let coast = 1.0 - smoothstep(80.0, 950.0, h.abs());
-            if coast <= 0.0 {
-                continue;
-            }
-
-            let sx = cache.x_by_cell[i];
-            let sy = cache.y_by_cell[i];
-            let sz = cache.z_by_cell[i];
-            let noise_u = spherical_fbm(
-                sx * 2.2 + 5.0,
-                sy * 2.2 - 7.0,
-                sz * 2.2 + 9.0,
-                seed_phase + 13.0,
-            );
-            let noise_v = spherical_fbm(
-                sx * 2.5 - 11.0,
-                sy * 2.5 + 3.0,
-                sz * 2.5 - 17.0,
-                seed_phase + 31.0,
-            );
-
-            let shift = 0.45 + 2.9 * coast;
-            let ox = (noise_u * shift).round() as i32;
-            let oy = (noise_v * shift).round() as i32;
-            let j = index_spherical(x as i32 + ox, y as i32 + oy);
-
-            let mix = clampf(0.16 + 0.62 * coast, 0.0, 0.78);
-            let warped = relief[i] * (1.0 - mix) + relief[j] * mix;
-            let fine = spherical_fbm(
-                sx * 4.4 + 23.0,
-                sy * 4.4 - 19.0,
-                sz * 4.4 + 29.0,
-                seed_phase + 57.0,
-            ) * 130.0 * coast;
-            next[i] = warped + fine;
-        }
-    }
-
-    relief.copy_from_slice(&next);
-}
-
-fn carve_fluvial_valleys(
-    relief: &mut [f32],
-    grid: &GridConfig,
-    detail: DetailProfile,
-    progress: &mut ProgressTap<'_>,
-    progress_base: f32,
-    progress_span: f32,
-) {
-    if detail.fluvial_rounds == 0 {
-        return;
-    }
-
-    let rounds = detail.fluvial_rounds.min(4);
-    let mut flow_direction = vec![-1_i32; grid.size];
-    let mut flow_accumulation = vec![1.0_f32; grid.size];
-    let mut order: Vec<usize> = (0..grid.size).collect();
-    let mut updated = relief.to_vec();
-
-    for round in 0..rounds {
-        for y in 0..grid.height {
-            let t = (round as f32 + y as f32 / grid.height as f32) / rounds as f32;
-            progress.phase(progress_base, progress_span, 0.35 * t);
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let h = relief[i];
-                let mut best_drop = 0.0_f32;
-                let mut best = -1_i32;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
-                        let drop = h - relief[j];
-                        if drop > best_drop {
-                            best_drop = drop;
-                            best = j as i32;
-                        }
-                    }
-                }
-                flow_direction[i] = best;
-            }
-        }
-
-        flow_accumulation.fill(1.0);
-        order.sort_by(|a, b| relief[*b].total_cmp(&relief[*a]));
-        for (rank, i) in order.iter().copied().enumerate() {
-            if rank % (grid.width * 4) == 0 {
-                progress.phase(
-                    progress_base,
-                    progress_span,
-                    0.35 + 0.25 * (rank as f32 / grid.size as f32),
-                );
-            }
-            if relief[i] <= -25.0 {
-                continue;
-            }
-            let to = flow_direction[i];
-            if to >= 0 {
-                let j = to as usize;
-                let drop = (relief[i] - relief[j]).max(0.0);
-                flow_accumulation[j] += flow_accumulation[i] * (1.0 + drop / 1600.0);
-            }
-        }
-
-        let mut sorted_acc = flow_accumulation.clone();
-        sorted_acc.sort_by(|a, b| a.total_cmp(b));
-        let channel_ref = quantile_sorted(&sorted_acc, 0.992).max(1.0);
-
-        updated.copy_from_slice(relief);
-        for y in 0..grid.height {
-            let t = (round as f32 + y as f32 / grid.height as f32) / rounds as f32;
-            progress.phase(progress_base, progress_span, 0.6 + 0.4 * t);
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let h = relief[i];
-                if h <= 8.0 {
-                    continue;
-                }
-
-                let mut max_drop = 0.0_f32;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
-                        max_drop = max_drop.max((h - relief[j]).max(0.0));
-                    }
-                }
-                if max_drop < 2.0 {
-                    continue;
-                }
-
-                let channel = ((flow_accumulation[i] / channel_ref) - 1.0).max(0.0).min(8.0);
-                if channel <= 0.0 {
-                    continue;
-                }
-
-                let slope_t = clampf(max_drop / 340.0, 0.0, 1.8);
-                let coast_t = 1.0 - smoothstep(60.0, 1900.0, h);
-                let incision = (7.5 + 26.0 * channel.powf(0.65) + 20.0 * slope_t.powf(0.7))
-                    * (0.4 + 0.6 * coast_t);
-                let cut = incision.min((h - 4.0).max(0.0));
-                if cut <= 0.0 {
-                    continue;
-                }
-
-                updated[i] = h - cut;
-                let to = flow_direction[i];
-                if to >= 0 {
-                    let j = to as usize;
-                    if relief[j] > 0.0 {
-                        updated[j] += cut * 0.04;
-                    }
-                }
-            }
-        }
-
-        relief.copy_from_slice(&updated);
-    }
-
-    progress.phase(progress_base, progress_span, 1.0);
-}
-
-fn apply_ocean_profile(
-    relief: &mut [f32],
-    boundary_types: &[i8],
-    boundary_strength: &[f32],
-    planet: &PlanetInputs,
-    seed: u32,
-    cache: &WorldCache,
-    detail: DetailProfile,
-    progress: &mut ProgressTap<'_>,
-    progress_base: f32,
-    progress_span: f32,
-) {
-    let mut distance_to_coast = vec![f32::INFINITY; WORLD_SIZE];
-    let mut is_ocean = vec![false; WORLD_SIZE];
-    let mut queue: BinaryHeap<Reverse<DistanceNode>> = BinaryHeap::new();
-    let km_lat_step = (KILOMETERS_PER_DEGREE * (180.0 / WORLD_HEIGHT as f32) * planet.radius_km
-        / 6371.0)
-        .max(0.01);
-    let km_lon_equator = (KILOMETERS_PER_DEGREE * (360.0 / WORLD_WIDTH as f32) * planet.radius_km
-        / 6371.0)
-        .max(0.01);
-    let km_equator_cell =
-        ((2.0 * std::f32::consts::PI * planet.radius_km) / WORLD_WIDTH as f32).max(0.01);
-    let mut lon_step_by_y = vec![0.0_f32; WORLD_HEIGHT];
-    for y in 0..WORLD_HEIGHT {
-        let lat_deg = 90.0 - (y as f32 + 0.5) * (180.0 / WORLD_HEIGHT as f32);
-        let lon_step = km_lon_equator * (lat_deg * RADIANS).cos().abs();
-        lon_step_by_y[y] = lon_step.max(km_lat_step * 0.22);
-    }
-
-    let mut land_mask = vec![0_u8; WORLD_SIZE];
-    for i in 0..WORLD_SIZE {
-        if relief[i] >= 0.0 {
-            land_mask[i] = 1;
-        }
-    }
-    let land_component_sizes = compute_component_sizes_for_mask(&land_mask, 1);
-    let major_land_component = clampf(
-        WORLD_SIZE as f32 * (0.00034 + (planet.ocean_percent / 100.0) * 0.00025),
-        420.0,
-        5200.0,
-    ) as usize;
-    let minor_land_component = (major_land_component / 5).max(65);
-
-    let mut ocean_cells = 0_usize;
-    let mut major_seed_count = 0_usize;
-    let mut minor_coast_seeds: Vec<(usize, f32)> = Vec::new();
-
-    for y in 0..WORLD_HEIGHT {
-        progress.phase(
-            progress_base,
-            progress_span,
-            0.1 * (y as f32 / WORLD_HEIGHT as f32),
-        );
-        for x in 0..WORLD_WIDTH {
-            let i = index(x, y);
-            if relief[i] >= 0.0 {
-                continue;
-            }
-            is_ocean[i] = true;
-            ocean_cells += 1;
-
-            let mut is_coast_adjacent = false;
-            let mut adjacent_land_component = 0_usize;
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    if ox == 0 && oy == 0 {
-                        continue;
-                    }
-                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                    if relief[j] >= 0.0 {
-                        is_coast_adjacent = true;
-                        adjacent_land_component =
-                            adjacent_land_component.max(land_component_sizes[j]);
-                        break;
-                    }
-                }
-                if is_coast_adjacent {
-                    break;
-                }
-            }
-
-            if is_coast_adjacent {
-                if adjacent_land_component >= major_land_component {
-                    distance_to_coast[i] = 0.0;
-                    queue.push(Reverse(DistanceNode { cost: 0.0, index: i }));
-                    major_seed_count += 1;
-                } else if adjacent_land_component >= minor_land_component {
-                    // Small islands should not generate unrealistically wide continental shelves.
-                    // Start them with a positive distance penalty so shelf influence decays quickly.
-                    let size_t = clampf(
-                        adjacent_land_component as f32 / major_land_component.max(1) as f32,
-                        0.0,
-                        1.0,
-                    );
-                    let start_penalty = km_equator_cell * (0.45 + (1.0 - size_t) * 2.4);
-                    minor_coast_seeds.push((i, start_penalty));
-                }
-            }
-        }
-    }
-
-    const FLOW_STEPS: [(i32, i32, f32, f32); 24] = [
-        (1, 0, 1.0, 0.0),
-        (-1, 0, 1.0, 0.0),
-        (0, 1, 0.0, 1.0),
-        (0, -1, 0.0, 1.0),
-        (1, 1, 1.0, 1.0),
-        (-1, 1, 1.0, 1.0),
-        (1, -1, 1.0, 1.0),
-        (-1, -1, 1.0, 1.0),
-        (2, 0, 2.0, 0.0),
-        (-2, 0, 2.0, 0.0),
-        (0, 2, 0.0, 2.0),
-        (0, -2, 0.0, 2.0),
-        (2, 1, 2.0, 1.0),
-        (-2, 1, 2.0, 1.0),
-        (2, -1, 2.0, 1.0),
-        (-2, -1, 2.0, 1.0),
-        (1, 2, 1.0, 2.0),
-        (-1, 2, 1.0, 2.0),
-        (1, -2, 1.0, 2.0),
-        (-1, -2, 1.0, 2.0),
-        (2, 2, 2.0, 2.0),
-        (-2, 2, 2.0, 2.0),
-        (2, -2, 2.0, 2.0),
-        (-2, -2, 2.0, 2.0),
-    ];
-
-    if major_seed_count == 0 && minor_coast_seeds.is_empty() {
-        for i in 0..WORLD_SIZE {
-            if is_ocean[i] {
-                distance_to_coast[i] = 0.0;
-            }
-        }
-    } else {
-        if major_seed_count == 0 {
-            for (idx, penalty) in minor_coast_seeds.iter().copied() {
-                let cost = penalty * 0.35;
-                if cost < distance_to_coast[idx] {
-                    distance_to_coast[idx] = cost;
-                    queue.push(Reverse(DistanceNode { cost, index: idx }));
-                }
-            }
-        } else {
-            for (idx, penalty) in minor_coast_seeds.iter().copied() {
-                let cost = penalty * 1.25;
-                if cost < distance_to_coast[idx] {
-                    distance_to_coast[idx] = cost;
-                    queue.push(Reverse(DistanceNode { cost, index: idx }));
-                }
-            }
-        }
-
-        let mut settled = 0_usize;
-        while let Some(Reverse(node)) = queue.pop() {
-            if node.cost > distance_to_coast[node.index] + 1e-5 {
-                continue;
-            }
-            settled += 1;
-            if settled % (WORLD_WIDTH * 6) == 0 {
-                let t = settled as f32 / ocean_cells.max(1) as f32;
-                progress.phase(progress_base, progress_span, 0.1 + 0.1 * t.min(1.0));
-            }
-            let x = node.index % WORLD_WIDTH;
-            let y = node.index / WORLD_WIDTH;
-
-            for (dx, dy, mx, my) in FLOW_STEPS {
-                let j = index_spherical(x as i32 + dx, y as i32 + dy);
-                if !is_ocean[j] {
-                    continue;
-                }
-                let jy = j / WORLD_WIDTH;
-                let step_lon = lon_step_by_y[jy];
-                let step = ((mx * step_lon).powi(2) + (my * km_lat_step).powi(2)).sqrt();
-                let next_dist = node.cost + step;
-                if next_dist + 1e-5 < distance_to_coast[j] {
-                    distance_to_coast[j] = next_dist;
-                    queue.push(Reverse(DistanceNode {
-                        cost: next_dist,
-                        index: j,
-                    }));
-                }
-            }
-        }
-    }
-    progress.phase(progress_base, progress_span, 0.2);
-
-    let mut max_distance_km = km_lat_step.max(km_lon_equator);
-    for i in 0..WORLD_SIZE {
-        if is_ocean[i] {
-            let d = distance_to_coast[i];
-            if d.is_finite() {
-                max_distance_km = max_distance_km.max(d);
-            }
-        }
-    }
-    let max_distance = (max_distance_km / km_equator_cell).max(1.0);
-
-    let shelf_cells = clampf(4.8 + (planet.radius_km / 6371.0 - 1.0) * 1.2, 3.8, 8.4);
-    let slope_cells = clampf(15.0 + (planet.ocean_percent - 67.0) * 0.08, 11.0, 23.0);
-    let abyssal_base = clampf(
-        4200.0 + (planet.ocean_percent - 67.0) * 26.0,
-        3600.0,
-        5600.0,
-    );
-
-    for i in 0..WORLD_SIZE {
-        if i % (WORLD_WIDTH * 4) == 0 {
-            progress.phase(
-                progress_base,
-                progress_span,
-                0.2 + 0.55 * (i as f32 / WORLD_SIZE as f32),
-            );
-        }
-        if relief[i] >= 0.0 {
-            continue;
-        }
-
-        let d_km = if distance_to_coast[i].is_finite() {
-            distance_to_coast[i]
-        } else {
-            max_distance_km
-        };
-        let d = (d_km / km_equator_cell).max(0.0);
-        let sx = cache.x_by_cell[i];
-        let sy = cache.y_by_cell[i];
-        let sz = cache.z_by_cell[i];
-        let seed_phase = seed as f32 * 0.0012;
-        let margin_signal = 0.5
-            + 0.5
-                * ((sx * 6.2 + sy * 5.1 + sz * 4.3 + seed_phase).sin() * 0.62
-                    + (sy * 7.4 - sz * 4.9 + sx * 3.8 - seed_phase * 1.1).cos() * 0.38);
-        let x = i % WORLD_WIDTH;
-        let y = i / WORLD_WIDTH;
-        let mut conv = 0.0_f32;
-        let mut div = 0.0_f32;
-        let mut transform = 0.0_f32;
-        let mut wsum = 0.0_f32;
-        for oy in -1..=1 {
-            for ox in -1..=1 {
-                let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                let t = boundary_types[j];
-                if t == 0 {
-                    continue;
-                }
-                let s = clampf(boundary_strength[j], 0.0, 1.0);
-                let w = if ox == 0 && oy == 0 {
-                    1.0
-                } else if ox == 0 || oy == 0 {
-                    0.58
-                } else {
-                    0.4
-                };
-                let value = s * w;
-                if t == 1 {
-                    conv += value;
-                } else if t == 2 {
-                    div += value;
-                } else if t == 3 {
-                    transform += value;
-                }
-                wsum += w;
-            }
-        }
-
-        if wsum > 1e-4 {
-            conv /= wsum;
-            div /= wsum;
-            transform /= wsum;
-        }
-
-        let regime_bias = match boundary_types[i] {
-            1 => -0.28, // active convergent margins -> narrower shelf
-            2 => 0.22,  // passive/divergent margins -> wider shelf
-            3 => -0.08,
-            _ => 0.0,
-        };
-        let shelf_texture = 0.5
-            + 0.5
-                * ((sx * 4.7 + sy * 3.8 + sz * 3.1 + seed_phase * 0.9).sin() * 0.58
-                    + (sy * 5.1 - sz * 3.6 + sx * 2.9 - seed_phase * 1.1).cos() * 0.42);
-        let tectonic_shelf_factor = clampf(1.0 + 1.35 * div - 1.45 * conv - 0.4 * transform, 0.4, 2.15);
-        let tectonic_slope_factor = clampf(1.0 + 1.15 * conv - 0.32 * div, 0.62, 1.95);
-        let local_shelf = shelf_cells
-            * clampf(
-                0.34 + 1.18 * margin_signal + regime_bias + 0.55 * (shelf_texture - 0.5),
-                0.22,
-                2.7,
-            )
-            * tectonic_shelf_factor;
-        let local_slope = slope_cells
-            * clampf(
-                0.56 + 1.02 * (1.0 - margin_signal) - regime_bias * 0.35 + 0.22 * conv,
-                0.36,
-                2.2,
-            )
-            * tectonic_slope_factor;
-        let shore_depth = -12.0
-            - 98.0 * clampf(margin_signal + regime_bias * 0.35, 0.0, 1.0)
-            - 140.0 * conv
-            + 62.0 * div;
-        let mut target_depth = if d <= local_shelf {
-            let t = clampf(d / local_shelf.max(0.5), 0.0, 1.0);
-            shore_depth - (150.0 + 240.0 * margin_signal + 110.0 * conv) * t.powf(1.42)
-        } else if d <= local_shelf + local_slope {
-            let t = clampf((d - local_shelf) / local_slope.max(0.8), 0.0, 1.0);
-            -245.0 - (abyssal_base - 245.0) * t.powf(0.74)
-        } else {
-            let t = clampf(
-                (d - local_shelf - local_slope) / (max_distance + 1.0),
-                0.0,
-                1.0,
-            );
-            -abyssal_base - 1650.0 * t.powf(0.58)
-        };
-        let basin_weight = clampf((d - local_shelf) / (local_shelf + local_slope + 1.0), 0.0, 1.0);
-        let undulation = (sx * 7.2 + sy * 5.3 + sz * 4.1 + seed_phase).sin() * 0.6
-            + (sy * 8.6 - sz * 4.9 + sx * 3.7 - seed_phase * 1.35).cos() * 0.4;
-        target_depth += undulation * (120.0 + 390.0 * basin_weight);
-        target_depth += -760.0 * conv + 320.0 * div - 130.0 * transform;
-
-        let blend = 0.72 + 0.24 * basin_weight;
-        relief[i] = clampf(
-            relief[i] * (1.0 - blend) + target_depth * blend,
-            -12000.0,
-            -5.0,
-        );
-    }
-
-    let mut smoothed = relief.to_vec();
-    for pass in 0..detail.ocean_smooth_passes {
-        for y in 0..WORLD_HEIGHT {
-            let pass_t = (pass as f32 + y as f32 / WORLD_HEIGHT as f32)
-                / detail.ocean_smooth_passes.max(1) as f32;
-            progress.phase(progress_base, progress_span, 0.75 + 0.25 * pass_t);
-            for x in 0..WORLD_WIDTH {
-                let i = index(x, y);
-                if relief[i] >= 0.0 {
-                    continue;
-                }
-                let mut sum = relief[i] * 2.8;
-                let mut wsum = 2.8;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                        if relief[j] >= 0.0 {
-                            continue;
-                        }
-                        let w = if ox == 0 || oy == 0 { 0.5 } else { 0.35 };
-                        sum += relief[j] * w;
-                        wsum += w;
-                    }
-                }
-                smoothed[i] = sum / wsum.max(1e-6);
-            }
-        }
-        for i in 0..WORLD_SIZE {
-            if relief[i] < 0.0 {
-                relief[i] = smoothed[i];
-            }
-        }
-    }
-    progress.phase(progress_base, progress_span, 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -3671,1018 +1691,261 @@ fn isostatic_elevation(crust_km: f32, is_continental: bool, heat_anomaly: f32) -
     }
 }
 
-fn compute_relief(
+// ---------------------------------------------------------------------------
+// Physics-based relief: isostasy + stream power erosion (replaces heuristics)
+// ---------------------------------------------------------------------------
+//
+// Pipeline:
+//  1. Continental vs oceanic classification from plate buoyancy
+//  2. Crustal thickness from plate boundary interactions (Christensen & Mooney 1995)
+//  3. Rock type from tectonic context → K_eff (Harel et al. 2016)
+//  4. Initial relief from Airy isostasy (Turcotte & Schubert 2002)
+//  5. Multi-epoch stream power erosion (Braun & Willett 2013)
+//  6. Sea level normalization from ocean_percent
+
+fn compute_relief_physics(
     planet: &PlanetInputs,
     tectonics: &TectonicInputs,
     plates: &ComputePlatesResult,
     seed: u32,
     grid: &GridConfig,
     cell_cache: &CellCache,
-    detail: DetailProfile,
+    _detail: DetailProfile,
     progress: &mut ProgressTap<'_>,
     progress_base: f32,
     progress_span: f32,
 ) -> ReliefResult {
-    let mut relief = vec![0.0_f32; grid.size];
-    let radius_cm = (planet.radius_km.max(1000.0) * 100_000.0).max(1.0);
+    let size = grid.size;
+    let n_plates = plates.plate_vectors.len();
+    progress.phase(progress_base, progress_span, 0.0);
 
-    let seed_mix = (((planet.radius_km * 1000.0) as i32)
-        ^ ((tectonics.plate_speed_cm_per_year * 1000.0) as i32)
-        ^ ((tectonics.mantle_heat * 1000.0) as i32)
-        ^ (seed.wrapping_mul(2_654_435_761) as i32)) as u32;
-    let mut random_seed = Rng::new(seed_mix);
-    let k_relief = 560.0_f32;
-    let fault_backbone = build_fault_backbone(
-        seed_mix,
-        detail.fault_iterations,
-        detail.fault_smooth_passes,
-        grid,
-        progress,
-        progress_base,
-        progress_span * 0.12,
-    );
-    let blob_backbone = build_continent_blob_field(seed_mix ^ 0xD1B5_4A35, grid, cell_cache);
-
-    // Smooth per-plate buoyancy so continent/ocean macro-shape is not cut by hard plate polygons.
-    let mut buoyancy_field = vec![0.0_f32; grid.size];
-    for (i, b) in buoyancy_field.iter_mut().enumerate() {
+    // --- 1. Continental vs oceanic per cell ---
+    // Plates with buoyancy > 0 are continental lithosphere.
+    let mut is_continental = vec![false; size];
+    for i in 0..size {
         let pid = plates.plate_field[i] as usize;
-        *b = plates.plate_vectors[pid].buoyancy;
-    }
-    let mut buoyancy_scratch = vec![0.0_f32; grid.size];
-    for pass in 0..detail.buoyancy_smooth_passes {
-        for y in 0..grid.height {
-            let pass_t = (pass as f32 + y as f32 / grid.height as f32)
-                / detail.buoyancy_smooth_passes.max(1) as f32;
-            progress.phase(progress_base, progress_span, 0.12 + 0.12 * pass_t);
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let mut sum = buoyancy_field[i] * 0.34;
-                let mut wsum = 0.34;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
-                        let w = if ox == 0 || oy == 0 { 0.125 } else { 0.07 };
-                        sum += buoyancy_field[j] * w;
-                        wsum += w;
-                    }
-                }
-                buoyancy_scratch[i] = sum / wsum.max(1e-6);
-            }
+        if pid < n_plates {
+            is_continental[i] = plates.plate_vectors[pid].buoyancy > 0.0;
         }
-        buoyancy_field.copy_from_slice(&buoyancy_scratch);
     }
 
-    let continentality_field = build_continentality_field(
-        seed_mix ^ 0x7FEB_352D,
-        grid,
-        cell_cache,
-        &buoyancy_field,
-        &blob_backbone,
-        (detail.buoyancy_smooth_passes / 4).clamp(1, 4),
-    );
+    // --- 2. Crustal thickness from plate boundary physics ---
+    // Base: continental 35 km, oceanic 7 km (Christensen & Mooney 1995).
+    // Convergent boundaries thicken crust (CC: collision doubles, OC: arc volcanism).
+    // Divergent boundaries thin crust (rifting).
+    // Transform boundaries: minor transpressional thickening.
+    let mut crust_thickness = vec![0.0_f32; size];
+    for i in 0..size {
+        let base = if is_continental[i] { 35.0_f32 } else { 7.0_f32 };
+        let btype = plates.boundary_types[i];
+        let bstr = plates.boundary_strength[i];
 
-    let plate_count = plates.plate_vectors.len();
-    let mut plate_land_sum = vec![0.0_f32; plate_count];
-    let mut plate_land_cells = vec![0_u32; plate_count];
-    for i in 0..grid.size {
-        let pid = plates.plate_field[i] as usize;
-        let landness = smoothstep(-0.14, 0.84, continentality_field[i]);
-        plate_land_sum[pid] += landness;
-        plate_land_cells[pid] += 1;
-    }
-    let mut plate_landness = vec![0.5_f32; plate_count];
-    for pid in 0..plate_count {
-        let cnt = plate_land_cells[pid].max(1) as f32;
-        plate_landness[pid] = clampf(plate_land_sum[pid] / cnt, 0.0, 1.0);
-    }
-
-    let mut heat_norm_field = vec![0.0_f32; grid.size];
-    let mut weakness_field = vec![0.0_f32; grid.size];
-    let mut strength_field = vec![0.0_f32; grid.size];
-    let mut comp_source = vec![0.0_f32; grid.size];
-    let mut ext_source = vec![0.0_f32; grid.size];
-    let mut shear_source = vec![0.0_f32; grid.size];
-    let mut cc_collision = vec![0.0_f32; grid.size];
-    let mut oc_collision_cont = vec![0.0_f32; grid.size];
-    let mut oc_collision_ocean = vec![0.0_f32; grid.size];
-    let mut oo_collision = vec![0.0_f32; grid.size];
-    let mut subduction_source = vec![0.0_f32; grid.size];
-    let mut rift_source = vec![0.0_f32; grid.size];
-    let mut velocity_x = vec![0.0_f32; grid.size];
-    let mut velocity_y = vec![0.0_f32; grid.size];
-    const LOCAL_NEIGHBORS: [(i32, i32, f32); 8] = [
-        (1, 0, 1.0),
-        (-1, 0, 1.0),
-        (0, -1, 1.0),
-        (0, 1, 1.0),
-        (1, -1, std::f32::consts::FRAC_1_SQRT_2),
-        (-1, -1, std::f32::consts::FRAC_1_SQRT_2),
-        (1, 1, std::f32::consts::FRAC_1_SQRT_2),
-        (-1, 1, std::f32::consts::FRAC_1_SQRT_2),
-    ];
-
-    for i in 0..grid.size {
-        if i % (grid.width * 4) == 0 {
-            progress.phase(
-                progress_base,
-                progress_span,
-                0.24 + 0.08 * (i as f32 / grid.size as f32),
-            );
-        }
-        let plate_id = plates.plate_field[i] as usize;
-        let heat = plates.plate_vectors[plate_id].heat;
-        let heat_norm = clampf(heat / tectonics.mantle_heat.max(1.0), 0.2, 2.3);
-        heat_norm_field[i] = heat_norm;
-
-        let sx = cell_cache.noise_x[i];
-        let sy = cell_cache.noise_y[i];
-        let sz = cell_cache.noise_z[i];
-        let boundary = clampf(plates.boundary_strength[i], 0.0, 1.0);
-        let fault = 0.5 + 0.5 * fault_backbone[i];
-        let inherited_noise = 0.5
-            + 0.5
-                * ((sx * 5.7 + sy * 4.8 + sz * 3.9 + seed_mix as f32 * 0.0011).sin() * 0.61
-                    + (sy * 6.3 - sz * 4.4 + sx * 3.2 - seed_mix as f32 * 0.0009).cos() * 0.39);
-        let segment_noise = 0.5
-            + 0.5
-                * ((sx * 12.1 + sy * 8.7 + sz * 6.5 + seed_mix as f32 * 0.0018).sin() * 0.54
-                    + (sy * 11.4 - sz * 7.9 + sx * 5.8 - seed_mix as f32 * 0.0014).cos() * 0.46);
-        let segment_gate = smoothstep(0.24, 0.88, segment_noise);
-        let inherited_gate = smoothstep(0.22, 0.9, inherited_noise * 0.76 + fault * 0.24);
-        let weakness = clampf(
-            0.14 + 0.58 * inherited_gate + 0.34 * boundary * segment_gate,
-            0.0,
-            1.0,
-        );
-        weakness_field[i] = weakness;
-
-        let strength = clampf(
-            0.72 + 0.23 * continentality_field[i] + 0.18 * (1.0 - weakness) - 0.24 * heat_norm,
-            0.05,
-            1.5,
-        );
-        strength_field[i] = strength;
-
-        let mut conv_cc = 0.0_f32;
-        let mut conv_oc_cont = 0.0_f32;
-        let mut conv_oc_ocean = 0.0_f32;
-        let mut conv_oo = 0.0_f32;
-        let mut div_mix = 0.0_f32;
-        let mut shear_mix = 0.0_f32;
-        let mut local_wsum = 0.0_f32;
-        let land_a = plate_landness[plate_id];
-        let a = &plates.plate_vectors[plate_id];
-        let (a_vx, a_vy) = plate_velocity_xy_at_cell(a, sx, sy, sz, radius_cm);
-        for (dx, dy, w) in LOCAL_NEIGHBORS {
-            let j = grid.neighbor((i % grid.width) as i32 + dx, (i / grid.width) as i32 + dy);
-            let plate_b = plates.plate_field[j] as usize;
-            if plate_b == plate_id {
-                continue;
-            }
-
-            let b = &plates.plate_vectors[plate_b];
-            let (b_vx, b_vy) = plate_velocity_xy_at_cell(b, sx, sy, sz, radius_cm);
-            let rel_x = b_vx - a_vx;
-            let rel_y = b_vy - a_vy;
-            let n_len = (dx as f32).hypot(dy as f32).max(1.0);
-            let nx = dx as f32 / n_len;
-            let ny = dy as f32 / n_len;
-            let tx = -ny;
-            let ty = nx;
-            let conv = (rel_x * nx + rel_y * ny).max(0.0);
-            let div = (-(rel_x * nx + rel_y * ny)).max(0.0);
-            let shear = (rel_x * tx + rel_y * ty).abs();
-            let land_b = plate_landness[plate_b];
-            let w_eff = w * (0.72 + 0.28 * boundary);
-
-            if land_a > 0.57 && land_b > 0.57 {
-                conv_cc += conv * w_eff;
-                div_mix += div * 0.28 * w_eff;
-            } else if land_a < 0.43 && land_b < 0.43 {
-                conv_oo += conv * w_eff;
-                div_mix += div * 0.94 * w_eff;
-            } else {
-                if land_a >= land_b {
-                    conv_oc_cont += conv * w_eff;
-                } else {
-                    conv_oc_ocean += conv * w_eff;
-                }
-                div_mix += div * 0.62 * w_eff;
-            }
-
-            shear_mix += shear * w_eff;
-            local_wsum += w_eff;
-        }
-
-        if local_wsum > 1e-5 {
-            conv_cc /= local_wsum;
-            conv_oc_cont /= local_wsum;
-            conv_oc_ocean /= local_wsum;
-            conv_oo /= local_wsum;
-            div_mix /= local_wsum;
-            shear_mix /= local_wsum;
-        }
-
-        let speed_norm = tectonics.plate_speed_cm_per_year.max(0.2);
-        let conv_cc_n = clampf(conv_cc / speed_norm, 0.0, 1.0);
-        let conv_oc_cont_n = clampf(conv_oc_cont / speed_norm, 0.0, 1.0);
-        let conv_oc_ocean_n = clampf(conv_oc_ocean / speed_norm, 0.0, 1.0);
-        let conv_oo_n = clampf(conv_oo / speed_norm, 0.0, 1.0);
-        let div_n = clampf(div_mix / speed_norm, 0.0, 1.0);
-        let shear_n = clampf(shear_mix / (speed_norm * 1.8), 0.0, 1.0);
-
-        cc_collision[i] = conv_cc_n;
-        oc_collision_cont[i] = conv_oc_cont_n;
-        oc_collision_ocean[i] = conv_oc_ocean_n;
-        oo_collision[i] = conv_oo_n;
-        subduction_source[i] = clampf(conv_oc_ocean_n * 0.95 + conv_oo_n * 0.55, 0.0, 1.4);
-        rift_source[i] = clampf(div_n * (0.58 + 0.42 * (1.0 - conv_cc_n)), 0.0, 1.4);
-
-        let source = boundary * (0.38 + 0.62 * segment_gate) * (0.86 + 0.24 * fault);
-        let collisional_mix = 0.6 * conv_cc_n + 0.42 * conv_oc_cont_n + 0.28 * conv_oo_n;
-        match plates.boundary_types[i] {
+        let thickening = match btype {
             1 => {
-                comp_source[i] = source
-                    * (0.34
-                        + 1.04 * collisional_mix
-                        + 0.44 * inherited_gate
-                        + 0.16 * shear_n);
-                shear_source[i] =
-                    source * (0.16 + 0.54 * shear_n + 0.18 * conv_oc_cont_n + 0.12 * conv_cc_n);
-                ext_source[i] = source * 0.08 * div_n;
-            }
+                // Convergent: CC collision thickens up to +30 km (→ 65 km, like Tibet);
+                //             OC subduction arc: up to +18 km.
+                if is_continental[i] { bstr * 30.0 } else { bstr * 18.0 }
+            },
             2 => {
-                ext_source[i] = source * (0.4 + 0.82 * rift_source[i] + 0.2 * (1.0 - collisional_mix));
-                shear_source[i] = source * (0.18 + 0.4 * shear_n + 0.18 * (1.0 - segment_gate));
-                comp_source[i] = source * 0.05 * conv_oc_cont_n;
-            }
+                // Divergent: rift thinning up to -20 km.
+                -bstr * 20.0
+            },
             3 => {
-                let transpress = shear_n * (0.46 + 0.54 * collisional_mix);
-                shear_source[i] = source * (0.34 + 0.72 * transpress);
-                comp_source[i] = source * 0.2 * transpress;
-                ext_source[i] = source * 0.14 * (div_n * (1.0 - transpress));
-            }
-            _ => {}
-        }
-
-        velocity_x[i] = a_vx;
-        velocity_y[i] = a_vy;
-    }
-
-    let collision_smooth_passes = (detail.max_kernel_radius as usize / 2 + 2).clamp(2, 6);
-    let mut cc_next = cc_collision.clone();
-    let mut oc_cont_next = oc_collision_cont.clone();
-    let mut oc_ocean_next = oc_collision_ocean.clone();
-    let mut oo_next = oo_collision.clone();
-    let mut subduction_next = subduction_source.clone();
-    let mut rift_next = rift_source.clone();
-    for pass in 0..collision_smooth_passes {
-        for y in 0..grid.height {
-            let t =
-                (pass as f32 + y as f32 / grid.height as f32) / collision_smooth_passes as f32;
-            progress.phase(progress_base, progress_span, 0.28 + 0.02 * t);
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let mut cc_sum = cc_collision[i] * 0.5;
-                let mut oc_cont_sum = oc_collision_cont[i] * 0.5;
-                let mut oc_ocean_sum = oc_collision_ocean[i] * 0.5;
-                let mut oo_sum = oo_collision[i] * 0.5;
-                let mut sub_sum = subduction_source[i] * 0.5;
-                let mut rift_sum = rift_source[i] * 0.5;
-                let mut wsum = 0.5;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
-                        let w = if ox == 0 || oy == 0 { 0.11 } else { 0.075 };
-                        cc_sum += cc_collision[j] * w;
-                        oc_cont_sum += oc_collision_cont[j] * w;
-                        oc_ocean_sum += oc_collision_ocean[j] * w;
-                        oo_sum += oo_collision[j] * w;
-                        sub_sum += subduction_source[j] * w;
-                        rift_sum += rift_source[j] * w;
-                        wsum += w;
-                    }
-                }
-                cc_next[i] = cc_sum / wsum.max(1e-6);
-                oc_cont_next[i] = oc_cont_sum / wsum.max(1e-6);
-                oc_ocean_next[i] = oc_ocean_sum / wsum.max(1e-6);
-                oo_next[i] = oo_sum / wsum.max(1e-6);
-                subduction_next[i] = sub_sum / wsum.max(1e-6);
-                rift_next[i] = rift_sum / wsum.max(1e-6);
-            }
-        }
-        cc_collision.copy_from_slice(&cc_next);
-        oc_collision_cont.copy_from_slice(&oc_cont_next);
-        oc_collision_ocean.copy_from_slice(&oc_ocean_next);
-        oo_collision.copy_from_slice(&oo_next);
-        subduction_source.copy_from_slice(&subduction_next);
-        rift_source.copy_from_slice(&rift_next);
-    }
-
-    let vel_smooth_passes = (detail.max_kernel_radius as usize + detail.buoyancy_smooth_passes / 6)
-        .clamp(3, 8);
-    let mut vel_x_next = velocity_x.clone();
-    let mut vel_y_next = velocity_y.clone();
-    for pass in 0..vel_smooth_passes {
-        for y in 0..grid.height {
-            let t = (pass as f32 + y as f32 / grid.height as f32) / vel_smooth_passes as f32;
-            progress.phase(progress_base, progress_span, 0.28 + 0.04 * t);
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let mut sx = velocity_x[i] * 0.34;
-                let mut sy = velocity_y[i] * 0.34;
-                let mut wsum = 0.34;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
-                        let w = if ox == 0 || oy == 0 { 0.11 } else { 0.07 };
-                        sx += velocity_x[j] * w;
-                        sy += velocity_y[j] * w;
-                        wsum += w;
-                    }
-                }
-                vel_x_next[i] = sx / wsum.max(1e-6);
-                vel_y_next[i] = sy / wsum.max(1e-6);
-            }
-        }
-        velocity_x.copy_from_slice(&vel_x_next);
-        velocity_y.copy_from_slice(&vel_y_next);
-    }
-
-    let mut comp_grad = vec![0.0_f32; grid.size];
-    let mut ext_grad = vec![0.0_f32; grid.size];
-    let mut shear_grad = vec![0.0_f32; grid.size];
-    let mut comp_peak = 1e-6_f32;
-    let mut ext_peak = 1e-6_f32;
-    let mut shear_peak = 1e-6_f32;
-    for y in 0..grid.height {
-        let t = y as f32 / grid.height as f32;
-        progress.phase(progress_base, progress_span, 0.32 + 0.02 * t);
-        for x in 0..grid.width {
-            let i = grid.index(x, y);
-            let vx_r = velocity_x[grid.neighbor(x as i32 + 1, y as i32)];
-            let vx_l = velocity_x[grid.neighbor(x as i32 - 1, y as i32)];
-            let vx_u = velocity_x[grid.neighbor(x as i32, y as i32 - 1)];
-            let vx_d = velocity_x[grid.neighbor(x as i32, y as i32 + 1)];
-            let vy_r = velocity_y[grid.neighbor(x as i32 + 1, y as i32)];
-            let vy_l = velocity_y[grid.neighbor(x as i32 - 1, y as i32)];
-            let vy_u = velocity_y[grid.neighbor(x as i32, y as i32 - 1)];
-            let vy_d = velocity_y[grid.neighbor(x as i32, y as i32 + 1)];
-            let div = ((vx_r - vx_l) + (vy_d - vy_u)) * 0.5;
-            let shear = ((vx_d - vx_u).abs() + (vy_r - vy_l).abs()) * 0.5;
-            let cg = (-div).max(0.0);
-            let eg = div.max(0.0);
-            comp_grad[i] = cg;
-            ext_grad[i] = eg;
-            shear_grad[i] = shear;
-            comp_peak = comp_peak.max(cg);
-            ext_peak = ext_peak.max(eg);
-            shear_peak = shear_peak.max(shear);
-        }
-    }
-
-    for i in 0..grid.size {
-        let weak = weakness_field[i];
-        let cg = clampf(comp_grad[i] / comp_peak, 0.0, 1.0).powf(0.9);
-        let eg = clampf(ext_grad[i] / ext_peak, 0.0, 1.0).powf(0.9);
-        let sg = clampf(shear_grad[i] / shear_peak, 0.0, 1.0).powf(0.92);
-        let collisional_boost =
-            cc_collision[i] * 0.7 + oc_collision_cont[i] * 0.52 + oo_collision[i] * 0.34;
-        let subduction_boost = subduction_source[i];
-        let rift_boost = rift_source[i];
-        comp_source[i] = clampf(
-            comp_source[i] * 0.68
-                + cg * (0.2 + 0.18 * weak)
-                + collisional_boost * (0.24 + 0.26 * weak),
-            0.0,
-            1.9,
-        );
-        ext_source[i] = clampf(
-            ext_source[i] * 0.68
-                + eg * (0.2 + 0.14 * (1.0 - weak))
-                + rift_boost * (0.22 + 0.18 * (1.0 - weak))
-                + subduction_boost * 0.08,
-            0.0,
-            1.9,
-        );
-        shear_source[i] = clampf(
-            shear_source[i] * 0.66
-                + sg * (0.19 + 0.2 * weak)
-                + collisional_boost * 0.12
-                + subduction_boost * 0.1,
-            0.0,
-            1.7,
-        );
-    }
-
-    let mut comp_field = comp_source.clone();
-    let mut ext_field = ext_source.clone();
-    let mut shear_field = shear_source.clone();
-    let mut comp_next = vec![0.0_f32; grid.size];
-    let mut ext_next = vec![0.0_f32; grid.size];
-    let mut shear_next = vec![0.0_f32; grid.size];
-
-    const STRAIN_NEIGHBORS: [(i32, i32, f32); 8] = [
-        (1, 0, 0.17),
-        (-1, 0, 0.17),
-        (0, 1, 0.17),
-        (0, -1, 0.17),
-        (1, 1, 0.12),
-        (-1, 1, 0.12),
-        (1, -1, 0.12),
-        (-1, -1, 0.12),
-    ];
-
-    let strain_passes = (detail.buoyancy_smooth_passes / 2 + detail.max_kernel_radius as usize + 5)
-        .clamp(9, 26);
-    for pass in 0..strain_passes {
-        let pass_t = pass as f32 / strain_passes.max(1) as f32;
-        for y in 0..grid.height {
-            let row_t = (pass as f32 + y as f32 / grid.height as f32) / strain_passes as f32;
-            progress.phase(progress_base, progress_span, 0.32 + 0.18 * row_t);
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let mut nx = plates.boundary_normal_x[i];
-                let mut ny = plates.boundary_normal_y[i];
-                let mut nlen = nx.hypot(ny);
-                if nlen < 0.15 {
-                    let left = continentality_field[grid.neighbor(x as i32 - 1, y as i32)];
-                    let right = continentality_field[grid.neighbor(x as i32 + 1, y as i32)];
-                    let up = continentality_field[grid.neighbor(x as i32, y as i32 - 1)];
-                    let down = continentality_field[grid.neighbor(x as i32, y as i32 + 1)];
-                    nx = right - left;
-                    ny = down - up;
-                    nlen = nx.hypot(ny);
-                }
-                if nlen < 1e-5 {
-                    nx = 1.0;
-                    ny = 0.0;
-                    nlen = 1.0;
-                }
-                let nux = nx / nlen;
-                let nuy = ny / nlen;
-                let tx = -nuy;
-                let ty = nux;
-                let weak = weakness_field[i];
-                let heat_norm = heat_norm_field[i];
-                let strength = strength_field[i];
-                let conductivity = clampf(
-                    0.12 + 0.54 * weak + 0.2 * heat_norm - 0.2 * strength,
-                    0.05,
-                    0.96,
-                );
-
-                let mut comp_sum = comp_field[i] * 0.42;
-                let mut ext_sum = ext_field[i] * 0.42;
-                let mut shear_sum = shear_field[i] * 0.42;
-                let mut wsum = 0.42;
-
-                for (dx, dy, base_w) in STRAIN_NEIGHBORS {
-                    let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
-                    let along = ((dx as f32) * tx + (dy as f32) * ty).abs();
-                    let across = ((dx as f32) * nux + (dy as f32) * nuy).abs();
-                    let orient = clampf(0.78 + 0.34 * along - 0.12 * across, 0.5, 1.35);
-                    let bridge = 0.55 + 0.45 * conductivity * (0.42 + 0.58 * weakness_field[j]);
-                    let w = base_w * orient * bridge;
-                    comp_sum += comp_field[j] * w;
-                    ext_sum += ext_field[j] * w;
-                    shear_sum += shear_field[j] * w;
-                    wsum += w;
-                }
-
-                let comp_avg = comp_sum / wsum.max(1e-6);
-                let ext_avg = ext_sum / wsum.max(1e-6);
-                let shear_avg = shear_sum / wsum.max(1e-6);
-
-                let comp_source_drive = comp_source[i] * (0.46 + 0.42 * weak);
-                let ext_source_drive = ext_source[i] * (0.48 + 0.38 * (1.0 - weak));
-                let shear_source_drive = shear_source[i] * (0.4 + 0.45 * weak);
-
-                comp_next[i] = clampf(
-                    comp_field[i] * (0.52 + 0.2 * (1.0 - conductivity))
-                        + comp_avg * (0.3 + 0.44 * conductivity)
-                        + comp_source_drive * 0.3
-                        - (0.008 + 0.006 * pass_t),
-                    0.0,
-                    2.8,
-                );
-                ext_next[i] = clampf(
-                    ext_field[i] * (0.54 + 0.2 * (1.0 - conductivity))
-                        + ext_avg * (0.3 + 0.4 * conductivity)
-                        + ext_source_drive * 0.31
-                        - (0.007 + 0.005 * pass_t),
-                    0.0,
-                    2.8,
-                );
-                shear_next[i] = clampf(
-                    shear_field[i] * (0.58 + 0.16 * (1.0 - conductivity))
-                        + shear_avg * (0.27 + 0.36 * conductivity)
-                        + shear_source_drive * 0.36
-                        - (0.006 + 0.004 * pass_t),
-                    0.0,
-                    2.6,
-                );
-            }
-        }
-
-        comp_field.copy_from_slice(&comp_next);
-        ext_field.copy_from_slice(&ext_next);
-        shear_field.copy_from_slice(&shear_next);
-    }
-
-    let mut comp_peak = 1e-6_f32;
-    let mut ext_peak = 1e-6_f32;
-    let mut shear_peak = 1e-6_f32;
-    for i in 0..grid.size {
-        comp_peak = comp_peak.max(comp_field[i]);
-        ext_peak = ext_peak.max(ext_field[i]);
-        shear_peak = shear_peak.max(shear_field[i]);
-    }
-    for i in 0..grid.size {
-        comp_field[i] = clampf(comp_field[i] / comp_peak, 0.0, 1.0).powf(0.86);
-        ext_field[i] = clampf(ext_field[i] / ext_peak, 0.0, 1.0).powf(0.9);
-        shear_field[i] = clampf(shear_field[i] / shear_peak, 0.0, 1.0).powf(0.94);
-    }
-
-    let corridor_passes = (detail.max_kernel_radius as usize / 2 + 2).clamp(2, 5);
-    for pass in 0..corridor_passes {
-        for y in 0..grid.height {
-            let t = (pass as f32 + y as f32 / grid.height as f32) / corridor_passes as f32;
-            progress.phase(progress_base, progress_span, 0.5 + 0.02 * t);
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let weak = weakness_field[i];
-                let mut comp_sum = comp_field[i] * 0.44;
-                let mut ext_sum = ext_field[i] * 0.44;
-                let mut shear_sum = shear_field[i] * 0.44;
-                let mut wsum = 0.44;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
-                        let w = if ox == 0 || oy == 0 { 0.1 } else { 0.065 };
-                        comp_sum += comp_field[j] * w;
-                        ext_sum += ext_field[j] * w;
-                        shear_sum += shear_field[j] * w;
-                        wsum += w;
-                    }
-                }
-                let comp_avg = comp_sum / wsum.max(1e-6);
-                let ext_avg = ext_sum / wsum.max(1e-6);
-                let shear_avg = shear_sum / wsum.max(1e-6);
-                comp_next[i] = clampf(
-                    comp_field[i] * (0.6 - 0.12 * weak) + comp_avg * (0.3 + 0.32 * weak),
-                    0.0,
-                    1.0,
-                );
-                ext_next[i] = clampf(
-                    ext_field[i] * (0.62 - 0.08 * weak) + ext_avg * (0.28 + 0.26 * (1.0 - weak)),
-                    0.0,
-                    1.0,
-                );
-                shear_next[i] = clampf(
-                    shear_field[i] * (0.64 - 0.06 * weak)
-                        + shear_avg * (0.24 + 0.22 * weak),
-                    0.0,
-                    1.0,
-                );
-            }
-        }
-        comp_field.copy_from_slice(&comp_next);
-        ext_field.copy_from_slice(&ext_next);
-        shear_field.copy_from_slice(&shear_next);
-    }
-
-    let mut orogen_drive = vec![0.0_f32; grid.size];
-    let mut crust_eq = vec![0.0_f32; grid.size];
-    let mut crust = vec![0.0_f32; grid.size];
-    let mut crust_next = vec![0.0_f32; grid.size];
-    for i in 0..grid.size {
-        let continental = continentality_field[i];
-        let landness = smoothstep(-0.08, 0.84, continental);
-        let eq = lerpf(7.0, 34.8, landness) * (1.02 - 0.14 * heat_norm_field[i]);
-        crust_eq[i] = eq;
-        let inherited = smoothstep(0.2, 0.9, 0.5 + 0.5 * fault_backbone[i]);
-        let collisionality =
-            cc_collision[i] * 0.88 + oc_collision_cont[i] * 0.62 + oo_collision[i] * 0.42;
-        let drive = smoothstep(
-            0.1,
-            0.9,
-            comp_field[i] * (0.56 + 0.46 * weakness_field[i])
-                + shear_field[i] * 0.18
-                + inherited * 0.12 * weakness_field[i]
-                + collisionality * (0.24 + 0.18 * landness),
-        ) * (0.42 + 0.58 * landness);
-        orogen_drive[i] = drive;
-        crust[i] = clampf(
-            eq + drive * (2.1 + 1.2 * collisionality)
-                - ext_field[i] * (0.95 + 0.45 * rift_source[i])
-                - subduction_source[i] * (0.6 + 0.62 * (1.0 - landness)),
-            4.0,
-            64.0,
-        );
-    }
-
-    let time_steps =
-        (detail.erosion_rounds * 9 + detail.max_kernel_radius as usize * 3 + 8).clamp(12, 40);
-    for step in 0..time_steps {
-        for y in 0..grid.height {
-            let t = (step as f32 + y as f32 / grid.height as f32) / time_steps as f32;
-            progress.phase(progress_base, progress_span, 0.5 + 0.12 * t);
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let landness = smoothstep(-0.08, 0.84, continentality_field[i]);
-                let weak = weakness_field[i];
-                let strength = strength_field[i];
-                let collisionality =
-                    cc_collision[i] * 0.92 + oc_collision_cont[i] * 0.66 + oo_collision[i] * 0.48;
-                let subduction = subduction_source[i];
-                let rift = rift_source[i];
-                let comp_eff = comp_field[i] * (0.54 + 0.62 * weak)
-                    + shear_field[i] * 0.24 * (0.32 + 0.68 * landness)
-                    + collisionality * (0.22 + 0.28 * landness);
-                let ext_eff = ext_field[i] * (0.64 + 0.36 * (1.0 - landness))
-                    + rift * 0.42
-                    + subduction * 0.22;
-                let thickening = (0.08 + 0.68 * comp_eff)
-                    * (0.42 + 0.58 * landness)
-                    * (1.14 - 0.3 * strength)
-                    * (0.86 + 0.48 * collisionality);
-                let thinning = (0.04 + 0.46 * ext_eff)
-                    * (0.56 + 0.52 * heat_norm_field[i])
-                    * (0.42 + 0.58 * (1.0 - landness));
-                let relaxation = (crust[i] - crust_eq[i]).max(0.0)
-                    * (0.017 + 0.03 * (1.0 - landness) + 0.01 * (step as f32 / time_steps as f32));
-                let evolved = crust[i] + thickening - thinning - relaxation;
-
-                let mut sum = evolved * 0.38;
-                let mut wsum = 0.38;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
-                        let w = if ox == 0 || oy == 0 { 0.1 } else { 0.065 };
-                        sum += crust[j] * w;
-                        wsum += w;
-                    }
-                }
-                let avg = sum / wsum.max(1e-6);
-                let corridor = comp_field[i]
-                    .max(shear_field[i] * 0.85)
-                    .max(ext_field[i] * 0.55)
-                    .max(collisionality * 0.7);
-                let lateral = clampf(
-                    0.034 + 0.064 * (1.0 - corridor) + 0.03 * (1.0 - weak) - 0.012 * collisionality,
-                    0.022,
-                    0.16,
-                );
-                crust_next[i] = clampf(evolved * (1.0 - lateral) + avg * lateral, 4.0, 78.0);
-            }
-        }
-        crust.copy_from_slice(&crust_next);
-    }
-
-    for i in 0..grid.size {
-        if i % (grid.width * 4) == 0 {
-            progress.phase(
-                progress_base,
-                progress_span,
-                0.62 + 0.2 * (i as f32 / grid.size as f32),
-            );
-        }
-        let plate_id = plates.plate_field[i] as usize;
-        let plate_speed = plates.plate_vectors[plate_id].speed;
-        let heat = plates.plate_vectors[plate_id].heat;
-        let plate_buoyancy = buoyancy_field[i];
-        let sx = cell_cache.noise_x[i];
-        let sy = cell_cache.noise_y[i];
-        let sz = cell_cache.noise_z[i];
-        let continental_raw = continentality_field[i];
-
-        let warp_u = spherical_fbm(
-            sx * 1.15 + 3.0,
-            sy * 1.15 - 5.0,
-            sz * 1.15 + 7.0,
-            seed as f32 * 0.0019 + 11.0,
-        );
-        let warp_v = spherical_fbm(
-            sx * 1.67 - 13.0,
-            sy * 1.67 + 17.0,
-            sz * 1.67 - 19.0,
-            seed as f32 * 0.0023 + 29.0,
-        );
-        let wx = sx + 0.34 * warp_u + 0.2 * warp_v;
-        let wy = sy + 0.34 * warp_v + 0.2 * warp_u;
-        let wz = sz + 0.27 * (warp_u - warp_v);
-
-        let macro_noise = spherical_fbm(
-            wx * 0.82 + 5.0,
-            wy * 0.82 - 7.0,
-            wz * 0.82 + 9.0,
-            seed as f32 * 0.0027 + 17.0,
-        );
-        let regional_signal = spherical_fbm(
-            wx * 1.72 - 11.0,
-            wy * 1.72 + 13.0,
-            wz * 1.72 - 3.0,
-            seed as f32 * 0.0035 + 37.0,
-        );
-        let micro_signal = spherical_fbm(
-            wx * 3.85 + 19.0,
-            wy * 3.85 - 17.0,
-            wz * 3.85 + 23.0,
-            seed as f32 * 0.0049 + 53.0,
-        );
-        let shelf_noise = spherical_fbm(
-            wx * 1.3 + 29.0,
-            wy * 1.3 - 31.0,
-            wz * 1.3 + 23.0,
-            seed as f32 * 0.0039 + 61.0,
-        );
-
-        let land_core = continental_raw.max(0.0);
-        let ocean_core = (-continental_raw).max(0.0);
-        let shelf_span = 0.18 + 0.16 * (0.5 + 0.5 * shelf_noise);
-        let coast_weight = 1.0 - smoothstep(0.05, shelf_span.max(0.08), continental_raw.abs());
-        let interior_weight = 1.0 - coast_weight;
-        let mountain_patch = smoothstep(0.2, 0.88, 0.5 + 0.5 * regional_signal);
-
-        let tectonic_scale = ((k_relief * plate_speed) / planet.gravity.max(1.0)) * 0.0135;
-        let land_gate = smoothstep(0.1, 0.95, continental_raw);
-        let ocean_gate = smoothstep(0.2, 0.98, -continental_raw);
-        let comp = comp_field[i];
-        let ext = ext_field[i];
-        let shear = shear_field[i];
-        let collision_cc = smoothstep(0.08, 0.86, cc_collision[i]);
-        let collision_oc_cont = smoothstep(0.08, 0.86, oc_collision_cont[i]);
-        let collision_oc_ocean = smoothstep(0.08, 0.86, oc_collision_ocean[i]);
-        let collision_oo = smoothstep(0.08, 0.86, oo_collision[i]);
-        let subduction = clampf(subduction_source[i], 0.0, 1.6);
-        let rift = clampf(rift_source[i], 0.0, 1.6);
-        let crust_anom = crust[i] - crust_eq[i];
-        let orogen = smoothstep(0.08, 0.9, orogen_drive[i]);
-        let plateau = smoothstep(3.0, 18.0, crust_anom) * smoothstep(0.24, 0.92, land_gate);
-        let segmentation = smoothstep(
-            0.16,
-            0.88,
-            weakness_field[i] * 0.78 + 0.22 * (0.5 + 0.5 * fault_backbone[i]),
-        );
-        let collisional_mix = clampf(
-            collision_cc * 0.74 + collision_oc_cont * 0.52 + collision_oo * 0.36,
-            0.0,
-            1.0,
-        );
-        let orogen_cc =
-            smoothstep(0.16, 0.9, orogen * 0.62 + collision_cc * 0.92 + plateau * 0.24);
-        let arc_orogen = smoothstep(
-            0.14,
-            0.9,
-            collision_oc_cont * 0.84 + collision_oo * 0.66 + comp * 0.26,
-        );
-
-        let mountain_uplift = tectonic_scale
-            * land_gate
-            * (70.0
-                + 1280.0 * orogen_cc * (0.46 + 0.54 * segmentation)
-                + 690.0 * arc_orogen * (0.42 + 0.58 * (1.0 - segmentation * 0.55))
-                + 280.0 * plateau
-                + 210.0 * clampf(crust_anom / 20.0, 0.0, 1.0))
-            * (0.56 + 0.44 * mountain_patch)
-            * (0.38 + 0.62 * interior_weight);
-        let transpress_uplift = tectonic_scale
-            * land_gate
-            * (42.0 + 260.0 * shear.powf(1.08))
-            * smoothstep(0.14, 0.8, shear + comp * 0.32 + collisional_mix * 0.2);
-        let ridge_ocean_uplift = tectonic_scale
-            * ocean_gate
-            * (30.0 + 540.0 * clampf(ext * 0.66 + rift * 0.58, 0.0, 2.0).powf(0.84))
-            * (0.58 + 0.42 * (1.0 - collision_cc));
-        let trench_driver = clampf(
-            subduction * 0.94 + collision_oc_ocean * 0.7 + collision_oo * 0.56 + comp * 0.46,
-            0.0,
-            1.8,
-        );
-        let trench_cut = tectonic_scale
-            * ocean_gate
-            * (70.0 + 1650.0 * trench_driver.powf(0.9))
-            * (0.66 + 0.34 * ocean_core.powf(0.42));
-        let foreland_sag = tectonic_scale
-            * land_gate
-            * (22.0 + 150.0 * collision_cc)
-            * (0.52 + 0.48 * (1.0 - orogen_cc))
-            * (0.7 + 0.3 * interior_weight);
-        let backarc_sag = tectonic_scale
-            * land_gate
-            * (18.0 + 138.0 * collision_oc_cont)
-            * (0.45 + 0.55 * (1.0 - arc_orogen))
-            * (0.68 + 0.32 * interior_weight);
-        let transform_term = tectonic_scale
-            * 140.0
-            * shear.powf(0.9)
-            * (regional_signal * 0.6 + micro_signal * 0.4)
-            * (land_gate + ocean_gate).min(1.0)
-            * (0.62 + 0.38 * (1.0 - collision_cc));
-        let base = mountain_uplift + transpress_uplift + ridge_ocean_uplift
-            - trench_cut
-            - foreland_sag
-            - backarc_sag
-            + transform_term;
-
-        // Empirical continental/oceanic base (legacy formula kept for blend)
-        let empirical_base = if continental_raw >= 0.0 {
-            85.0 + land_core.powf(1.16) * (1480.0 + 2350.0 * smoothstep(0.18, 0.96, land_core))
-        } else {
-            -(170.0 + ocean_core.powf(1.18) * (1860.0 + 3180.0 * smoothstep(0.22, 0.98, ocean_core)))
+                // Transform: minor transpressional thickening.
+                bstr * 5.0
+            },
+            _ => 0.0,
         };
 
-        // Airy isostasy: crust thickness → elevation (Turcotte & Schubert 2002)
-        let is_continental = continental_raw >= 0.0;
-        let heat_anomaly = (heat_norm_field[i] - 0.2) / 2.1; // normalise [0.2,2.3] → [0,1]
-        let isostatic_base = isostatic_elevation(crust[i], is_continental, heat_anomaly);
-
-        // Blend: 60 % physics + 40 % empirical ensures smooth transition to full isostasy
-        let continental_base = isostatic_base * 0.85 + empirical_base * 0.15;
-
-        let litho_variation = (regional_signal * 112.0
-            + micro_signal * 58.0
-            + macro_noise * 44.0
-            + plate_buoyancy * 14.0
-            + crust_anom * (14.0 + 26.0 * orogen))
-            * (0.2 + 0.8 * interior_weight);
-        let macro_base = continental_base + litho_variation;
-
-        let noise = (random_seed.next_f32() - 0.5) * 10.0
-            + regional_signal * 21.0
-            + micro_signal * (6.5 + 9.0 * interior_weight);
-        let heat_term = (heat - tectonics.mantle_heat * 0.5) * 0.95;
-
-        relief[i] = base + macro_base + noise + heat_term;
+        crust_thickness[i] = (base + thickening).clamp(5.0, 75.0);
     }
 
-    let mut macro_blend = vec![0.0_f32; grid.size];
-    let macro_radius = 1_i32;
-
-    for y in 0..grid.height {
-        progress.phase(
-            progress_base,
-            progress_span,
-            0.6 + 0.1 * (y as f32 / grid.height as f32),
-        );
-        for x in 0..grid.width {
-            let i = grid.index(x, y);
-            let mut sum = 0.0_f32;
-            let mut wsum = 0.0_f32;
-            for oy in -macro_radius..=macro_radius {
-                for ox in -macro_radius..=macro_radius {
-                    let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
-                    let dist2 = (ox * ox + oy * oy) as f32;
-                    let w = (-dist2 / 1.9).exp();
-                    sum += relief[j] * w;
-                    wsum += w;
-                }
-            }
-            macro_blend[i] = sum / wsum.max(1e-6);
-        }
-    }
-
-    for i in 0..grid.size {
-        relief[i] = relief[i] * 0.9 + macro_blend[i] * 0.1;
-    }
-
-    let erosion_rounds = detail.erosion_rounds;
-    let mut smoothed = relief.clone();
-    let mut scratch = vec![0.0_f32; grid.size];
-
-    for round in 0..erosion_rounds {
-        for y in 0..grid.height {
-            let round_t =
-                (round as f32 + y as f32 / grid.height as f32) / erosion_rounds.max(1) as f32;
-            progress.phase(progress_base, progress_span, 0.72 + 0.14 * round_t);
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let mut sum = 0.0_f32;
-                let mut count = 0.0_f32;
-                for oy in -1..=1 {
-                    for ox in -1..=1 {
-                        let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
-                        sum += smoothed[j];
-                        count += 1.0;
+    // Smooth crust_thickness: flexural isostasy proxy.
+    // ~8 passes at ~20 km/cell = ~160 km diffusion length (Te ≈ 30 km → flexural
+    // wavelength ~200 km, Watts 2001).
+    {
+        let mut scratch = vec![0.0_f32; size];
+        for _ in 0..8 {
+            for y in 0..grid.height {
+                for x in 0..grid.width {
+                    let i = grid.index(x, y);
+                    let mut sum = crust_thickness[i] * 4.0;
+                    let mut wt = 4.0_f32;
+                    for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
+                        let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
+                        sum += crust_thickness[j];
+                        wt += 1.0;
                     }
+                    scratch[i] = sum / wt;
                 }
-                let avg = sum / count;
-                scratch[i] = smoothed[i] * 0.95 + avg * 0.05;
             }
-        }
-
-        for i in 0..grid.size {
-            let drop = (smoothed[i] - scratch[i]).max(0.0);
-            let height_loss = (drop * 0.14).min(16.0);
-            smoothed[i] = scratch[i] - height_loss;
+            crust_thickness.copy_from_slice(&scratch);
         }
     }
+    progress.phase(progress_base, progress_span, 0.08);
 
-    relief.copy_from_slice(&smoothed);
+    // --- 3. Rock type from tectonic context → K_eff (Harel et al. 2016) ---
+    let noise_seed = hash_u32(seed ^ 0x80C4_F1E1);
+    let mut k_eff = vec![0.0_f32; size];
+    for i in 0..size {
+        let btype = plates.boundary_types[i];
+        let bstr = plates.boundary_strength[i];
 
-    let ocean_cut = (((planet.ocean_percent / 100.0) * grid.size as f32).floor() as isize)
-        .clamp(0, (grid.size - 1) as isize) as usize;
+        let rock = if !is_continental[i] {
+            // Oceanic: basalt (MORB), schist near subduction
+            if btype == 1 && bstr > 0.3 { RockType::Schist } else { RockType::Basalt }
+        } else {
+            match btype {
+                1 if bstr > 0.5 => RockType::Granite,    // orogenic metamorphic core
+                1               => RockType::Quartzite,   // fold-and-thrust belt
+                2 if bstr > 0.3 => RockType::Sandstone,   // rift sediments
+                3               => RockType::Schist,       // sheared metamorphic
+                _ => {
+                    // Continental interior: noise-based sedimentary cover
+                    let n = value_noise3(
+                        cell_cache.noise_x[i] * 2.0,
+                        cell_cache.noise_y[i] * 2.0,
+                        cell_cache.noise_z[i] * 2.0,
+                        noise_seed,
+                    );
+                    if n > 0.3 { RockType::Limestone }
+                    else if n > -0.3 { RockType::Sandstone }
+                    else { RockType::Granite }
+                }
+            }
+        };
 
-    let mut sorted = relief.clone();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let sea_level = *sorted.get(ocean_cut).unwrap_or(&0.0);
-    for h in relief.iter_mut() {
-        *h -= sea_level;
+        k_eff[i] = rock.k_eff();
     }
 
-    // Coastal/ocean processing — planet scope only.
-    // For island scope, coastline emerges from stream power erosion (Phase J).
-    if grid.is_spherical {
-        let cache = world_cache();
-        stabilize_landmass_topology(&mut relief, planet, detail);
-        apply_coastal_detail(&mut relief, seed, cache);
-        defuse_plate_linearity(&mut relief, plates, seed, cache, detail);
-        defuse_coastal_linearity(&mut relief, plates, seed_mix ^ 0x1F23_BA47, cache);
-        fracture_coastline_band(&mut relief, seed_mix ^ 0x7B91_5C31, cache);
-        warp_coastal_band(&mut relief, seed_mix ^ 0x6A31_91D7, cache);
-        break_straight_coasts(&mut relief, seed_mix ^ 0x2CD8_7A43, cache);
-        cleanup_coastal_speckles(&mut relief);
-
-        let mut sorted_after_coast = relief.clone();
-        sorted_after_coast.sort_by(|a, b| a.total_cmp(b));
-        let coast_recenter = *sorted_after_coast.get(ocean_cut).unwrap_or(&0.0);
-        for h in relief.iter_mut() {
-            *h -= coast_recenter;
+    // Smooth K_eff across boundaries (fault-zone weathering enhancement × 1.5;
+    // Hovius & Stark 2006).
+    {
+        let mut scratch = vec![0.0_f32; size];
+        for _ in 0..3 {
+            for y in 0..grid.height {
+                for x in 0..grid.width {
+                    let i = grid.index(x, y);
+                    let mut sum = k_eff[i] * 4.0;
+                    let mut wt = 4.0_f32;
+                    for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
+                        let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
+                        sum += k_eff[j];
+                        wt += 1.0;
+                    }
+                    scratch[i] = sum / wt;
+                }
+            }
+            k_eff.copy_from_slice(&scratch);
         }
     }
+    progress.phase(progress_base, progress_span, 0.12);
 
-    normalize_height_range(&mut relief, planet, tectonics);
-    if grid.is_spherical && detail.erosion_rounds == 0 {
-        let cache = world_cache();
-        defuse_orogenic_ribbons(&mut relief, seed_mix, cache, detail);
+    // --- 4. Initial relief from Airy isostasy (Turcotte & Schubert 2002) ---
+    let heat_map: Vec<f32> = (0..size).map(|i| {
+        let pid = plates.plate_field[i] as usize;
+        if pid < n_plates {
+            (plates.plate_vectors[pid].heat / 100.0).clamp(0.0, 1.0)
+        } else {
+            0.5
+        }
+    }).collect();
+
+    let mut relief = vec![0.0_f32; size];
+    for i in 0..size {
+        relief[i] = isostatic_elevation(crust_thickness[i], is_continental[i], heat_map[i]);
     }
-    // Fluvial valley carving — planet scope only.
-    // Island scope uses stream_power_evolve + carve_fluvial_valleys_grid instead.
-    if grid.is_spherical {
-        carve_fluvial_valleys(
+
+    // Add small-scale initial roughness (4-octave noise, total ~120 m amplitude).
+    for i in 0..size {
+        let nx = cell_cache.noise_x[i];
+        let ny = cell_cache.noise_y[i];
+        let nz = cell_cache.noise_z[i];
+        let n = value_noise3(nx * 3.0, ny * 3.0, nz * 3.0, seed ^ 0xBEEF) * 60.0
+              + value_noise3(nx * 6.0 + 3.0, ny * 6.0 - 2.0, nz * 6.0, seed ^ 0xDEAD) * 35.0
+              + value_noise3(nx * 12.0 - 5.0, ny * 12.0 + 3.0, nz * 12.0, seed ^ 0xCAFE) * 18.0
+              + value_noise3(nx * 24.0 + 7.0, ny * 24.0 - 6.0, nz * 24.0, seed ^ 0xF00D) * 7.0;
+        relief[i] += n;
+    }
+    progress.phase(progress_base, progress_span, 0.15);
+
+    // --- 5. Multi-epoch stream power erosion (Braun & Willett 2013) ---
+    // Uplift field: convergent → positive, divergent → negative, interior → zero.
+    // Rates from GPS observations: orogeny 1-5 mm/yr (Bevis et al.).
+    let dx_m = grid.km_per_cell_x * 1000.0;
+    let plate_speed = tectonics.plate_speed_cm_per_year.clamp(1.0, 20.0);
+
+    let mut uplift = vec![0.0_f32; size];
+    for i in 0..size {
+        let bstr = plates.boundary_strength[i];
+        let btype = plates.boundary_types[i];
+        // Scale uplift by plate speed (faster plates → stronger collision → more uplift).
+        let speed_factor = plate_speed / 5.0; // normalized to Earth-like 5 cm/yr
+
+        uplift[i] = match btype {
+            1 => bstr * 0.003 * speed_factor,   // convergent: up to 3 mm/yr
+            2 => -bstr * 0.001 * speed_factor,  // divergent: up to -1 mm/yr subsidence
+            3 => bstr * 0.001 * speed_factor,    // transform: up to 1 mm/yr transpression
+            _ => 0.0,
+        };
+    }
+
+    // 3 epochs × 5 steps = 15 Braun-Willett passes.
+    // dt = 500 kyr, total simulated time = 15 × 500 kyr = 7.5 Myr.
+    let n_epochs = 3_usize;
+    let steps_per_epoch = 5_usize;
+    let dt_yr = 500_000.0_f32;
+
+    for epoch in 0..n_epochs {
+        let epoch_frac = epoch as f32 / n_epochs as f32;
+        // Diminishing uplift: younger epochs have less tectonic forcing.
+        let epoch_scale = 1.0 - epoch_frac * 0.3;
+
+        // Build per-epoch uplift (zero below sea level — no uplift in ocean).
+        let epoch_uplift: Vec<f32> = (0..size).map(|i| {
+            if relief[i] <= 0.0 { 0.0 } else { uplift[i] * epoch_scale }
+        }).collect();
+
+        let prog_start = 0.15 + epoch_frac * 0.65;
+        let prog_span_epoch = 0.65 / n_epochs as f32;
+
+        stream_power_evolve(
             &mut relief,
+            &epoch_uplift,
+            &k_eff,
+            dt_yr,
+            dx_m,
+            0.5,   // m: area exponent (Whipple & Tucker 1999)
+            1.0,   // n: slope exponent
+            0.01,  // kappa: hillslope diffusivity (CFL-stable at dx=20km, dt=500ky)
+            steps_per_epoch,
             grid,
-            detail,
             progress,
-            progress_base + progress_span * 0.82,
-            progress_span * 0.08,
+            progress_base + progress_span * prog_start,
+            progress_span * prog_span_epoch,
         );
-    }
-    progress.phase(progress_base, progress_span, 0.9);
 
-    // Ocean profile and final coastal cleanup — planet scope only.
-    if grid.is_spherical {
-        let cache = world_cache();
-        apply_ocean_profile(
-            &mut relief,
-            &plates.boundary_types,
-            &plates.boundary_strength,
-            planet,
-            seed,
-            cache,
-            detail,
-            progress,
-            progress_base + progress_span * 0.9,
-            progress_span * 0.08,
-        );
-        reshape_ocean_boundaries(
-            &mut relief,
-            &plates.boundary_types,
-            &plates.boundary_strength,
-        );
-        cleanup_coastal_speckles(&mut relief);
-        suppress_subgrid_islands(&mut relief, planet);
-        dampen_isolated_shallow_ocean(&mut relief);
-        progress.phase(progress_base, progress_span, 0.985);
-
-        let mut sorted_final = relief.clone();
-        sorted_final.sort_by(|a, b| a.total_cmp(b));
-        let final_recenter = *sorted_final.get(ocean_cut).unwrap_or(&0.0);
-        for h in relief.iter_mut() {
-            *h -= final_recenter;
+        // Isostatic relaxation after each epoch: relief drifts toward isostatic
+        // equilibrium (Maxwell relaxation timescale ~1 Myr for lithosphere).
+        for i in 0..size {
+            let target = isostatic_elevation(crust_thickness[i], is_continental[i], heat_map[i]);
+            relief[i] = relief[i] * 0.85 + target * 0.15;
         }
-        suppress_subgrid_islands(&mut relief, planet);
-        dampen_isolated_shallow_ocean(&mut relief);
     }
-    progress.phase(progress_base, progress_span, 1.0);
 
+    progress.phase(progress_base, progress_span, 0.85);
+
+    // --- 6. Sea level from ocean_percent ---
+    let ocean_frac = (planet.ocean_percent / 100.0).clamp(0.3, 0.95);
+    let mut sorted = relief.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let cut_idx = ((size as f32 * ocean_frac) as usize).min(size - 1);
+    let sea_level = sorted[cut_idx];
+    for v in relief.iter_mut() {
+        *v -= sea_level;
+    }
+
+    progress.phase(progress_base, progress_span, 1.0);
     ReliefResult { relief, sea_level }
 }
 
@@ -4852,212 +2115,261 @@ fn compute_slope(
     (slope, min_slope, max_slope)
 }
 
-fn compute_hydrology(
-    heights: &[f32],
-    slope: &[f32],
-    progress: &mut ProgressTap<'_>,
-    progress_base: f32,
-    progress_span: f32,
-) -> (Vec<i32>, Vec<f32>, Vec<f32>, Vec<u8>) {
-    let mut flow_direction = vec![-1_i32; WORLD_SIZE];
-    let mut secondary_direction = vec![-1_i32; WORLD_SIZE];
-    let mut primary_share = vec![1.0_f32; WORLD_SIZE];
-    let mut flow_accumulation = vec![1.0_f32; WORLD_SIZE];
-
-    for y in 0..WORLD_HEIGHT {
-        progress.phase(
-            progress_base,
-            progress_span,
-            0.45 * (y as f32 / WORLD_HEIGHT as f32),
-        );
-        for x in 0..WORLD_WIDTH {
-            let i = index(x, y);
-            let h = heights[i];
-            let mut best_drop = 0.0_f32;
-            let mut second_drop = 0.0_f32;
-            let mut best = -1_i32;
-            let mut second = -1_i32;
-
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    if ox == 0 && oy == 0 {
-                        continue;
-                    }
-                    let j = index_spherical(x as i32 + ox, y as i32 + oy);
-                    let drop = h - heights[j];
-                    if drop > best_drop {
-                        second_drop = best_drop;
-                        second = best;
-                        best_drop = drop;
-                        best = j as i32;
-                    } else if drop > second_drop {
-                        second_drop = drop;
-                        second = j as i32;
-                    }
-                }
-            }
-
-            flow_direction[i] = best;
-            secondary_direction[i] = second;
-            if best >= 0 && second >= 0 {
-                let total = (best_drop + second_drop).max(1e-6);
-                primary_share[i] = clampf(best_drop / total, 0.55, 0.92);
-            } else {
-                primary_share[i] = 1.0;
-            }
-        }
-    }
-
-    let mut order: Vec<usize> = (0..WORLD_SIZE).collect();
-    order.sort_by(|a, b| heights[*b].total_cmp(&heights[*a]));
-    progress.phase(progress_base, progress_span, 0.48);
-
-    for (rank, i) in order.iter().copied().enumerate() {
-        if rank % (WORLD_WIDTH * 4) == 0 {
-            progress.phase(
-                progress_base,
-                progress_span,
-                0.48 + 0.35 * (rank as f32 / WORLD_SIZE as f32),
-            );
-        }
-        let to = flow_direction[i];
-        let scale = 1.0 + slope[i] / 1000.0;
-        if to >= 0 {
-            flow_accumulation[to as usize] += flow_accumulation[i] * primary_share[i] * scale;
-            let alt = secondary_direction[i];
-            if alt >= 0 {
-                let spill = (1.0 - primary_share[i]) * 0.9;
-                flow_accumulation[alt as usize] += flow_accumulation[i] * spill * scale;
-            }
-        }
-    }
-    progress.phase(progress_base, progress_span, 0.83);
-
-    let mut sorted = flow_accumulation.clone();
-    sorted.sort_by(|a, b| b.total_cmp(a));
-    let threshold_index = ((sorted.len() as f32 * 0.992).floor() as usize).min(sorted.len() - 1);
-    let threshold = sorted[threshold_index].max(1.0);
-
-    let mut rivers = vec![0.0_f32; WORLD_SIZE];
-    let mut lakes = vec![0_u8; WORLD_SIZE];
-
-    for i in 0..WORLD_SIZE {
-        if i % (WORLD_WIDTH * 4) == 0 {
-            progress.phase(
-                progress_base,
-                progress_span,
-                0.83 + 0.17 * (i as f32 / WORLD_SIZE as f32),
-            );
-        }
-        rivers[i] = (flow_accumulation[i] / threshold).powf(0.9);
-        if flow_direction[i] < 0 && heights[i] > 0.0 && slope[i] < 25.0 {
-            lakes[i] = 1;
-        }
-    }
-    progress.phase(progress_base, progress_span, 1.0);
-
-    (flow_direction, flow_accumulation, rivers, lakes)
-}
-
-fn compute_climate(
+/// Unified climate model using Hadley cell circulation, latitude-dependent wind,
+/// orographic precipitation, rain shadow, and environmental lapse rate.
+/// Works on both spherical planet grids and flat island grids via GridConfig.
+///
+/// Physics basis:
+///   Temperature: T = T_sea(lat) − lapse × elevation + atmospheric correction
+///     T_sea(lat) = 28 − 0.007 × lat²   (quadratic fit to zonal-mean Earth data)
+///     lapse = 6.0 K/km  (environmental lapse rate, Holton & Hakim 2013)
+///   Precipitation: Hadley cell zonal base (Held & Hou 1980)
+///     + windward moisture path (exponential decay from coast)
+///     + coastal exposure (local kernel)
+///     + orographic lift (Roe 2005)
+///     − cumulative rain shadow (Smith 1979)
+///     × altitude factor (Clausius-Clapeyron: cold air holds less moisture)
+///   Wind: latitude-dependent prevailing winds
+///     Trade winds <30°, westerlies 30-60°, polar easterlies >60° (Peixoto & Oort 1992)
+fn compute_climate_unified(
     planet: &PlanetInputs,
     heights: &[f32],
-    slope: &[f32],
-    rivers: &[f32],
-    flow: &[f32],
+    grid: &GridConfig,
+    cell_cache: &CellCache,
+    seed: u32,
     aerosol: f32,
-    cache: &WorldCache,
     progress: &mut ProgressTap<'_>,
     progress_base: f32,
     progress_span: f32,
 ) -> (Vec<f32>, Vec<f32>, f32, f32, f32, f32) {
-    let mut temperature = vec![0.0_f32; WORLD_SIZE];
-    let mut precipitation = vec![0.0_f32; WORLD_SIZE];
-    let tilt_rad = planet.axial_tilt_deg * RADIANS;
-    let rotation_factor = 20.0 / planet.rotation_hours.max(1.0);
+    let size = grid.size;
+    let w = grid.width;
+    let h = grid.height;
+    let w_i32 = w as i32;
+    let h_i32 = h as i32;
 
-    let mut min_temp = f32::INFINITY;
-    let mut max_temp = -f32::INFINITY;
-    let mut min_prec = f32::INFINITY;
-    let mut max_prec = -f32::INFINITY;
+    let mut temperature = vec![0.0_f32; size];
+    let mut precipitation = vec![0.0_f32; size];
 
-    for i in 0..WORLD_SIZE {
-        if i % (WORLD_WIDTH * 4) == 0 {
-            progress.phase(progress_base, progress_span, i as f32 / WORLD_SIZE as f32);
+    let temp_seed = hash_u32(seed ^ 0xC11_A7E0);
+    let precip_seed = hash_u32(seed ^ 0xD0CC_EE01);
+    let path_noise_seed = hash_u32(seed ^ 0xD157_A4CE);
+
+    // Resolution-adaptive trace distances (capped at 400 cells for performance)
+    let windward_max_steps = (800.0 / grid.km_per_cell_x).min(400.0) as i32;
+    let shadow_max_steps = (1200.0 / grid.km_per_cell_x).min(400.0) as i32;
+    let lapse_rate = 0.006_f32; // 6.0 K per km = 0.006 K/m (environmental lapse rate)
+
+    // --- Step 1: Coastal exposure (fraction of ocean within ~60 km) ---
+    let coast_r = (60.0 / grid.km_per_cell_x).max(2.0).min(7.0) as i32;
+    let mut coastal_exposure = vec![0.0_f32; size];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if heights[i] <= 0.0 { continue; }
+            let mut ocean_n = 0_u32;
+            let mut total = 0_u32;
+            for dy in -coast_r..=coast_r {
+                let ny = (y as i32 + dy).clamp(0, h_i32 - 1) as usize;
+                for dx in -coast_r..=coast_r {
+                    let nx = if grid.is_spherical {
+                        (((x as i32 + dx) % w_i32) + w_i32) % w_i32
+                    } else {
+                        (x as i32 + dx).clamp(0, w_i32 - 1)
+                    } as usize;
+                    total += 1;
+                    if heights[ny * w + nx] <= 0.0 { ocean_n += 1; }
+                }
+            }
+            coastal_exposure[i] = ocean_n as f32 / total as f32;
         }
-        let lat = cache.lat_by_y[i] * RADIANS;
-        let base_insolation = (lat - tilt_rad).cos().max(0.0) * (1.0 + planet.eccentricity * 0.35);
-        let elevation_for_temperature = heights[i].max(0.0);
-        let base_temp =
-            55.0 * base_insolation - 0.0065 * elevation_for_temperature - lat.abs() * 0.4;
-        let pressure_term = 12.0 * planet.atmosphere_bar.max(0.0).ln_1p();
-        let ocean_term = if heights[i] < 0.0 { 6.0 } else { 0.0 };
-        let seasonal = 1.0 + 0.08 * ((lat + 0.2 * std::f32::consts::PI * tilt_rad) * 2.0).sin();
-        let temp =
-            base_temp + pressure_term + ocean_term + 0.12 * rotation_factor * 100.0 * seasonal
-                - aerosol * 8.0;
-        let slope_orographic = 1.0 + (slope[i].abs() / 400.0).min(1.4);
-        let precip_raw = 600.0
-            + 1800.0 * base_insolation * seasonal
-            + 1200.0 * rivers[i].min(1.0) * slope_orographic
-            + flow[i] * 0.1;
-        let precip = (precip_raw - aerosol * 250.0).max(0.0);
+    }
+    progress.phase(progress_base, progress_span, 0.10);
 
-        temperature[i] = clampf(temp, -90.0, 70.0);
-        precipitation[i] = precip;
+    // --- Step 2: Per-row prevailing wind (upwind direction) ---
+    // Trade winds (|lat|<30°): from east  → upwind = +x
+    // Westerlies (30-60°):     from west  → upwind = −x
+    // Polar easterlies (>60°): from east  → upwind = +x
+    // (Peixoto & Oort, 1992)
+    let wind_noise_seed = hash_u32(seed ^ 0xF1AD_D120);
+    let mut upwind_dx = vec![0.0_f32; h];
+    let mut upwind_dy = vec![0.0_f32; h];
+    for y in 0..h {
+        let lat_deg = cell_cache.lat_deg[y * w];
+        let abs_lat = lat_deg.abs();
+        let zonal = if abs_lat < 25.0 {
+            1.0_f32 // trades: upwind = east
+        } else if abs_lat < 35.0 {
+            1.0 - 2.0 * (abs_lat - 25.0) / 10.0 // smooth +1 → −1
+        } else if abs_lat < 55.0 {
+            -1.0 // westerlies: upwind = west
+        } else if abs_lat < 65.0 {
+            -1.0 + 2.0 * (abs_lat - 55.0) / 10.0 // smooth −1 → +1
+        } else {
+            1.0 // polar easterlies
+        };
+        // Small Coriolis meridional deflection (NH right, SH left)
+        let meridional = if lat_deg > 0.0 { 0.2 } else { -0.2 };
+        let noise = value_noise3(0.0, y as f32 / h as f32 * 4.0, 0.5, wind_noise_seed) * 0.2;
+        let angle = zonal.atan2(meridional) + noise;
+        upwind_dx[y] = angle.cos();
+        upwind_dy[y] = angle.sin();
+    }
 
-        min_temp = min_temp.min(temperature[i]);
-        max_temp = max_temp.max(temperature[i]);
-        min_prec = min_prec.min(precip);
-        max_prec = max_prec.max(precip);
+    // --- Step 3: Windward moisture path ---
+    // Trace upwind from each land cell; exponential moisture decay from coast.
+    let decay_rate = 0.02 * (grid.km_per_cell_x / 20.0); // normalize to ~20 km cells
+    let mut windward_moisture = vec![0.0_f32; size];
+    for y in 0..h {
+        let udx = upwind_dx[y];
+        let udy = upwind_dy[y];
+        for x in 0..w {
+            let i = y * w + x;
+            if heights[i] <= 0.0 { continue; }
+            let mut land_dist = 0.0_f32;
+            for d in 1..=windward_max_steps {
+                let sy = (y as i32 + (udy * d as f32) as i32).clamp(0, h_i32 - 1) as usize;
+                let sx = if grid.is_spherical {
+                    ((((x as i32 + (udx * d as f32) as i32) % w_i32) + w_i32) % w_i32) as usize
+                } else {
+                    (x as i32 + (udx * d as f32) as i32).clamp(0, w_i32 - 1) as usize
+                };
+                if heights[sy * w + sx] <= 0.0 { break; }
+                land_dist += 1.0;
+            }
+            let fx = x as f32 / w as f32;
+            let fy = y as f32 / h as f32;
+            let pn = value_noise3(fx * 6.0, fy * 6.0, 0.3, path_noise_seed) * 15.0;
+            let eff_dist = (land_dist + pn).max(0.0);
+            windward_moisture[i] = 600.0 * (-eff_dist * decay_rate).exp();
+        }
+    }
+    progress.phase(progress_base, progress_span, 0.45);
+
+    // --- Step 4: Cumulative rain shadow ---
+    // Scan upwind, find max terrain height; shadow = factor × (max_upwind − local).
+    // 0.40: a 2000 m range casts ~800 mm shadow (Smith, 1979).
+    let mut cumulative_shadow = vec![0.0_f32; size];
+    for y in 0..h {
+        let udx = upwind_dx[y];
+        let udy = upwind_dy[y];
+        for x in 0..w {
+            let i = y * w + x;
+            let h_here = heights[i].max(0.0);
+            let mut h_max_upwind = 0.0_f32;
+            for d in 1..=shadow_max_steps {
+                let sy = (y as i32 + (udy * d as f32) as i32).clamp(0, h_i32 - 1) as usize;
+                let sx = if grid.is_spherical {
+                    ((((x as i32 + (udx * d as f32) as i32) % w_i32) + w_i32) % w_i32) as usize
+                } else {
+                    (x as i32 + (udx * d as f32) as i32).clamp(0, w_i32 - 1) as usize
+                };
+                let sh = heights[sy * w + sx].max(0.0);
+                if sh > h_max_upwind { h_max_upwind = sh; }
+            }
+            cumulative_shadow[i] = (h_max_upwind - h_here).max(0.0) * 0.40;
+        }
+    }
+    progress.phase(progress_base, progress_span, 0.75);
+
+    // --- Step 5: Temperature and precipitation per cell ---
+    let mut min_temp = f32::MAX;
+    let mut max_temp = f32::MIN;
+    let mut min_prec = f32::MAX;
+    let mut max_prec = f32::MIN;
+
+    for y in 0..h {
+        let udx = upwind_dx[y];
+        let udy = upwind_dy[y];
+        if y % 64 == 0 {
+            progress.phase(progress_base, progress_span, 0.75 + 0.25 * y as f32 / h as f32);
+        }
+        for x in 0..w {
+            let i = y * w + x;
+            let elev = heights[i];
+            let abs_lat = cell_cache.lat_deg[i].abs();
+            let fx = x as f32 / w as f32;
+            let fy = y as f32 / h as f32;
+
+            // ---- Temperature ----
+            // Sea-level base: quadratic fit to zonal-mean Earth data
+            //   28°C at equator, −31°C at poles (matches observations)
+            let t_sea = 28.0 - 0.007 * abs_lat * abs_lat;
+            let h_m = elev.max(0.0);
+            let lapse = h_m * lapse_rate;
+            let ocean_mod = if elev <= 0.0 { 2.0 } else { 0.0 };
+            let tn = value_noise3(
+                fx * 7.0 + 4.0, fy * 7.0 - 6.0,
+                seed as f32 * 0.000_21, temp_seed,
+            );
+            // Greenhouse effect from atmosphere (Earth = 1 bar → ~+5°C above baseline)
+            let atm = 5.0 * planet.atmosphere_bar.max(0.01).ln_1p();
+            let temp = t_sea - lapse + ocean_mod + tn * 2.0 + atm - aerosol * 5.0;
+            temperature[i] = temp.clamp(-70.0, 55.0);
+
+            // ---- Precipitation ----
+            // Hadley cell zonal base (Held & Hou, 1980)
+            let hadley = if abs_lat < 10.0 {
+                2000.0 // ITCZ: deep convection
+            } else if abs_lat < 20.0 {
+                2000.0 - (abs_lat - 10.0) / 10.0 * 1400.0
+            } else if abs_lat < 35.0 {
+                600.0 - (abs_lat - 20.0) / 15.0 * 350.0 // subtropical high (desert belt)
+            } else if abs_lat < 50.0 {
+                250.0 + (abs_lat - 35.0) / 15.0 * 650.0 // westerly storm track
+            } else if abs_lat < 70.0 {
+                900.0 - (abs_lat - 50.0) / 20.0 * 500.0
+            } else {
+                400.0 - ((abs_lat - 70.0) / 20.0).min(1.0) * 250.0 // polar desert
+            };
+
+            let windward = windward_moisture[i];
+            let coastal = coastal_exposure[i] * 600.0;
+
+            // Local orographic lift: compare with 5 cells upwind
+            let upw_d = 5_i32;
+            let uy = (y as i32 + (udy * upw_d as f32) as i32).clamp(0, h_i32 - 1) as usize;
+            let ux = if grid.is_spherical {
+                ((((x as i32 + (udx * upw_d as f32) as i32) % w_i32) + w_i32) % w_i32) as usize
+            } else {
+                (x as i32 + (udx * upw_d as f32) as i32).clamp(0, w_i32 - 1) as usize
+            };
+            let h_upwind = heights[uy * w + ux].max(0.0);
+            let orographic = (h_m - h_upwind).max(0.0) * 0.8;
+
+            let shadow = cumulative_shadow[i];
+
+            // Clausius-Clapeyron: cold air holds less moisture
+            let alt_factor = (1.0 - h_m * 0.00025).max(0.2);
+
+            let pn = value_noise3(
+                fx * 8.6 + 11.0, fy * 8.6 - 3.5,
+                seed as f32 * 0.000_13, precip_seed,
+            );
+
+            // Atmosphere moisture scaling
+            let atm_factor = planet.atmosphere_bar.max(0.01).sqrt();
+
+            let p = if elev <= 0.0 {
+                // Ocean: zonal base only (for biome classification of seafloor is N/A)
+                hadley * atm_factor
+            } else {
+                let raw = (hadley + windward + coastal + orographic - shadow)
+                    * alt_factor
+                    + pn * 60.0;
+                (raw * atm_factor - aerosol * 200.0).clamp(20.0, 4500.0)
+            };
+            precipitation[i] = p;
+
+            min_temp = min_temp.min(temperature[i]);
+            max_temp = max_temp.max(temperature[i]);
+            min_prec = min_prec.min(precipitation[i]);
+            max_prec = max_prec.max(precipitation[i]);
+        }
     }
     progress.phase(progress_base, progress_span, 1.0);
 
-    (
-        temperature,
-        precipitation,
-        min_temp,
-        max_temp,
-        min_prec,
-        max_prec,
-    )
-}
-
-#[inline]
-fn classify_biome(temp: f32, precip: f32, height: f32) -> u8 {
-    if height < 0.0 {
-        return 0;
-    }
-    if temp < -5.0 {
-        return 1;
-    }
-    if precip > 1600.0 && temp >= 5.0 && temp < 22.0 {
-        return 2;
-    }
-    if temp > 12.0 && precip > 900.0 {
-        return 3;
-    }
-    if temp > 24.0 && precip > 500.0 && precip <= 1400.0 {
-        return 4;
-    }
-    if precip < 400.0 && temp > 18.0 {
-        return 5;
-    }
-    if precip > 700.0 && temp > 5.0 && temp < 22.0 {
-        return 6;
-    }
-    if height > 1800.0 {
-        return 7;
-    }
-    8
-}
-
-fn compute_biomes(temperature: &[f32], precipitation: &[f32], heights: &[f32]) -> Vec<u8> {
-    let mut biomes = vec![0_u8; WORLD_SIZE];
-    for i in 0..WORLD_SIZE {
-        biomes[i] = classify_biome(temperature[i], precipitation[i], heights[i]);
-    }
-    biomes
+    (temperature, precipitation, min_temp, max_temp, min_prec, max_prec)
 }
 
 fn compute_settlement(
@@ -5399,242 +2711,6 @@ fn carve_fluvial_valleys_grid(
     progress.phase(progress_base, progress_span, 1.0);
 }
 
-#[allow(dead_code)]
-fn compute_climate_grid(
-    planet: &PlanetInputs,
-    heights: &[f32],
-    slope: &[f32],
-    river_map: &[f32],
-    flow_accumulation: &[f32],
-    coastal_exposure: &[f32],
-    width: usize,
-    height: usize,
-    seed: u32,
-    progress: &mut ProgressTap<'_>,
-    progress_base: f32,
-    progress_span: f32,
-) -> (Vec<f32>, Vec<f32>, f32, f32, f32, f32) {
-    let mut temperature = vec![0.0_f32; heights.len()];
-    let mut precipitation = vec![0.0_f32; heights.len()];
-    let mut min_temp = f32::INFINITY;
-    let mut max_temp = -f32::INFINITY;
-    let mut min_prec = f32::INFINITY;
-    let mut max_prec = -f32::INFINITY;
-
-    let temp_seed = hash_u32(seed ^ 0x71F1_2A8B);
-    let precip_seed = hash_u32(seed ^ 0x92E5_14C3);
-
-    for y in 0..height {
-        progress.phase(progress_base, progress_span, y as f32 / height as f32);
-        let lat = ((y as f32 + 0.5) / height as f32 - 0.5).abs() * 2.0;
-        for x in 0..width {
-            let i = grid_index(x, y, width);
-            let h = heights[i].max(0.0);
-            let uvx = x as f32 / width as f32;
-            let uvy = y as f32 / height as f32;
-
-            let temp_noise = value_noise3(
-                uvx * 7.2 + 4.0,
-                uvy * 7.2 - 6.0,
-                seed as f32 * 0.000_21,
-                temp_seed,
-            );
-            let precip_noise = value_noise3(
-                uvx * 8.6 - 9.0,
-                uvy * 8.6 + 7.0,
-                seed as f32 * 0.000_31,
-                precip_seed,
-            );
-
-            let base_temp = 25.0
-                - lat * (9.0 + planet.axial_tilt_deg * 0.09)
-                - h * (0.0054 + 0.00008 * planet.gravity);
-            let ocean_inertia = if heights[i] <= 0.0 { 1.6 } else { 0.0 };
-            let t = base_temp + temp_noise * 2.2 + ocean_inertia;
-            temperature[i] = t;
-            min_temp = min_temp.min(t);
-            max_temp = max_temp.max(t);
-
-            let west = heights[grid_index_clamped(
-                x as i32 - 1,
-                y as i32,
-                width,
-                height,
-            )]
-            .max(0.0);
-            let east = heights[grid_index_clamped(
-                x as i32 + 1,
-                y as i32,
-                width,
-                height,
-            )]
-            .max(0.0);
-            let uplift = (h - west).max(0.0);
-            let rain_shadow = (west - h).max(0.0) + 0.35 * (east - h).max(0.0);
-            let acc_term = (flow_accumulation[i].ln_1p() / 8.0).clamp(0.0, 1.0);
-            let slope_term = slope[i] / (slope[i] + 80.0);
-
-            let p = 340.0
-                + coastal_exposure[i] * 980.0
-                + river_map[i] * 540.0
-                + acc_term * 240.0
-                + uplift * 0.24
-                - rain_shadow * 0.2
-                + slope_term * 60.0
-                + (precip_noise * 0.5 + 0.5) * 190.0
-                - h * 0.047
-                + (planet.atmosphere_bar - 1.0) * 130.0;
-
-            let precip = clampf(p, 65.0, 3600.0);
-            precipitation[i] = precip;
-            min_prec = min_prec.min(precip);
-            max_prec = max_prec.max(precip);
-        }
-    }
-
-    (
-        temperature,
-        precipitation,
-        min_temp,
-        max_temp,
-        min_prec,
-        max_prec,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Science-based island climate: no river→precipitation backwards causality
-// ---------------------------------------------------------------------------
-
-/// Compute island climate without using river_map for precipitation.
-/// Temperature uses standard lapse rate (5.4 K/km).
-/// Precipitation uses Hadley cells + orographic + coastal moisture.
-fn compute_island_climate(
-    planet: &PlanetInputs,
-    heights: &[f32],
-    slope: &[f32],
-    grid: &GridConfig,
-    seed: u32,
-    progress: &mut ProgressTap<'_>,
-    progress_base: f32,
-    progress_span: f32,
-) -> (Vec<f32>, Vec<f32>, f32, f32, f32, f32) {
-    let size = grid.size;
-    let width = grid.width;
-    let height = grid.height;
-
-    let mut temperature = vec![0.0_f32; size];
-    let mut precipitation = vec![0.0_f32; size];
-
-    let temp_seed = hash_u32(seed ^ 0xC11_A7E0);
-    let precip_seed = hash_u32(seed ^ 0xD0CC_EE01);
-
-    // Prevailing wind direction (seed-derived, biased westerly)
-    let wind_angle = std::f32::consts::PI + (hash_u32(seed ^ 0xF1AD) % 100) as f32 * 0.006 - 0.3;
-    let wind_dx = wind_angle.cos();
-    let wind_dy = wind_angle.sin();
-    let wind_sample_dist = 5_i32; // cells upwind to sample
-
-    // Coastal exposure: 7×7 kernel counting ocean cells
-    let mut coastal_exposure = vec![0.0_f32; size];
-    {
-        let radius = 3_i32;
-        let max_count = ((2 * radius + 1) * (2 * radius + 1)) as f32;
-        for y in 0..height {
-            for x in 0..width {
-                let i = y * width + x;
-                let mut ocean_count = 0_u32;
-                for oy in -radius..=radius {
-                    for ox in -radius..=radius {
-                        let nx = (x as i32 + ox).clamp(0, width as i32 - 1) as usize;
-                        let ny = (y as i32 + oy).clamp(0, height as i32 - 1) as usize;
-                        if heights[ny * width + nx] <= 0.0 { ocean_count += 1; }
-                    }
-                }
-                coastal_exposure[i] = ocean_count as f32 / max_count;
-            }
-        }
-    }
-
-    let mut min_temp = f32::MAX;
-    let mut max_temp = f32::MIN;
-    let mut min_prec = f32::MAX;
-    let mut max_prec = f32::MIN;
-
-    for y in 0..height {
-        for x in 0..width {
-            let i = y * width + x;
-            let h = heights[i].max(0.0);
-            let fx = x as f32 / width as f32;
-            let fy = y as f32 / height as f32;
-
-            // --- Temperature: standard lapse rate model ---
-            let lat = (fy - 0.5).abs() * 2.0; // 0 at equator, 1 at pole
-            let tilt_term = 9.0 + planet.axial_tilt_deg * 0.09;
-            let lapse = 0.0054 + 0.00008 * planet.gravity;
-            let temp_noise = value_noise3(
-                fx * 7.2 + 4.0, fy * 7.2 - 6.0,
-                seed as f32 * 0.000_21, temp_seed,
-            );
-            let ocean_inertia = if heights[i] <= 0.0 { 1.6 } else { 0.0 };
-            let t = 25.0 - lat * tilt_term - h * lapse + temp_noise * 2.2 + ocean_inertia;
-            temperature[i] = t;
-            if t < min_temp { min_temp = t; }
-            if t > max_temp { max_temp = t; }
-
-            // --- Precipitation: Hadley + orographic + coastal ---
-
-            // 1. Hadley cell base precipitation from latitude
-            let hadley = if lat < 0.15 {
-                1600.0 // ITCZ
-            } else if lat < 0.30 {
-                1600.0 - (lat - 0.15) / 0.15 * 1100.0 // transition
-            } else if lat < 0.45 {
-                500.0 // subtropical high (desert belt)
-            } else if lat < 0.65 {
-                500.0 + (lat - 0.45) / 0.20 * 400.0 // mid-latitude westerlies
-            } else if lat < 0.85 {
-                900.0 - (lat - 0.65) / 0.20 * 400.0 // subpolar
-            } else {
-                500.0 // polar
-            };
-
-            // 2. Coastal moisture source
-            let coastal = coastal_exposure[i] * 600.0;
-
-            // 3. Orographic effect: compare height with upwind cell
-            let ux = (x as i32 - (wind_dx * wind_sample_dist as f32) as i32)
-                .clamp(0, width as i32 - 1) as usize;
-            let uy = (y as i32 - (wind_dy * wind_sample_dist as f32) as i32)
-                .clamp(0, height as i32 - 1) as usize;
-            let h_upwind = heights[uy * width + ux].max(0.0);
-            let orographic = (h - h_upwind).max(0.0) * 0.35;
-            let rain_shadow = (h_upwind - h).max(0.0) * 0.25;
-
-            // 4. Altitude reduction (cold air holds less moisture)
-            let altitude_factor = (1.0 - h * 0.00025).max(0.2);
-
-            // 5. Small noise
-            let pn = value_noise3(
-                fx * 8.6 + 11.0, fy * 8.6 - 3.5,
-                seed as f32 * 0.000_13, precip_seed,
-            );
-
-            let p = (hadley + coastal + orographic - rain_shadow)
-                    * altitude_factor
-                    + pn * 80.0;
-            let p = p.clamp(65.0, 3600.0);
-            precipitation[i] = p;
-            if p < min_prec { min_prec = p; }
-            if p > max_prec { max_prec = p; }
-        }
-    }
-
-    progress.phase(progress_base, progress_span, 1.0);
-
-    (temperature, precipitation, min_temp, max_temp, min_prec, max_prec)
-}
-
 // ---------------------------------------------------------------------------
 // Whittaker biome classification: 12 biomes, nearest-centroid in (T, P) space
 // ---------------------------------------------------------------------------
@@ -5643,7 +2719,7 @@ fn compute_island_climate(
 /// Uses nearest-centroid in normalized (T/15°C, P/500mm) space.
 fn classify_biome_whittaker(temp: f32, precip: f32, height: f32) -> u8 {
     if height < 0.0 { return 0; } // ocean
-    if height > 2500.0 { return 10; } // alpine (altitude override)
+    // Alpine override moved to compute_biomes_grid (noise-modulated treeline)
     if temp < -5.0 { return 1; } // tundra/ice (extreme cold)
 
     // Biome centroids: (temperature °C, precipitation mm/yr)
@@ -5677,10 +2753,42 @@ fn classify_biome_whittaker(temp: f32, precip: f32, height: f32) -> u8 {
     best_id
 }
 
-fn compute_biomes_grid(temperature: &[f32], precipitation: &[f32], heights: &[f32]) -> Vec<u8> {
-    let mut biomes = vec![0_u8; heights.len()];
-    for i in 0..heights.len() {
-        biomes[i] = classify_biome_whittaker(temperature[i], precipitation[i], heights[i]);
+fn compute_biomes_grid(
+    temperature: &[f32],
+    precipitation: &[f32],
+    heights: &[f32],
+    width: usize,
+    seed: u32,
+    river_map: &[f32],
+) -> Vec<u8> {
+    let alpine_seed = hash_u32(seed ^ 0xA1F1_E000);
+    let size = heights.len();
+    let height_grid = size / width;
+    let mut biomes = vec![0_u8; size];
+    for i in 0..size {
+        let mut biome = classify_biome_whittaker(temperature[i], precipitation[i], heights[i]);
+        // Soft Alpine transition: noise-modulated threshold (1700-2300m)
+        // instead of a hard 2000m cutoff, creating irregular treeline.
+        if heights[i] > 1700.0 && biome != 0 {
+            let x = i % width;
+            let y = i / width;
+            let fx = x as f32 / width as f32;
+            let fy = y as f32 / height_grid as f32;
+            let n = value_noise3(fx * 14.0, fy * 14.0, seed as f32 * 0.001, alpine_seed);
+            let threshold = 2000.0 + n * 300.0; // 1700 to 2300
+            if heights[i] > threshold { biome = 10; }
+        }
+        // Riparian vegetation: rivers support green corridors through dry
+        // biomes (Desert, Steppe, Mediterranean, Temp Grassland).
+        // This is a direct effect — rivers irrigate adjacent land — not a
+        // precipitation feedback (no reverse causality).
+        if river_map[i] > 0.12 && matches!(biome, 4 | 5 | 8 | 11) {
+            let t = temperature[i];
+            biome = if t > 20.0 { 7 }       // Tropical Savanna
+                    else if t > 12.0 { 9 }   // Subtropical Forest
+                    else { 3 };               // Temperate Forest
+        }
+        biomes[i] = biome;
     }
     biomes
 }
@@ -5874,16 +2982,10 @@ fn stream_power_evolve(
 }
 
 
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Phase NEW: Science-based geological province model
-// ---------------------------------------------------------------------------
-
 /// Rock type determines erodibility (K_eff) for stream power erosion.
 /// Values from Harel et al. (2016) global erodibility analysis.
 #[derive(Clone, Copy, PartialEq)]
 enum RockType {
-    Dolerite,    // Resistant sill/dyke (Tasmania plateau cap)
     Granite,     // Intrusive igneous
     Quartzite,   // Metamorphic, resistant
     Basalt,      // Volcanic, moderate
@@ -5893,11 +2995,10 @@ enum RockType {
 }
 
 impl RockType {
-    /// Base erodibility K in m^{0.5}/yr.  Range spans ~8× from most resistant
-    /// (dolerite) to least resistant (limestone).
+    /// Base erodibility K in m^{0.5}/yr.  Range spans ~8x from most resistant
+    /// (granite) to least resistant (limestone).
     fn k_eff(self) -> f32 {
         match self {
-            RockType::Dolerite  => 0.4e-6,
             RockType::Granite   => 0.5e-6,
             RockType::Quartzite => 0.8e-6,
             RockType::Basalt    => 1.0e-6,
@@ -5908,1037 +3009,6 @@ impl RockType {
     }
 }
 
-/// Geological epoch type — controls the uplift pattern during evolution.
-#[derive(Clone, Copy, PartialEq)]
-enum EpochType {
-    /// Compressional mountain-building: anisotropic uplift along fold axis.
-    Orogeny,
-    /// Magmatic intrusion: circular/elliptical dome uplift, lowers K_eff locally.
-    Intrusion,
-    /// Extensional tectonics: asymmetric shoulder uplift + rift-side subsidence.
-    Rifting,
-    /// Volcanic construction: conical/shield uplift at discrete centres.
-    Volcanism,
-    /// Tectonic quiescence: zero uplift, pure erosion sculpts the landscape.
-    Quiescence,
-}
-
-/// A geological province — a region of uniform rock type and structural grain.
-#[derive(Clone)]
-struct GeoProvince {
-    center_x: f32,
-    center_y: f32,
-    rock_type: RockType,
-    base_crust_km: f32,
-    fold_axis_angle: f32,   // radians — structural grain direction
-    age_myr: f32,
-}
-
-/// One epoch in the geological history of an island.
-#[derive(Clone)]
-struct GeologicalEpoch {
-    epoch_type: EpochType,
-    dt_yr: f32,
-    n_steps: usize,
-    uplift_scale: f32,
-    active_provinces: Vec<usize>,
-}
-
-/// Full geological context for island generation.
-struct IslandGeoContext {
-    provinces: Vec<GeoProvince>,
-    province_map: Vec<u8>,
-    k_eff_map: Vec<f32>,
-    crust_thickness: Vec<f32>,
-    epochs: Vec<GeologicalEpoch>,
-}
-
-// ---------------------------------------------------------------------------
-// Island tectonic type enum
-// ---------------------------------------------------------------------------
-
-/// Island tectonic type — controls geological province configuration.
-#[derive(Clone, Copy, PartialEq)]
-enum IslandType {
-    /// Continental fragment (Tasmania-like): mixed transform + divergent boundaries.
-    Continental,
-    /// Convergent arc (Japan-like): subduction with back-arc basin.
-    Arc,
-    /// Hot-spot volcanic shield (Hawaii-like): single plate, central uplift.
-    Hotspot,
-    /// Rift shoulder (Corsica-like): asymmetric divergent boundary.
-    Rift,
-}
-
-/// Generate geological provinces for island scope.  Each province has a rock
-/// type, crustal thickness, and structural grain.  Province boundaries become
-/// the natural locations for faults, bays, and headlands.
-fn generate_geological_provinces(
-    seed: u32,
-    island_type: IslandType,
-    grid: &GridConfig,
-    _params: &TectonicInputs,
-) -> IslandGeoContext {
-    let mut rng = Rng::new(seed ^ 0xAE01_0B0F);
-
-    // --- 1. Determine number of provinces ---
-    let n_prov: usize = match island_type {
-        IslandType::Continental => 4 + (rng.next_f32() * 3.0) as usize, // 4-6
-        IslandType::Arc         => 3 + (rng.next_f32() * 2.0) as usize, // 3-4
-        IslandType::Hotspot     => 2 + (rng.next_f32() * 2.0) as usize, // 2-3
-        IslandType::Rift        => 3 + (rng.next_f32() * 3.0) as usize, // 3-5
-    };
-
-    // --- 2. Place Voronoi seeds within central 70% of grid ---
-    let margin_x = grid.width as f32 * 0.15;
-    let margin_y = grid.height as f32 * 0.15;
-    let span_x = grid.width as f32 - 2.0 * margin_x;
-    let span_y = grid.height as f32 - 2.0 * margin_y;
-
-    // Base structural grain angle (seed-derived)
-    let base_angle: f32 = (rng.next_f32() - 0.5) * std::f32::consts::PI * 0.6; // ±54°
-
-    // Rock type distributions per island type
-    let rock_weights: &[(RockType, f32)] = match island_type {
-        IslandType::Continental => &[
-            (RockType::Granite, 0.25), (RockType::Quartzite, 0.15),
-            (RockType::Dolerite, 0.15), (RockType::Sandstone, 0.20),
-            (RockType::Schist, 0.10), (RockType::Basalt, 0.05),
-            (RockType::Limestone, 0.10),
-        ],
-        IslandType::Arc => &[
-            (RockType::Basalt, 0.35), (RockType::Granite, 0.20),
-            (RockType::Schist, 0.15), (RockType::Sandstone, 0.15),
-            (RockType::Limestone, 0.15),
-        ],
-        IslandType::Hotspot => &[
-            (RockType::Basalt, 0.60), (RockType::Granite, 0.20),
-            (RockType::Sandstone, 0.20),
-        ],
-        IslandType::Rift => &[
-            (RockType::Granite, 0.25), (RockType::Sandstone, 0.25),
-            (RockType::Schist, 0.15), (RockType::Quartzite, 0.15),
-            (RockType::Basalt, 0.10), (RockType::Limestone, 0.10),
-        ],
-    };
-
-    let pick_rock = |rng: &mut Rng| -> RockType {
-        let r = rng.next_f32();
-        let mut acc = 0.0_f32;
-        for &(rt, w) in rock_weights {
-            acc += w;
-            if r < acc { return rt; }
-        }
-        rock_weights.last().unwrap().0
-    };
-
-    let mut provinces = Vec::with_capacity(n_prov);
-    for _ in 0..n_prov {
-        let cx = margin_x + rng.next_f32() * span_x;
-        let cy = margin_y + rng.next_f32() * span_y;
-        let rock = pick_rock(&mut rng);
-        let crust = match island_type {
-            IslandType::Continental => 30.0 + rng.next_f32() * 12.0, // 30-42 km
-            IslandType::Arc         => 15.0 + rng.next_f32() * 20.0, // 15-35 km
-            IslandType::Hotspot     => 8.0  + rng.next_f32() * 12.0, // 8-20 km
-            IslandType::Rift        => 25.0 + rng.next_f32() * 15.0, // 25-40 km
-        };
-        let angle = base_angle + (rng.next_f32() - 0.5) * 0.52; // ±15°
-        let age = 50.0 + rng.next_f32() * 450.0; // 50-500 Myr
-
-        provinces.push(GeoProvince {
-            center_x: cx,
-            center_y: cy,
-            rock_type: rock,
-            base_crust_km: crust,
-            fold_axis_angle: angle,
-            age_myr: age,
-        });
-    }
-
-    // --- 3. Build province map (weighted Voronoi with noise) ---
-    let noise_seed = hash_u32(seed ^ 0xF0E0_A01E);
-    let mean_spacing = (span_x * span_y / n_prov as f32).sqrt();
-    let noise_amp = mean_spacing * 0.15; // 15% perturbation
-
-    let mut province_map = vec![0_u8; grid.size];
-    let mut crust_thickness = vec![35.0_f32; grid.size];
-
-    for y in 0..grid.height {
-        for x in 0..grid.width {
-            let i = grid.index(x, y);
-            let fx = x as f32 + 0.5;
-            let fy = y as f32 + 0.5;
-
-            // Noise perturbation on distance
-            let nx = value_noise3(
-                fx * 3.7 / grid.width as f32,
-                fy * 3.7 / grid.height as f32,
-                0.42, noise_seed,
-            ) * noise_amp;
-            let ny = value_noise3(
-                fx * 3.7 / grid.width as f32 + 7.3,
-                fy * 3.7 / grid.height as f32 - 4.1,
-                0.42, noise_seed ^ 0x1234,
-            ) * noise_amp;
-
-            let mut best_dist = f32::MAX;
-            let mut best_id = 0_u8;
-            for (pid, prov) in provinces.iter().enumerate() {
-                let dx = fx + nx - prov.center_x;
-                let dy = fy + ny - prov.center_y;
-                let d = dx * dx + dy * dy;
-                if d < best_dist {
-                    best_dist = d;
-                    best_id = pid as u8;
-                }
-            }
-            province_map[i] = best_id;
-            crust_thickness[i] = provinces[best_id as usize].base_crust_km;
-        }
-    }
-
-    // --- 4. Build K_eff map with boundary smoothing ---
-    let mut k_eff_map = vec![0.0_f32; grid.size];
-    for i in 0..grid.size {
-        k_eff_map[i] = provinces[province_map[i] as usize].rock_type.k_eff();
-    }
-
-    // 3-pass Gaussian blur to smooth K_eff across province boundaries
-    let mut scratch = vec![0.0_f32; grid.size];
-    for _ in 0..3 {
-        for y in 0..grid.height {
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let mut sum = k_eff_map[i] * 4.0;
-                let mut wt = 4.0_f32;
-                for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                    let nx = (x as i32 + dx).clamp(0, grid.width as i32 - 1) as usize;
-                    let ny = (y as i32 + dy).clamp(0, grid.height as i32 - 1) as usize;
-                    sum += k_eff_map[grid.index(nx, ny)];
-                    wt += 1.0;
-                }
-                scratch[i] = sum / wt;
-            }
-        }
-        k_eff_map.copy_from_slice(&scratch);
-    }
-
-    // --- 5. Generate epoch sequence ---
-    let epochs = match island_type {
-        IslandType::Continental => vec![
-            GeologicalEpoch { epoch_type: EpochType::Orogeny,    dt_yr: 100_000.0, n_steps: 6, uplift_scale: 1.0,  active_provinces: (0..n_prov).collect() },
-            GeologicalEpoch { epoch_type: EpochType::Intrusion,  dt_yr: 100_000.0, n_steps: 5, uplift_scale: 0.8,  active_provinces: vec![0, 1] },
-            GeologicalEpoch { epoch_type: EpochType::Quiescence, dt_yr: 100_000.0, n_steps: 5, uplift_scale: 0.0,  active_provinces: vec![] },
-            GeologicalEpoch { epoch_type: EpochType::Orogeny,    dt_yr: 100_000.0, n_steps: 5, uplift_scale: 0.6,  active_provinces: (0..n_prov/2).collect() },
-            GeologicalEpoch { epoch_type: EpochType::Quiescence, dt_yr: 100_000.0, n_steps: 4, uplift_scale: 0.0,  active_provinces: vec![] },
-        ],
-        IslandType::Arc => vec![
-            GeologicalEpoch { epoch_type: EpochType::Volcanism,  dt_yr: 100_000.0, n_steps: 6, uplift_scale: 1.2,  active_provinces: (0..n_prov).collect() },
-            GeologicalEpoch { epoch_type: EpochType::Orogeny,    dt_yr: 100_000.0, n_steps: 5, uplift_scale: 0.8,  active_provinces: (0..n_prov).collect() },
-            GeologicalEpoch { epoch_type: EpochType::Volcanism,  dt_yr: 100_000.0, n_steps: 5, uplift_scale: 1.0,  active_provinces: vec![0, 1] },
-            GeologicalEpoch { epoch_type: EpochType::Quiescence, dt_yr: 100_000.0, n_steps: 5, uplift_scale: 0.0,  active_provinces: vec![] },
-            GeologicalEpoch { epoch_type: EpochType::Volcanism,  dt_yr: 100_000.0, n_steps: 4, uplift_scale: 0.7,  active_provinces: vec![0] },
-        ],
-        IslandType::Hotspot => vec![
-            GeologicalEpoch { epoch_type: EpochType::Volcanism,  dt_yr: 100_000.0, n_steps: 7, uplift_scale: 1.5,  active_provinces: (0..n_prov).collect() },
-            GeologicalEpoch { epoch_type: EpochType::Volcanism,  dt_yr: 100_000.0, n_steps: 5, uplift_scale: 1.0,  active_provinces: vec![0] },
-            GeologicalEpoch { epoch_type: EpochType::Quiescence, dt_yr: 100_000.0, n_steps: 5, uplift_scale: 0.0,  active_provinces: vec![] },
-            GeologicalEpoch { epoch_type: EpochType::Quiescence, dt_yr: 100_000.0, n_steps: 4, uplift_scale: 0.0,  active_provinces: vec![] },
-            GeologicalEpoch { epoch_type: EpochType::Quiescence, dt_yr: 100_000.0, n_steps: 4, uplift_scale: 0.0,  active_provinces: vec![] },
-        ],
-        IslandType::Rift => vec![
-            GeologicalEpoch { epoch_type: EpochType::Rifting,    dt_yr: 100_000.0, n_steps: 6, uplift_scale: 1.0,  active_provinces: (0..n_prov).collect() },
-            GeologicalEpoch { epoch_type: EpochType::Quiescence, dt_yr: 100_000.0, n_steps: 5, uplift_scale: 0.0,  active_provinces: vec![] },
-            GeologicalEpoch { epoch_type: EpochType::Orogeny,    dt_yr: 100_000.0, n_steps: 5, uplift_scale: 0.7,  active_provinces: (0..n_prov/2).collect() },
-            GeologicalEpoch { epoch_type: EpochType::Quiescence, dt_yr: 100_000.0, n_steps: 5, uplift_scale: 0.0,  active_provinces: vec![] },
-            GeologicalEpoch { epoch_type: EpochType::Rifting,    dt_yr: 100_000.0, n_steps: 4, uplift_scale: 0.5,  active_provinces: (0..2.min(n_prov)).collect() },
-        ],
-    };
-
-    IslandGeoContext {
-        provinces,
-        province_map,
-        k_eff_map,
-        crust_thickness,
-        epochs,
-    }
-}
-
-/// Convert geological provinces into a `ComputePlatesResult` for output
-/// compatibility (plates_preview, boundary_types in WasmSimulationResult).
-fn generate_compat_plates_result(
-    ctx: &IslandGeoContext,
-    grid: &GridConfig,
-) -> ComputePlatesResult {
-    let size = grid.size;
-    let n_prov = ctx.provinces.len();
-
-    let mut plate_field = vec![0_i16; size];
-    let mut boundary_types = vec![0_i8; size];
-    let mut boundary_normal_x = vec![0.0_f32; size];
-    let mut boundary_normal_y = vec![0.0_f32; size];
-    let mut boundary_strength = vec![0.0_f32; size];
-
-    for i in 0..size {
-        plate_field[i] = ctx.province_map[i] as i16;
-    }
-
-    // Detect province boundaries: cells adjacent to a different province.
-    let bw = 3.0_f32; // boundary width in pixels
-    for y in 0..grid.height {
-        for x in 0..grid.width {
-            let i = grid.index(x, y);
-            let my_prov = ctx.province_map[i];
-            let mut is_boundary = false;
-            let mut sum_nx = 0.0_f32;
-            let mut sum_ny = 0.0_f32;
-
-            for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                let nx = x as i32 + dx;
-                let ny = y as i32 + dy;
-                if nx < 0 || nx >= grid.width as i32 || ny < 0 || ny >= grid.height as i32 {
-                    continue;
-                }
-                let j = grid.index(nx as usize, ny as usize);
-                if ctx.province_map[j] != my_prov {
-                    is_boundary = true;
-                    sum_nx += dx as f32;
-                    sum_ny += dy as f32;
-                }
-            }
-
-            if is_boundary {
-                let len = (sum_nx * sum_nx + sum_ny * sum_ny).sqrt().max(1e-6);
-                boundary_normal_x[i] = sum_nx / len;
-                boundary_normal_y[i] = sum_ny / len;
-                boundary_strength[i] = 1.0;
-                boundary_types[i] = 2; // divergent (default for province contacts)
-            }
-        }
-    }
-
-    // Diffuse boundary_strength outward (exponential decay from contacts)
-    let mut bs_scratch = vec![0.0_f32; size];
-    for _ in 0..5 {
-        for y in 0..grid.height {
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let mut mx = boundary_strength[i];
-                for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                    let nx = (x as i32 + dx).clamp(0, grid.width as i32 - 1) as usize;
-                    let ny = (y as i32 + dy).clamp(0, grid.height as i32 - 1) as usize;
-                    let v = boundary_strength[grid.index(nx, ny)] * 0.7;
-                    if v > mx { mx = v; }
-                }
-                bs_scratch[i] = mx;
-            }
-        }
-        boundary_strength.copy_from_slice(&bs_scratch);
-    }
-
-    // Plate vectors: one per province, minimal data for output.
-    let base_speed = 5.0_f32; // cm/yr
-    let plate_vectors: Vec<PlateVector> = ctx.provinces.iter().map(|p| {
-        PlateVector {
-            speed: base_speed,
-            omega_x: 0.0,
-            omega_y: 0.0,
-            omega_z: 0.01,
-            heat: 55.0,
-            buoyancy: if p.base_crust_km > 20.0 { 0.5 } else { -0.3 },
-        }
-    }).collect();
-
-    ComputePlatesResult {
-        plate_field,
-        boundary_types,
-        boundary_normal_x,
-        boundary_normal_y,
-        boundary_strength,
-        plate_vectors,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Multi-epoch uplift + K_eff generation
-// ---------------------------------------------------------------------------
-
-/// Generate per-cell uplift field (m/yr) for a geological epoch.
-/// Each EpochType produces a physically motivated spatial pattern:
-///   Orogeny:    anisotropic Gaussian along fold axes (elongated mountain ranges)
-///   Intrusion:  circular domes at province centres
-///   Rifting:    exponential shoulder uplift + rift-side subsidence
-///   Volcanism:  conical/shield centres in active provinces
-///   Quiescence: zero uplift (pure erosion)
-fn generate_epoch_uplift(
-    epoch: &GeologicalEpoch,
-    ctx: &IslandGeoContext,
-    grid: &GridConfig,
-    seed: u32,
-    epoch_index: usize,
-) -> Vec<f32> {
-    let mut uplift = vec![0.0_f32; grid.size];
-    let base_speed_m_yr = 0.05; // 5 cm/yr in m/yr
-    let epoch_seed = hash_u32(seed ^ (epoch_index as u32 * 7919));
-    let mut rng = Rng::new(epoch_seed);
-
-    let scale = epoch.uplift_scale;
-    if scale <= 0.0 {
-        return uplift; // quiescence — zero uplift
-    }
-
-    let w = grid.width as f32;
-    let h = grid.height as f32;
-    let km_per_cell = grid.km_per_cell_x;
-
-    match epoch.epoch_type {
-        EpochType::Orogeny => {
-            // Anisotropic uplift along fold axis of each active province.
-            // Mountains are elongated (sigma_along >> sigma_perp).
-            let u_max = base_speed_m_yr * 0.06 * scale; // ~3 mm/yr peak
-
-            for &pid in &epoch.active_provinces {
-                if pid >= ctx.provinces.len() { continue; }
-                let prov = &ctx.provinces[pid];
-                let cx = prov.center_x;
-                let cy = prov.center_y;
-                let angle = prov.fold_axis_angle;
-                let cos_a = angle.cos();
-                let sin_a = angle.sin();
-
-                // Province extent: estimate from Voronoi cell size
-                let prov_radius = (w * h / ctx.provinces.len() as f32).sqrt() * 0.5;
-                let sigma_perp = prov_radius * 0.35 * km_per_cell;  // narrow
-                let sigma_along = prov_radius * 1.5 * km_per_cell;  // elongated
-                let inv_perp2 = 1.0 / (2.0 * sigma_perp * sigma_perp);
-                let inv_along2 = 1.0 / (2.0 * sigma_along * sigma_along);
-
-                // Along-strike segmentation frequency
-                let seg_freq = (rng.next_f32() * 2.0 + 1.0) * std::f32::consts::PI
-                    / (prov_radius * km_per_cell);
-
-                for y in 0..grid.height {
-                    for x in 0..grid.width {
-                        let i = grid.index(x, y);
-                        if ctx.province_map[i] as usize != pid { continue; }
-                        let dx_km = (x as f32 + 0.5 - cx) * km_per_cell;
-                        let dy_km = (y as f32 + 0.5 - cy) * km_per_cell;
-                        // Rotate into fold-axis coordinates
-                        let d_perp  =  dx_km * cos_a + dy_km * sin_a;
-                        let d_along = -dx_km * sin_a + dy_km * cos_a;
-                        let env = (-d_perp * d_perp * inv_perp2
-                                   - d_along * d_along * inv_along2).exp();
-                        let segmentation = 0.7 + 0.3 * (d_along * seg_freq).sin();
-                        uplift[i] += u_max * env * segmentation;
-                    }
-                }
-            }
-        }
-
-        EpochType::Intrusion => {
-            // Circular domes at province centres.
-            let u_dome = base_speed_m_yr * 0.03 * scale; // ~1.5 mm/yr
-            for &pid in &epoch.active_provinces {
-                if pid >= ctx.provinces.len() { continue; }
-                let prov = &ctx.provinces[pid];
-                let cx = prov.center_x;
-                let cy = prov.center_y;
-                let prov_radius = (w * h / ctx.provinces.len() as f32).sqrt() * 0.5;
-                let sigma = prov_radius * 0.3 * km_per_cell;
-                let inv_s2 = 1.0 / (2.0 * sigma * sigma);
-
-                for y in 0..grid.height {
-                    for x in 0..grid.width {
-                        let i = grid.index(x, y);
-                        let dx_km = (x as f32 + 0.5 - cx) * km_per_cell;
-                        let dy_km = (y as f32 + 0.5 - cy) * km_per_cell;
-                        let r2 = dx_km * dx_km + dy_km * dy_km;
-                        uplift[i] += u_dome * (-r2 * inv_s2).exp();
-                    }
-                }
-            }
-        }
-
-        EpochType::Rifting => {
-            // Asymmetric rift: shoulder uplift on one side, subsidence on other.
-            let u_shoulder = base_speed_m_yr * 0.02 * scale; // ~1 mm/yr
-            // Rift axis = vertical line at ~35% of grid width (left-leaning)
-            let rift_x_frac = 0.30 + rng.next_f32() * 0.15;
-            let rift_x = w * rift_x_frac;
-            let lambda_km = w * km_per_cell * 0.25; // decay length
-
-            for y in 0..grid.height {
-                for x in 0..grid.width {
-                    let i = grid.index(x, y);
-                    let d_km = (x as f32 + 0.5 - rift_x) * km_per_cell;
-                    if d_km >= 0.0 {
-                        // East of rift: shoulder uplift (exponential decay)
-                        uplift[i] += u_shoulder * (-d_km / lambda_km).exp();
-                    } else {
-                        // West of rift: subsidence
-                        uplift[i] += u_shoulder * 0.3 * (d_km / (lambda_km * 1.5)).exp();
-                    }
-                }
-            }
-        }
-
-        EpochType::Volcanism => {
-            // 1-3 volcanic centres in active provinces.
-            let u_volcano = base_speed_m_yr * 0.10 * scale; // ~5 mm/yr
-            let n_centres = 1 + (rng.next_f32() * 2.0) as usize;
-
-            for c in 0..n_centres.min(epoch.active_provinces.len()) {
-                let pid = epoch.active_provinces[c % epoch.active_provinces.len()];
-                if pid >= ctx.provinces.len() { continue; }
-                let prov = &ctx.provinces[pid];
-                // Volcanic centre near province centre with jitter
-                let vx = prov.center_x + (rng.next_f32() - 0.5) * 30.0;
-                let vy = prov.center_y + (rng.next_f32() - 0.5) * 30.0;
-                let sigma_km = (20.0 + rng.next_f32() * 20.0); // 20-40 km
-                let sigma_px = sigma_km / km_per_cell;
-                let inv_s2 = 1.0 / (2.0 * sigma_px * sigma_px);
-
-                for y in 0..grid.height {
-                    for x in 0..grid.width {
-                        let i = grid.index(x, y);
-                        let dx = x as f32 + 0.5 - vx;
-                        let dy = y as f32 + 0.5 - vy;
-                        uplift[i] += u_volcano * (-(dx*dx + dy*dy) * inv_s2).exp();
-                    }
-                }
-            }
-        }
-
-        EpochType::Quiescence => {
-            // Already zero — nothing to do.
-        }
-    }
-
-    uplift
-}
-
-/// Generate per-cell K_eff for a geological epoch.  Rock type provides the
-/// base; province boundaries erode 1.5× faster; weathering accumulates.
-fn generate_epoch_k_eff(
-    ctx: &IslandGeoContext,
-    grid: &GridConfig,
-    epoch_index: usize,
-) -> Vec<f32> {
-    let mut k = ctx.k_eff_map.clone(); // base from rock type (already smoothed)
-
-    // Province-boundary weakening: contacts erode 1.5× faster.
-    for y in 0..grid.height {
-        for x in 0..grid.width {
-            let i = grid.index(x, y);
-            let my_prov = ctx.province_map[i];
-            let mut on_boundary = false;
-            for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                let nx = (x as i32 + dx).clamp(0, grid.width as i32 - 1) as usize;
-                let ny = (y as i32 + dy).clamp(0, grid.height as i32 - 1) as usize;
-                if ctx.province_map[grid.index(nx, ny)] != my_prov {
-                    on_boundary = true;
-                    break;
-                }
-            }
-            if on_boundary {
-                k[i] *= 1.5;
-            }
-        }
-    }
-
-    // Weathering accumulation: later epochs have higher effective K (more
-    // pre-existing fractures, deeper regolith from prior weathering).
-    let age_factor = 1.0 + 0.08 * epoch_index as f32;
-    for v in k.iter_mut() {
-        *v *= age_factor;
-    }
-
-    k
-}
-
-/// Generate initial island topography from isostatic elevation of crustal
-/// thickness — pure physics, no empirical formula.
-fn generate_initial_island_topography(
-    ctx: &IslandGeoContext,
-    grid: &GridConfig,
-    seed: u32,
-) -> Vec<f32> {
-    let noise_seed = hash_u32(seed ^ 0xCAFE_1234);
-    let mut relief = vec![0.0_f32; grid.size];
-
-    for y in 0..grid.height {
-        for x in 0..grid.width {
-            let i = grid.index(x, y);
-            let crust_km = ctx.crust_thickness[i];
-            let is_continental = crust_km > 20.0;
-            let base = isostatic_elevation(crust_km, is_continental, 0.1);
-
-            // Small noise for initial roughness
-            let fx = x as f32 / grid.width as f32;
-            let fy = y as f32 / grid.height as f32;
-            let noise = value_noise3(fx * 4.0, fy * 4.0, 0.77, noise_seed) * 50.0
-                      + value_noise3(fx * 9.0 + 3.0, fy * 9.0 - 2.0, 0.77, noise_seed ^ 0xBEEF) * 25.0;
-
-            // Province-boundary depression (fault zones start lower)
-            let my_prov = ctx.province_map[i];
-            let mut on_boundary = false;
-            for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                let nx = (x as i32 + dx).clamp(0, grid.width as i32 - 1) as usize;
-                let ny = (y as i32 + dy).clamp(0, grid.height as i32 - 1) as usize;
-                if ctx.province_map[grid.index(nx, ny)] != my_prov {
-                    on_boundary = true;
-                    break;
-                }
-            }
-            let boundary_dep = if on_boundary { -30.0 } else { 0.0 };
-
-            relief[i] = base + noise + boundary_dep;
-        }
-    }
-
-    relief
-}
-
-/// Run multi-epoch geological evolution.  Each epoch has its own uplift field
-/// and K_eff map.  Braun-Willett stream power evolves the relief progressively.
-fn run_geological_evolution(
-    relief: &mut [f32],
-    ctx: &IslandGeoContext,
-    grid: &GridConfig,
-    dx_m: f32,
-    seed: u32,
-    progress: &mut ProgressTap<'_>,
-    progress_base: f32,
-    progress_span: f32,
-) {
-    let total_steps: usize = ctx.epochs.iter().map(|e| e.n_steps).sum();
-    let mut steps_done: usize = 0;
-
-    for (epoch_idx, epoch) in ctx.epochs.iter().enumerate() {
-        // 1. Generate uplift + K_eff for this epoch
-        let mut uplift = generate_epoch_uplift(epoch, ctx, grid, seed, epoch_idx);
-        let k_eff = generate_epoch_k_eff(ctx, grid, epoch_idx);
-
-        // 2. Zero uplift on ocean cells (prevent resurrection of sunken fragments)
-        for i in 0..grid.size {
-            if relief[i] <= 0.0 { uplift[i] = 0.0; }
-        }
-
-        // 3. Run Braun-Willett stream power for this epoch's steps
-        let frac_before = steps_done as f32 / total_steps as f32;
-        let frac_span  = epoch.n_steps as f32 / total_steps as f32;
-        stream_power_evolve(
-            relief,
-            &uplift,
-            &k_eff,
-            epoch.dt_yr,
-            dx_m,
-            0.5,    // m: area exponent
-            1.0,    // n: slope exponent
-            0.08,   // kappa: hillslope diffusivity
-            epoch.n_steps,
-            grid,
-            progress,
-            progress_base + progress_span * frac_before,
-            progress_span * frac_span,
-        );
-
-        steps_done += epoch.n_steps;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// LEGACY: old island plate context (to be removed after full integration)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Island sea-level cutoff and island isolation
-// ---------------------------------------------------------------------------
-
-/// Enforce a deformed-ellipse island boundary after compute_relief.
-/// Shape the island by **sea-level cutoff**, not by geometric masking.
-///
-/// 1. Edge fade: smoothly push cells near grid boundaries to deep ocean
-///    so the island never touches the frame.  Noise on the fade margin
-///    prevents a rectangular look.
-/// 2. Find the height percentile that gives `target_land_frac` of cells
-///    above sea level, shift the whole field so that height == 0 at shore.
-///
-/// The coastline emerges from the tectonic relief itself: faults create
-/// bays, ridges create peninsulas.  No geometric shape is imposed.
-fn apply_island_sea_level(
-    relief: &mut [f32],
-    grid: &GridConfig,
-    target_land_frac: f32,
-    seed: u32,
-) {
-    let w = grid.width as f32;
-    let h = grid.height as f32;
-
-    // --- Step 1: find sea level for target land fraction --------------------
-    let size = grid.size;
-    let mut sorted: Vec<f32> = relief.to_vec();
-    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    let ocean_frac = (1.0 - target_land_frac).clamp(0.3, 0.95);
-    let cut_idx = ((size as f32 * ocean_frac) as usize).min(size - 1);
-    let sea_level = sorted[cut_idx];
-
-    for val in relief.iter_mut() {
-        *val -= sea_level;
-    }
-
-    // --- Step 2: edge fade AFTER cutoff — guarantees ocean at grid borders --
-    let fade_base = 0.12_f32; // 12 % of each edge
-    let fade_seed = hash_u32(seed ^ 0xFADE_B0CE);
-
-    for y in 0..grid.height {
-        for x in 0..grid.width {
-            let i = grid.index(x, y);
-            let fx = (x as f32 + 0.5) / w;
-            let fy = (y as f32 + 0.5) / h;
-
-            let edge = fx.min(1.0 - fx).min(fy).min(1.0 - fy);
-            let noise = value_noise3(fx * 5.5, fy * 5.5, 0.31, fade_seed) * 0.04;
-            let margin = (fade_base + noise).max(0.03);
-
-            if edge < margin {
-                let t = (edge / margin).clamp(0.0, 1.0);
-                let s = t * t * (3.0 - 2.0 * t); // smoothstep
-                // Force ocean at grid borders: positive → lerp toward -500
-                relief[i] = relief[i] * s - 500.0 * (1.0 - s);
-            }
-        }
-    }
-}
-
-/// After sea-level cutoff the terrain may contain many disconnected land
-/// fragments.  Keep only the single largest connected component (4-connected
-/// flood fill on land cells, h > 0) and sink everything else to shallow
-/// ocean.  Tiny offshore islets (< 0.5 % of the main island) are also sunk.
-fn keep_largest_island(relief: &mut [f32], grid: &GridConfig) {
-    let size = grid.size;
-    let mut comp_id = vec![-1_i32; size];
-    let mut comp_sizes: Vec<usize> = Vec::new();
-    let mut queue: Vec<usize> = Vec::with_capacity(size / 4);
-
-    for start in 0..size {
-        if relief[start] <= 0.0 || comp_id[start] >= 0 {
-            continue;
-        }
-        let cid = comp_sizes.len() as i32;
-        let mut count = 0_usize;
-        queue.clear();
-        queue.push(start);
-        comp_id[start] = cid;
-
-        while let Some(idx) = queue.pop() {
-            count += 1;
-            let x = (idx % grid.width) as i32;
-            let y = (idx / grid.width) as i32;
-            for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                let nx = x + dx;
-                let ny = y + dy;
-                if nx < 0 || nx >= grid.width as i32 || ny < 0 || ny >= grid.height as i32 {
-                    continue;
-                }
-                let j = ny as usize * grid.width + nx as usize;
-                if relief[j] > 0.0 && comp_id[j] < 0 {
-                    comp_id[j] = cid;
-                    queue.push(j);
-                }
-            }
-        }
-        comp_sizes.push(count);
-    }
-
-    if comp_sizes.is_empty() {
-        return;
-    }
-
-    let largest = comp_sizes
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, &s)| s)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    // Sink ALL components except the largest one.  This guarantees a single
-    // contiguous island.  Small offshore rocks are noise, not geology.
-    for i in 0..size {
-        if relief[i] > 0.0 {
-            let c = comp_id[i] as usize;
-            if c != largest {
-                relief[i] = -20.0; // shallow ocean
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// run_island_scope — multi-epoch geological evolution pipeline
-// ---------------------------------------------------------------------------
-//
-// Pipeline:
-//  1. generate_geological_provinces() → IslandGeoContext (Voronoi provinces)
-//  2. generate_compat_plates_result() → plates output for UI
-//  3. generate_initial_island_topography() → isostatic elevation from crust
-//  4. apply_island_sea_level() → percentile cutoff + edge fade
-//  5. keep_largest_island() → single contiguous island
-//  6. run_geological_evolution() → 5 epochs × N steps Braun-Willett
-//  7. Post-erosion cleanup (keep_largest_island + edge fade)
-//  8. Slope → hydrology → carve → cleanup → final slope → final hydrology
-//  9. compute_island_climate() → temperature + precipitation (no river→rain)
-// 10. compute_biomes_grid() → Whittaker-based 12-biome classification
-// 11. compute_settlement_grid()
-
-fn run_island_scope(
-    cfg: &SimulationConfig,
-    recomputed_layers: Vec<String>,
-    detail: DetailProfile,
-    progress: &mut ProgressTap<'_>,
-) -> WasmSimulationResult {
-    let island_type = parse_island_type(cfg.island_type.as_deref());
-    let island_scale_km = cfg.island_scale_km.unwrap_or(400.0).clamp(50.0, 2000.0);
-
-    let width = ISLAND_WIDTH;
-    let height = ISLAND_HEIGHT;
-    let km_per_cell = island_scale_km / width as f32;
-    let dx_m = km_per_cell * 1000.0;
-
-    // 1. Grid abstraction (flat, clamped edges)
-    let grid = GridConfig::island(width, height, km_per_cell);
-
-    // 2. Geological provinces (Voronoi-based, replaces old plate context hack)
-    progress.phase(0.0, 5.0, 0.0);
-    let geo_ctx = generate_geological_provinces(cfg.seed, island_type, &grid, &cfg.tectonics);
-    progress.phase(0.0, 5.0, 1.0);
-
-    // 3. Compatibility plates result for UI output (plates_preview, boundary_types)
-    let plates = generate_compat_plates_result(&geo_ctx, &grid);
-
-    // 4. Initial topography from isostatic elevation (pure physics, no heuristics)
-    progress.phase(5.0, 5.0, 0.0);
-    let mut relief = generate_initial_island_topography(&geo_ctx, &grid, cfg.seed);
-    progress.phase(5.0, 5.0, 1.0);
-
-    // 5. Sea-level cutoff: coastline emerges from crustal thickness variation.
-    //    Target ~25% land. Edge fade prevents land touching the grid frame.
-    let target_land = 0.25_f32;
-    apply_island_sea_level(&mut relief, &grid, target_land, cfg.seed);
-
-    // 6. Keep single contiguous island before evolution
-    keep_largest_island(&mut relief, &grid);
-
-    // 7. Multi-epoch geological evolution (5 epochs, variable uplift + K_eff)
-    //    Each epoch runs N Braun-Willett steps with its own uplift field and
-    //    erodibility map. Uplift is zeroed on ocean cells inside the loop.
-    run_geological_evolution(
-        &mut relief,
-        &geo_ctx,
-        &grid,
-        dx_m,
-        cfg.seed,
-        progress,
-        10.0,  // progress_base
-        40.0,  // progress_span (10..50)
-    );
-
-    // 8. Post-evolution cleanup: re-enforce single island + edge fade
-    keep_largest_island(&mut relief, &grid);
-    {
-        let w = grid.width as f32;
-        let h = grid.height as f32;
-        let fade_base = 0.12_f32;
-        let fade_seed = hash_u32(cfg.seed ^ 0xFADE_B0CE);
-        for y in 0..grid.height {
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let fx = (x as f32 + 0.5) / w;
-                let fy = (y as f32 + 0.5) / h;
-                let edge = fx.min(1.0 - fx).min(fy).min(1.0 - fy);
-                let noise = value_noise3(fx * 5.5, fy * 5.5, 0.31, fade_seed) * 0.04;
-                let margin = (fade_base + noise).max(0.03);
-                if edge < margin && relief[i] > 0.0 {
-                    let t = (edge / margin).clamp(0.0, 1.0);
-                    let s = t * t * (3.0 - 2.0 * t);
-                    relief[i] = relief[i] * s - 500.0 * (1.0 - s);
-                }
-            }
-        }
-    }
-
-    // 9. Slope (pre-carve pass)
-    let (slope_pre, _, _) = compute_slope_grid(&relief, width, height, progress, 52.0, 3.0);
-
-    // 10. Hydrology (pre-carve pass)
-    let (_, flow_accum_pre, river_map_pre, _) =
-        compute_hydrology_grid(&relief, &slope_pre, width, height, detail, progress, 55.0, 5.0);
-
-    // 11. Carve fluvial valleys
-    carve_fluvial_valleys_grid(
-        &mut relief,
-        &flow_accum_pre,
-        &river_map_pre,
-        width,
-        height,
-        detail,
-        progress,
-        60.0,
-        5.0,
-    );
-
-    // 12. Post-carve cleanup: re-enforce single island + edge fade
-    keep_largest_island(&mut relief, &grid);
-    {
-        let w = grid.width as f32;
-        let h = grid.height as f32;
-        let fade_base = 0.10_f32;
-        let fade_seed = hash_u32(cfg.seed ^ 0xFADE_C0DE);
-        for y in 0..grid.height {
-            for x in 0..grid.width {
-                let i = grid.index(x, y);
-                let fx = (x as f32 + 0.5) / w;
-                let fy = (y as f32 + 0.5) / h;
-                let edge = fx.min(1.0 - fx).min(fy).min(1.0 - fy);
-                let noise = value_noise3(fx * 5.5, fy * 5.5, 0.77, fade_seed) * 0.03;
-                let margin = (fade_base + noise).max(0.03);
-                if edge < margin && relief[i] > 0.0 {
-                    let t = (edge / margin).clamp(0.0, 1.0);
-                    let s = t * t * (3.0 - 2.0 * t);
-                    relief[i] = relief[i] * s - 500.0 * (1.0 - s);
-                }
-            }
-        }
-    }
-
-    // 13. Final slope
-    let (slope_map, min_slope, max_slope) =
-        compute_slope_grid(&relief, width, height, progress, 66.0, 4.0);
-
-    // 14. Final hydrology
-    let (flow_direction, flow_accumulation, river_map, lake_map) =
-        compute_hydrology_grid(&relief, &slope_map, width, height, detail, progress, 70.0, 5.0);
-
-    // 15. Climate — science-based model (Hadley + orographic, NO river dependency)
-    let relief_for_climate = {
-        let mut smoothed = relief.clone();
-        let mut scratch = vec![0.0_f32; grid.size];
-        for _ in 0..3 {
-            for y in 0..height {
-                for x in 0..width {
-                    let i = grid.index(x, y);
-                    let mut sum = smoothed[i] * 4.0;
-                    let mut wt = 4.0_f32;
-                    for (ddx, ddy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                        let nx = (x as i32 + ddx).clamp(0, width as i32 - 1) as usize;
-                        let ny = (y as i32 + ddy).clamp(0, height as i32 - 1) as usize;
-                        sum += smoothed[grid.index(nx, ny)];
-                        wt += 1.0;
-                    }
-                    scratch[i] = sum / wt;
-                }
-            }
-            smoothed.copy_from_slice(&scratch);
-        }
-        smoothed
-    };
-
-    let coastal_exposure = compute_coastal_exposure_grid(&relief, width, height);
-    let (
-        temperature_map,
-        precipitation_map,
-        min_temperature,
-        max_temperature,
-        min_precipitation,
-        max_precipitation,
-    ) = compute_island_climate(
-        &cfg.planet,
-        &relief_for_climate,
-        &slope_map,
-        &grid,
-        cfg.seed,
-        progress,
-        76.0,
-        8.0,
-    );
-
-    // 16. Biomes — Whittaker diagram, 12 types (blur T/P to suppress channel streaks)
-    let smooth_map = |src: &[f32]| -> Vec<f32> {
-        let mut out = src.to_vec();
-        let mut scratch = vec![0.0_f32; grid.size];
-        for _ in 0..5 {
-            for y in 0..height {
-                for x in 0..width {
-                    let i = grid.index(x, y);
-                    let mut sum = out[i] * 4.0;
-                    let mut wt = 4.0_f32;
-                    for (ddx, ddy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                        let nx = (x as i32 + ddx).clamp(0, width as i32 - 1) as usize;
-                        let ny = (y as i32 + ddy).clamp(0, height as i32 - 1) as usize;
-                        sum += out[grid.index(nx, ny)];
-                        wt += 1.0;
-                    }
-                    scratch[i] = sum / wt;
-                }
-            }
-            out.copy_from_slice(&scratch);
-        }
-        out
-    };
-    let temp_smooth = smooth_map(&temperature_map);
-    let precip_smooth = smooth_map(&precipitation_map);
-    let biome_map = compute_biomes_grid(&temp_smooth, &precip_smooth, &relief_for_climate);
-    progress.emit(90.0);
-
-    // 17. Settlement
-    let settlement_map = compute_settlement_grid(
-        &biome_map,
-        &relief,
-        &temperature_map,
-        &precipitation_map,
-        &river_map,
-        &coastal_exposure,
-    );
-    progress.emit(95.0);
-
-    let (min_height, max_height) = min_max(&relief);
-    let ocean_cells = relief.iter().filter(|&&h| h < 0.0).count() as f32;
-    let ocean_percent = 100.0 * ocean_cells / grid.size as f32;
-
-    progress.emit(99.0);
-
-    WasmSimulationResult {
-        width: width as u32,
-        height: height as u32,
-        seed: cfg.seed,
-        sea_level: 0.0,
-        radius_km: cfg.planet.radius_km,
-        ocean_percent,
-        recomputed_layers,
-        plates: plates.plate_field,
-        boundary_types: plates.boundary_types,
-        height_map: relief,
-        slope_map,
-        river_map,
-        lake_map,
-        flow_direction,
-        flow_accumulation,
-        temperature_map,
-        precipitation_map,
-        biome_map,
-        settlement_map,
-        min_height,
-        max_height,
-        min_temperature,
-        max_temperature,
-        min_precipitation,
-        max_precipitation,
-        min_slope,
-        max_slope,
-    }
-}
 
 #[wasm_bindgen]
 pub struct WasmSimulationResult {
@@ -7143,6 +3213,413 @@ impl<'a> ProgressTap<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+//  Island-as-Crop: select interesting region on planet, upsample, refine
+// ---------------------------------------------------------------------------
+
+/// Catmull–Rom cubic interpolation kernel.
+#[inline]
+fn catmull_rom(t: f32, p0: f32, p1: f32, p2: f32, p3: f32) -> f32 {
+    let a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
+    let b = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
+    let c = -0.5 * p0 + 0.5 * p2;
+    let d = p1;
+    ((a * t + b) * t + c) * t + d
+}
+
+/// Bicubic (Catmull–Rom) sample of a 2-D grid at continuous coordinates.
+/// `wrap_x`: if true, x wraps (spherical planet); else clamps.
+fn bicubic_sample(data: &[f32], w: usize, h: usize, fx: f32, fy: f32, wrap_x: bool) -> f32 {
+    let ix = fx.floor() as i32;
+    let iy = fy.floor() as i32;
+    let tx = fx - ix as f32;
+    let ty = fy - iy as f32;
+    let w_i32 = w as i32;
+    let h_i32 = h as i32;
+    let mut cols = [0.0_f32; 4];
+    for j in -1..=2_i32 {
+        let cy = (iy + j).clamp(0, h_i32 - 1) as usize;
+        let mut row = [0.0_f32; 4];
+        for i in -1..=2_i32 {
+            let cx = if wrap_x {
+                (((ix + i) % w_i32) + w_i32) % w_i32
+            } else {
+                (ix + i).clamp(0, w_i32 - 1)
+            } as usize;
+            row[(i + 1) as usize] = data[cy * w + cx];
+        }
+        cols[(j + 1) as usize] = catmull_rom(tx, row[0], row[1], row[2], row[3]);
+    }
+    catmull_rom(ty, cols[0], cols[1], cols[2], cols[3])
+}
+
+/// Nearest-neighbour sample of a discrete (integer) grid.
+fn nearest_sample_i16(data: &[i16], w: usize, h: usize, fx: f32, fy: f32, wrap_x: bool) -> i16 {
+    let ix = fx.round() as i32;
+    let iy = fy.round().clamp(0.0, (h as f32) - 1.0) as usize;
+    let cx = if wrap_x {
+        (((ix % w as i32) + w as i32) % w as i32) as usize
+    } else {
+        ix.clamp(0, w as i32 - 1) as usize
+    };
+    data[iy * w + cx]
+}
+
+fn nearest_sample_i8(data: &[i8], w: usize, h: usize, fx: f32, fy: f32, wrap_x: bool) -> i8 {
+    let ix = fx.round() as i32;
+    let iy = fy.round().clamp(0.0, (h as f32) - 1.0) as usize;
+    let cx = if wrap_x {
+        (((ix % w as i32) + w as i32) % w as i32) as usize
+    } else {
+        ix.clamp(0, w as i32 - 1) as usize
+    };
+    data[iy * w + cx]
+}
+
+/// Score every possible crop-window center on the planet and return the best one.
+/// Interest = coastline cells × elevation variance × plate-boundary cells.
+fn find_interesting_region(
+    heights: &[f32],
+    boundary_types: &[i8],
+    pg: &GridConfig,
+    seed: u32,
+    target_km: f32,
+) -> (usize, usize) {
+    // Window size in planet cells
+    let win_w = ((target_km / pg.km_per_cell_x).round() as usize).max(4);
+    let win_h = (win_w / 2).max(2); // 2:1 aspect
+
+    // Exclude polar rows (top/bottom 10%) — boring terrain
+    let margin_y = (pg.height as f32 * 0.10) as usize;
+    let y_min = margin_y;
+    let y_max = pg.height.saturating_sub(margin_y + win_h);
+
+    let score_seed = hash_u32(seed ^ 0xC80F_1A0D);
+    let mut best_score = f32::MIN;
+    let mut best_cx = pg.width / 2;
+    let mut best_cy = pg.height / 2;
+
+    // Step by half-window to avoid O(W²×H²) full scan
+    let step = (win_w / 2).max(1);
+    for wy in (y_min..=y_max).step_by(step.max(1)) {
+        for wx in (0..pg.width).step_by(step.max(1)) {
+            let mut coast = 0_u32;
+            let mut boundary = 0_u32;
+            let mut h_min = f32::MAX;
+            let mut h_max = f32::MIN;
+            let mut land_count = 0_u32;
+            for dy in 0..win_h {
+                let y = wy + dy;
+                if y >= pg.height { break; }
+                for dx in 0..win_w {
+                    let x = (wx + dx) % pg.width;
+                    let i = y * pg.width + x;
+                    let h = heights[i];
+                    if h > 0.0 { land_count += 1; }
+                    if h < h_min { h_min = h; }
+                    if h > h_max { h_max = h; }
+                    if boundary_types[i] != 0 { boundary += 1; }
+                    // Coast = land cell with an ocean neighbor (simplified)
+                    if h > 0.0 {
+                        let x_r = (x + 1) % pg.width;
+                        if heights[y * pg.width + x_r] <= 0.0 { coast += 1; }
+                    }
+                }
+            }
+            let total = (win_w * win_h) as f32;
+            let land_frac = land_count as f32 / total;
+            // Want mixed land/ocean (0.2–0.8 land fraction is most interesting)
+            let mix_score = 1.0 - (land_frac - 0.4).abs() * 2.5;
+            let elev_range = (h_max - h_min).max(1.0);
+            let coast_f = coast as f32;
+            let boundary_f = 1.0 + boundary as f32 * 0.5;
+            // Seed-based noise to vary selection per seed
+            let nx = wx as f32 / pg.width as f32;
+            let ny = wy as f32 / pg.height as f32;
+            let noise = value_noise3(nx * 3.0, ny * 3.0, seed as f32 * 0.001, score_seed) * 500.0;
+
+            let score = mix_score * coast_f * elev_range * boundary_f + noise;
+            if score > best_score {
+                best_score = score;
+                best_cx = wx + win_w / 2;
+                best_cy = wy + win_h / 2;
+            }
+        }
+    }
+    (best_cx % pg.width, best_cy.min(pg.height - 1))
+}
+
+/// Main Island-as-Crop pipeline: crop planet data → upsample → refine.
+fn run_island_crop(
+    cfg: &SimulationConfig,
+    planet_heights: &[f32],
+    planet_plates: &[i16],
+    planet_boundary_types: &[i8],
+    planet_grid: &GridConfig,
+    planet_cell_cache: &CellCache,
+    detail: DetailProfile,
+    recomputed_layers: Vec<String>,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) -> WasmSimulationResult {
+    let island_w = ISLAND_WIDTH;
+    let island_h = ISLAND_HEIGHT;
+    let island_scale_km = cfg.island_scale_km.unwrap_or(400.0).clamp(50.0, 2000.0);
+    let km_per_cell = island_scale_km / island_w as f32;
+    let dx_m = km_per_cell * 1000.0;
+    let island_grid = GridConfig::island(island_w, island_h, km_per_cell);
+    let seed = cfg.seed;
+
+    // --- 1. Find interesting region on planet ---
+    let (cx, cy) = find_interesting_region(
+        planet_heights, planet_boundary_types, planet_grid, seed, island_scale_km,
+    );
+    progress.phase(progress_base, progress_span, 0.02);
+
+    // Planet-space coordinates of the crop center
+    let center_lat = planet_cell_cache.lat_deg[cy * planet_grid.width + (cx % planet_grid.width)];
+    let center_lon = planet_cell_cache.lon_deg[cy * planet_grid.width + (cx % planet_grid.width)];
+
+    // Build island CellCache with correct planetary coordinates
+    let island_cell_cache = CellCache::for_island_crop(&island_grid, center_lat, center_lon);
+
+    // Window size in planet cells
+    let pw = planet_grid.width;
+    let ph = planet_grid.height;
+    let win_w_cells = (island_scale_km / planet_grid.km_per_cell_x).round() as usize;
+    let win_h_cells = ((island_scale_km * 0.5) / planet_grid.km_per_cell_y).round() as usize;
+    let half_w = win_w_cells / 2;
+    let half_h = win_h_cells / 2;
+
+    // --- 2. Crop + bicubic upsample relief ---
+    let mut relief = vec![0.0_f32; island_grid.size];
+    let mut plates_field = vec![0_i16; island_grid.size];
+    let mut bnd_types = vec![0_i8; island_grid.size];
+    let noise_seed = hash_u32(seed ^ 0xFBFD_E7A1);
+
+    for iy in 0..island_h {
+        for ix in 0..island_w {
+            let i = iy * island_w + ix;
+            // Map island cell → planet coordinate
+            let fx_norm = ix as f32 / island_w as f32; // 0..1
+            let fy_norm = iy as f32 / island_h as f32;
+            let px = (cx as f32 - half_w as f32) + fx_norm * win_w_cells as f32;
+            let py = (cy as f32 - half_h as f32) + fy_norm * win_h_cells as f32;
+
+            // Bicubic for height (smooth)
+            let h_coarse = bicubic_sample(planet_heights, pw, ph, px, py, planet_grid.is_spherical);
+            // Nearest for discrete fields
+            plates_field[i] = nearest_sample_i16(planet_plates, pw, ph, px, py, planet_grid.is_spherical);
+            bnd_types[i] = nearest_sample_i8(planet_boundary_types, pw, ph, px, py, planet_grid.is_spherical);
+
+            // FBM fractal detail: adds sub-20km features
+            // Amplitude scales with local elevation magnitude (mountains get more detail)
+            let nx = island_cell_cache.noise_x[i];
+            let ny = island_cell_cache.noise_y[i];
+            let nz = island_cell_cache.noise_z[i];
+            let scale = h_coarse.abs().max(50.0) * 0.15; // ~15% of local elevation
+            let mut fbm = 0.0_f32;
+            let mut freq = 8.0_f32;
+            let mut amp = 1.0_f32;
+            for oct in 0..6_u32 {
+                let s = hash_u32(noise_seed ^ (oct * 0x1337));
+                fbm += value_noise3(nx * freq, ny * freq, nz * freq + oct as f32 * 0.7, s) * amp;
+                freq *= 2.0;
+                amp *= 0.5; // Hurst H = 0.7 → decay = 2^(-H) ≈ 0.62; using 0.5 for safety
+            }
+
+            relief[i] = h_coarse + fbm * scale;
+        }
+    }
+    progress.phase(progress_base, progress_span, 0.10);
+
+    // --- 3. Edge fade: smooth terrain to ocean at grid edges ---
+    {
+        let w = island_w as f32;
+        let h = island_h as f32;
+        let fade_seed = hash_u32(seed ^ 0xFADE_C80F);
+        for y in 0..island_h {
+            for x in 0..island_w {
+                let i = y * island_w + x;
+                let fx = (x as f32 + 0.5) / w;
+                let fy = (y as f32 + 0.5) / h;
+                let edge = fx.min(1.0 - fx).min(fy).min(1.0 - fy);
+                let noise = value_noise3(fx * 5.5, fy * 5.5, 0.31, fade_seed) * 0.04;
+                let margin = (0.06 + noise).max(0.03);
+                if edge < margin {
+                    let t = (edge / margin).clamp(0.0, 1.0);
+                    let s = t * t * (3.0 - 2.0 * t);
+                    relief[i] = relief[i] * s - 500.0 * (1.0 - s);
+                }
+            }
+        }
+    }
+
+    // --- 4. Fine-scale stream power erosion (10 steps) ---
+    // Derive K_eff from boundary types: boundary cells are harder rock
+    let mut k_eff = vec![0.0_f32; island_grid.size];
+    for i in 0..island_grid.size {
+        k_eff[i] = if bnd_types[i] == 1 {
+            2.0e-6 // convergent: metamorphic (granite, quartzite)
+        } else if bnd_types[i] == 2 {
+            5.0e-6 // divergent: basalt (fresh volcanic)
+        } else {
+            8.0e-6 // interior: sedimentary (sandstone, limestone)
+        };
+    }
+    // Zero uplift for fine-scale pass (planet already provided the large-scale topography)
+    let uplift_zero = vec![0.0_f32; island_grid.size];
+    stream_power_evolve(
+        &mut relief,
+        &uplift_zero,
+        &k_eff,
+        100_000.0,  // dt = 100 kyr
+        dx_m,
+        0.5, 1.0,   // m, n (standard stream power exponents)
+        0.01,        // kappa (hillslope diffusion, CFL-safe)
+        10,          // 10 steps
+        &island_grid,
+        progress,
+        progress_base + progress_span * 0.10,
+        progress_span * 0.30,
+    );
+
+    // --- 5. Pre-carve slope + hydrology ---
+    let (slope_pre, _, _) = compute_slope_grid(&relief, island_w, island_h, progress,
+        progress_base + progress_span * 0.40, progress_span * 0.03);
+    let (_, flow_pre, river_pre, _) = compute_hydrology_grid(
+        &relief, &slope_pre, island_w, island_h, detail, progress,
+        progress_base + progress_span * 0.43, progress_span * 0.05);
+
+    // --- 6. Carve fluvial valleys ---
+    carve_fluvial_valleys_grid(
+        &mut relief, &flow_pre, &river_pre, island_w, island_h, detail, progress,
+        progress_base + progress_span * 0.48, progress_span * 0.04);
+
+    // --- 7. Post-carve edge fade ---
+    {
+        let w = island_w as f32;
+        let h = island_h as f32;
+        let fade_seed = hash_u32(seed ^ 0xFADE_C0DE);
+        for y in 0..island_h {
+            for x in 0..island_w {
+                let i = y * island_w + x;
+                let fx = (x as f32 + 0.5) / w;
+                let fy = (y as f32 + 0.5) / h;
+                let edge = fx.min(1.0 - fx).min(fy).min(1.0 - fy);
+                let noise = value_noise3(fx * 5.5, fy * 5.5, 0.77, fade_seed) * 0.03;
+                let margin = (0.05 + noise).max(0.03);
+                if edge < margin && relief[i] > 0.0 {
+                    let t = (edge / margin).clamp(0.0, 1.0);
+                    let s = t * t * (3.0 - 2.0 * t);
+                    relief[i] = relief[i] * s - 500.0 * (1.0 - s);
+                }
+            }
+        }
+    }
+
+    // --- 8. Final slope + hydrology ---
+    let (slope_map, min_slope, max_slope) = compute_slope_grid(&relief, island_w, island_h,
+        progress, progress_base + progress_span * 0.52, progress_span * 0.04);
+    let (flow_direction, flow_accumulation, river_map, lake_map) = compute_hydrology_grid(
+        &relief, &slope_map, island_w, island_h, detail, progress,
+        progress_base + progress_span * 0.56, progress_span * 0.06);
+
+    // --- 9. Climate (unified model with real planetary coordinates) ---
+    let aerosol = 0.0_f32; // no events for island crop
+    let (
+        temperature_map,
+        precipitation_map,
+        min_temperature,
+        max_temperature,
+        min_precipitation,
+        max_precipitation,
+    ) = compute_climate_unified(
+        &cfg.planet,
+        &relief,
+        &island_grid,
+        &island_cell_cache,
+        seed,
+        aerosol,
+        progress,
+        progress_base + progress_span * 0.62,
+        progress_span * 0.18,
+    );
+
+    // --- 10. Biomes (smoothed T/P for stable classification) ---
+    let smooth = |src: &[f32]| -> Vec<f32> {
+        let mut out = src.to_vec();
+        let mut scratch = vec![0.0_f32; island_grid.size];
+        for _ in 0..5 {
+            for y in 0..island_h {
+                for x in 0..island_w {
+                    let i = y * island_w + x;
+                    let mut sum = out[i] * 4.0;
+                    let mut wt = 4.0_f32;
+                    for (ddx, ddy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
+                        let nx = (x as i32 + ddx).clamp(0, island_w as i32 - 1) as usize;
+                        let ny = (y as i32 + ddy).clamp(0, island_h as i32 - 1) as usize;
+                        sum += out[ny * island_w + nx];
+                        wt += 1.0;
+                    }
+                    scratch[i] = sum / wt;
+                }
+            }
+            out.copy_from_slice(&scratch);
+        }
+        out
+    };
+    let temp_smooth = smooth(&temperature_map);
+    let precip_smooth = smooth(&precipitation_map);
+    let biome_map = compute_biomes_grid(
+        &temp_smooth, &precip_smooth, &relief, island_w, seed, &river_map);
+    progress.phase(progress_base, progress_span, 0.85);
+
+    // --- 11. Settlement ---
+    let coastal_exposure = compute_coastal_exposure_grid(&relief, island_w, island_h);
+    let settlement_map = compute_settlement_grid(
+        &biome_map, &relief, &temperature_map, &precipitation_map,
+        &river_map, &coastal_exposure);
+    progress.phase(progress_base, progress_span, 0.92);
+
+    let (min_height, max_height) = min_max(&relief);
+    let ocean_cells = relief.iter().filter(|&&h| h < 0.0).count() as f32;
+    let ocean_percent = 100.0 * ocean_cells / island_grid.size as f32;
+
+    progress.phase(progress_base, progress_span, 1.0);
+
+    WasmSimulationResult {
+        width: island_w as u32,
+        height: island_h as u32,
+        seed,
+        sea_level: 0.0,
+        radius_km: cfg.planet.radius_km,
+        ocean_percent,
+        recomputed_layers,
+        plates: plates_field,
+        boundary_types: bnd_types,
+        height_map: relief,
+        slope_map,
+        river_map,
+        lake_map,
+        flow_direction,
+        flow_accumulation,
+        temperature_map,
+        precipitation_map,
+        biome_map,
+        settlement_map,
+        min_height,
+        max_height,
+        min_temperature,
+        max_temperature,
+        min_precipitation,
+        max_precipitation,
+        min_slope,
+        max_slope,
+    }
+}
+
 fn run_simulation_internal(
     config: JsValue,
     reason: String,
@@ -7160,12 +3637,10 @@ fn run_simulation_internal(
     let detail = detail_profile(preset);
     let scope = parse_scope(cfg.scope.as_deref());
 
-    if scope == GenerationScope::Island {
-        let result = run_island_scope(&cfg, recomputed_layers, detail, &mut progress);
-        // Keep progress <100 until JS wrapper and worker finish marshalling + posting result.
-        progress.emit(99.9);
-        return Ok(result);
-    }
+    // Planet generation is always run first (island = crop of planet).
+    // Progress allocation: planet 0-70% for island scope, 0-78% for planet scope.
+    let is_island = scope == GenerationScope::Island;
+    let planet_progress_scale = if is_island { 0.70 } else { 1.0 };
 
     let cache = world_cache();
 
@@ -7176,12 +3651,12 @@ fn run_simulation_internal(
         cfg.seed,
         cache,
         &mut progress,
-        2.0,
-        22.0,
+        2.0 * planet_progress_scale,
+        22.0 * planet_progress_scale,
     );
     let planet_grid = GridConfig::planet();
     let planet_cell_cache = CellCache::for_planet(&planet_grid);
-    let relief_raw = compute_relief(
+    let relief_raw = compute_relief_physics(
         &cfg.planet,
         &cfg.tectonics,
         &plates_layer,
@@ -7190,17 +3665,35 @@ fn run_simulation_internal(
         &planet_cell_cache,
         detail,
         &mut progress,
-        24.0,
-        50.0,
+        24.0 * planet_progress_scale,
+        50.0 * planet_progress_scale,
     );
-    progress.emit(74.0);
+    progress.emit(74.0 * planet_progress_scale);
     let (event_relief, aerosol) = apply_events(&cfg.planet, &relief_raw.relief, &cfg.events, cache);
-    progress.emit(78.0);
+    progress.emit(78.0 * planet_progress_scale);
 
-    let (slope_map, min_slope, max_slope) = compute_slope(&event_relief, &mut progress, 78.0, 8.0);
-    let (flow_direction, flow_accumulation, river_map, lake_map) =
-        compute_hydrology(&event_relief, &slope_map, &mut progress, 86.0, 7.0);
+    // --- Island scope: crop from planet and refine ---
+    if is_island {
+        let result = run_island_crop(
+            &cfg,
+            &event_relief,
+            &plates_layer.plate_field,
+            &plates_layer.boundary_types,
+            &planet_grid,
+            &planet_cell_cache,
+            detail,
+            recomputed_layers,
+            &mut progress,
+            70.0,  // progress_base (70-100%)
+            29.9,  // progress_span
+        );
+        progress.emit(99.9);
+        return Ok(result);
+    }
 
+    let (slope_map, min_slope, max_slope) = compute_slope(&event_relief, &mut progress, 78.0, 4.0);
+
+    // Climate BEFORE hydrology: precipitation drives rivers, not the reverse.
     let (
         temperature_map,
         precipitation_map,
@@ -7208,22 +3701,39 @@ fn run_simulation_internal(
         max_temperature,
         min_precipitation,
         max_precipitation,
-    ) = compute_climate(
+    ) = compute_climate_unified(
         &cfg.planet,
         &event_relief,
-        &slope_map,
-        &river_map,
-        &flow_accumulation,
+        &planet_grid,
+        &planet_cell_cache,
+        cfg.seed,
         aerosol,
-        cache,
         &mut progress,
-        93.0,
-        5.0,
+        82.0,
+        10.0,
+    );
+
+    let (flow_direction, flow_accumulation, river_map, lake_map) =
+        compute_hydrology_grid(
+            &event_relief,
+            &slope_map,
+            planet_grid.width,
+            planet_grid.height,
+            detail,
+            &mut progress,
+            92.0,
+            5.0,
+        );
+
+    let biome_map = compute_biomes_grid(
+        &temperature_map,
+        &precipitation_map,
+        &event_relief,
+        planet_grid.width,
+        cfg.seed,
+        &river_map,
     );
     progress.emit(98.0);
-
-    let biome_map = compute_biomes(&temperature_map, &precipitation_map, &event_relief);
-    progress.emit(99.0);
     let settlement_map = compute_settlement(
         &biome_map,
         &event_relief,

@@ -153,17 +153,21 @@ function heightColor(value, min, max, landMinRef, landMaxRef) {
 }
 
 function biomeColor(id) {
+  // 12 Whittaker biome types — must match BIOME_COLORS in types.ts
   switch (id) {
-    case 0: return [17, 42, 82];
-    case 1: return [204, 213, 238];
-    case 2: return [34, 139, 87];
-    case 3: return [21, 109, 61];
-    case 4: return [196, 168, 84];
-    case 5: return [219, 179, 94];
-    case 6: return [132, 173, 93];
-    case 7: return [130, 106, 74];
-    case 8: return [63, 104, 61];
-    default: return [255, 255, 255];
+    case 0:  return [17,  42,  82];   // Ocean
+    case 1:  return [204, 213, 238];  // Tundra/Ice
+    case 2:  return [63,  104, 61];   // Boreal/Taiga
+    case 3:  return [21,  109, 61];   // Temperate Forest
+    case 4:  return [196, 168, 84];   // Temperate Grassland
+    case 5:  return [168, 142, 60];   // Mediterranean
+    case 6:  return [1,   87,  50];   // Tropical Rainforest
+    case 7:  return [132, 173, 93];   // Tropical Savanna
+    case 8:  return [219, 179, 94];   // Desert
+    case 9:  return [34,  139, 87];   // Subtropical Forest
+    case 10: return [130, 106, 74];   // Alpine
+    case 11: return [178, 162, 108];  // Steppe
+    default: return [128, 128, 128];
   }
 }
 
