@@ -1751,8 +1751,8 @@ fn compute_relief_physics(
                 -bstr * 20.0
             },
             3 => {
-                // Transform: minor transpressional thickening.
-                bstr * 5.0
+                // Transform: minor transpressional thickening only.
+                bstr * 2.0
             },
             _ => 0.0,
         };
@@ -1883,9 +1883,9 @@ fn compute_relief_physics(
         let speed_factor = plate_speed / 5.0; // normalized to Earth-like 5 cm/yr
 
         uplift[i] = match btype {
-            1 => bstr * 0.003 * speed_factor,   // convergent: up to 3 mm/yr
-            2 => -bstr * 0.001 * speed_factor,  // divergent: up to -1 mm/yr subsidence
-            3 => bstr * 0.001 * speed_factor,    // transform: up to 1 mm/yr transpression
+            1 => bstr * 0.005 * speed_factor,   // convergent: up to 5 mm/yr (GPS: 0.5-10)
+            2 => -bstr * 0.002 * speed_factor,  // divergent: up to -2 mm/yr subsidence
+            3 => bstr * 0.001 * speed_factor,   // transform: up to 1 mm/yr transpression
             _ => 0.0,
         };
     }
@@ -2157,7 +2157,7 @@ fn compute_climate_unified(
 
     // Resolution-adaptive trace distances (capped at 400 cells for performance)
     let windward_max_steps = (800.0 / grid.km_per_cell_x).min(400.0) as i32;
-    let shadow_max_steps = (1200.0 / grid.km_per_cell_x).min(400.0) as i32;
+    let shadow_max_steps = (500.0 / grid.km_per_cell_x).min(400.0) as i32;
     let lapse_rate = 0.006_f32; // 6.0 K per km = 0.006 K/m (environmental lapse rate)
 
     // --- Step 1: Coastal exposure (fraction of ocean within ~60 km) ---
@@ -2208,8 +2208,8 @@ fn compute_climate_unified(
         } else {
             1.0 // polar easterlies
         };
-        // Small Coriolis meridional deflection (NH right, SH left)
-        let meridional = if lat_deg > 0.0 { 0.2 } else { -0.2 };
+        // Coriolis meridional deflection: f = 2Ω sin(φ). Zero at equator, max at poles.
+        let meridional = 0.35 * (lat_deg * RADIANS).sin();
         let noise = value_noise3(0.0, y as f32 / h as f32 * 4.0, 0.5, wind_noise_seed) * 0.2;
         let angle = zonal.atan2(meridional) + noise;
         upwind_dx[y] = angle.cos();
@@ -2234,8 +2234,11 @@ fn compute_climate_unified(
                 } else {
                     (x as i32 + (udx * d as f32) as i32).clamp(0, w_i32 - 1) as usize
                 };
-                if heights[sy * w + sx] <= 0.0 { break; }
-                land_dist += 1.0;
+                if heights[sy * w + sx] > 0.0 {
+                    land_dist += 1.0;
+                }
+                // Stop after ~1000 km of cumulative land distance
+                if land_dist > 50.0 { break; }
             }
             let fx = x as f32 / w as f32;
             let fy = y as f32 / h as f32;
@@ -2246,9 +2249,12 @@ fn compute_climate_unified(
     }
     progress.phase(progress_base, progress_span, 0.45);
 
-    // --- Step 4: Cumulative rain shadow ---
-    // Scan upwind, find max terrain height; shadow = factor × (max_upwind − local).
-    // 0.40: a 2000 m range casts ~800 mm shadow (Smith, 1979).
+    // --- Step 4: Rain shadow with distance decay ---
+    // Trace upwind; shadow strength decays exponentially with distance from barrier.
+    // 0.40: a 2000 m range casts ~800 mm shadow at foot (Smith, 1979).
+    // e-folding distance 250 km: at 500 km, shadow retains ~13%.
+    let shadow_decay_km = 250.0_f32;
+    let decay_per_step = (-grid.km_per_cell_x / shadow_decay_km).exp();
     let mut cumulative_shadow = vec![0.0_f32; size];
     for y in 0..h {
         let udx = upwind_dx[y];
@@ -2256,7 +2262,8 @@ fn compute_climate_unified(
         for x in 0..w {
             let i = y * w + x;
             let h_here = heights[i].max(0.0);
-            let mut h_max_upwind = 0.0_f32;
+            let mut best_shadow = 0.0_f32;
+            let mut decay_factor = 1.0_f32;
             for d in 1..=shadow_max_steps {
                 let sy = (y as i32 + (udy * d as f32) as i32).clamp(0, h_i32 - 1) as usize;
                 let sx = if grid.is_spherical {
@@ -2265,9 +2272,11 @@ fn compute_climate_unified(
                     (x as i32 + (udx * d as f32) as i32).clamp(0, w_i32 - 1) as usize
                 };
                 let sh = heights[sy * w + sx].max(0.0);
-                if sh > h_max_upwind { h_max_upwind = sh; }
+                let shadow_here = (sh - h_here).max(0.0) * 0.40 * decay_factor;
+                if shadow_here > best_shadow { best_shadow = shadow_here; }
+                decay_factor *= decay_per_step;
             }
-            cumulative_shadow[i] = (h_max_upwind - h_here).max(0.0) * 0.40;
+            cumulative_shadow[i] = best_shadow;
         }
     }
     progress.phase(progress_base, progress_span, 0.75);
@@ -2339,8 +2348,8 @@ fn compute_climate_unified(
 
             let shadow = cumulative_shadow[i];
 
-            // Clausius-Clapeyron: cold air holds less moisture
-            let alt_factor = (1.0 - h_m * 0.00025).max(0.2);
+            // Clausius-Clapeyron: exponential moisture drop ~42%/km (6 K/km × 7%/K)
+            let alt_factor = (-h_m * 0.0004_f32).exp().max(0.1);
 
             let pn = value_noise3(
                 fx * 8.6 + 11.0, fy * 8.6 - 3.5,
@@ -3319,10 +3328,14 @@ fn find_interesting_region(
                     if h < h_min { h_min = h; }
                     if h > h_max { h_max = h; }
                     if boundary_types[i] != 0 { boundary += 1; }
-                    // Coast = land cell with an ocean neighbor (simplified)
+                    // Coast = land cell with any cardinal ocean neighbor
                     if h > 0.0 {
-                        let x_r = (x + 1) % pg.width;
-                        if heights[y * pg.width + x_r] <= 0.0 { coast += 1; }
+                        let has_ocean =
+                            heights[y * pg.width + (x + 1) % pg.width] <= 0.0
+                            || (x > 0 && heights[y * pg.width + x - 1] <= 0.0)
+                            || (y > 0 && heights[(y - 1) * pg.width + x] <= 0.0)
+                            || (y + 1 < pg.height && heights[(y + 1) * pg.width + x] <= 0.0);
+                        if has_ocean { coast += 1; }
                     }
                 }
             }
@@ -3330,15 +3343,15 @@ fn find_interesting_region(
             let land_frac = land_count as f32 / total;
             // Want mixed land/ocean (0.2–0.8 land fraction is most interesting)
             let mix_score = 1.0 - (land_frac - 0.4).abs() * 2.5;
-            let elev_range = (h_max - h_min).max(1.0);
-            let coast_f = coast as f32;
-            let boundary_f = 1.0 + boundary as f32 * 0.5;
+            let coast_norm = (coast as f32 / total).min(1.0);
+            let elev_norm = ((h_max - h_min).max(1.0) / 5000.0).min(1.0);
+            let boundary_norm = 1.0 + (boundary as f32 / total).min(0.5) * 2.0;
             // Seed-based noise to vary selection per seed
             let nx = wx as f32 / pg.width as f32;
             let ny = wy as f32 / pg.height as f32;
-            let noise = value_noise3(nx * 3.0, ny * 3.0, seed as f32 * 0.001, score_seed) * 500.0;
+            let noise = value_noise3(nx * 3.0, ny * 3.0, seed as f32 * 0.001, score_seed) * 0.3;
 
-            let score = mix_score * coast_f * elev_range * boundary_f + noise;
+            let score = mix_score * coast_norm * elev_norm * boundary_norm + noise;
             if score > best_score {
                 best_score = score;
                 best_cx = wx + win_w / 2;
