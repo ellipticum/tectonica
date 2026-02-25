@@ -1741,8 +1741,11 @@ fn propagate_deformation(
     field
 }
 
-/// In-place 4-neighbor diffusive smoothing (N passes, center weight 4).
+/// In-place 8-neighbor diffusive smoothing (N passes).
+/// Uses isotropic 3×3 kernel: cardinal weight 1, diagonal weight 1/√2,
+/// center weight 4.  Eliminates axis-aligned bias of the 4-neighbor stencil.
 fn smooth_field(field: &mut [f32], passes: usize, grid: &GridConfig) {
+    let diag_w = std::f32::consts::FRAC_1_SQRT_2; // ~0.707
     let mut scratch = vec![0.0_f32; grid.size];
     for _ in 0..passes {
         for y in 0..grid.height {
@@ -1754,6 +1757,11 @@ fn smooth_field(field: &mut [f32], passes: usize, grid: &GridConfig) {
                     let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
                     sum += field[j];
                     wt += 1.0;
+                }
+                for (dx, dy) in [(-1_i32, -1_i32), (-1, 1), (1, -1), (1, 1)] {
+                    let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
+                    sum += field[j] * diag_w;
+                    wt += diag_w;
                 }
                 scratch[i] = sum / wt;
             }
@@ -1803,9 +1811,10 @@ fn compute_relief_physics(
     }
 
     // Smooth continental fraction to create gradual continent-ocean transition.
-    // 5 passes ≈ 100 km diffusion = realistic continental shelf/slope width
-    // (Bond et al. 1995; passive margin transition zone ~80-150 km).
-    smooth_field(&mut continental_frac, 5, grid);
+    // 20 passes with 8-neighbor kernel ≈ σ ~4 cells ~80 km → 3σ ~240 km transition.
+    // Matches realistic passive margin width: shelf ~100 km + slope ~100 km
+    // (Bond et al. 1995; Watts 2001).
+    smooth_field(&mut continental_frac, 20, grid);
 
     // --- 2. Crustal thickness from plate boundary physics ---
     // Create per-type seed fields from boundary detection, then propagate
@@ -1863,27 +1872,9 @@ fn compute_relief_physics(
     }
 
     // Smooth crust_thickness: flexural isostasy proxy.
-    // ~8 passes at ~20 km/cell = ~160 km diffusion length (Te ≈ 30 km → flexural
-    // wavelength ~200 km, Watts 2001).
-    {
-        let mut scratch = vec![0.0_f32; size];
-        for _ in 0..8 {
-            for y in 0..grid.height {
-                for x in 0..grid.width {
-                    let i = grid.index(x, y);
-                    let mut sum = crust_thickness[i] * 4.0;
-                    let mut wt = 4.0_f32;
-                    for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                        let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
-                        sum += crust_thickness[j];
-                        wt += 1.0;
-                    }
-                    scratch[i] = sum / wt;
-                }
-            }
-            crust_thickness.copy_from_slice(&scratch);
-        }
-    }
+    // 8 passes with isotropic 8-neighbor kernel ≈ 160 km diffusion (Te ≈ 30 km →
+    // flexural wavelength ~200 km, Watts 2001).
+    smooth_field(&mut crust_thickness, 8, grid);
     progress.phase(progress_base, progress_span, 0.08);
 
     // --- 3. Rock type from tectonic context → K_eff (Harel et al. 2016) ---
@@ -2044,12 +2035,13 @@ fn compute_relief_physics(
 
     // --- 5b. Post-erosion land smoothing ---
     // At 20 km/cell, D8 erosion creates sub-grid-scale channel artifacts (single-
-    // cell incised valleys).  3 passes of diffusive smoothing (~60 km σ) represent
-    // unresolved hillslope mass wasting, debris flows, and colluvial transport.
-    // Applied to land cells only to preserve ocean bathymetry.
+    // cell incised valleys).  5 passes of isotropic 8-neighbor diffusion (~100 km σ)
+    // represent unresolved hillslope mass wasting, debris flows, and colluvial
+    // transport.  Land cells only — preserves ocean bathymetry.
     {
+        let diag_w = std::f32::consts::FRAC_1_SQRT_2;
         let mut scratch = relief.clone();
-        for _ in 0..3 {
+        for _ in 0..5 {
             for y in 0..grid.height {
                 for x in 0..grid.width {
                     let i = grid.index(x, y);
@@ -2058,10 +2050,11 @@ fn compute_relief_physics(
                     let mut wt = 4.0_f32;
                     for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
                         let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
-                        if relief[j] > 0.0 {
-                            sum += relief[j];
-                            wt += 1.0;
-                        }
+                        if relief[j] > 0.0 { sum += relief[j]; wt += 1.0; }
+                    }
+                    for (dx, dy) in [(-1_i32, -1_i32), (-1, 1), (1, -1), (1, 1)] {
+                        let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
+                        if relief[j] > 0.0 { sum += relief[j] * diag_w; wt += diag_w; }
                     }
                     scratch[i] = sum / wt;
                 }
@@ -2323,6 +2316,55 @@ fn compute_climate_unified(
     }
     progress.phase(progress_base, progress_span, 0.10);
 
+    // --- Step 1b: Coast distance (Chamfer distance transform) ---
+    // Two-pass approximate Euclidean distance from nearest ocean cell.
+    // Used for temperature continentality and precipitation inland drying.
+    // Reference: Borgefors 1986 — two-pass Chamfer 3-4 distance.
+    let mut coast_dist = vec![f32::MAX; size];
+    for i in 0..size {
+        if heights[i] <= 0.0 { coast_dist[i] = 0.0; }
+    }
+    // Forward pass: top-left → bottom-right
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if coast_dist[i] == 0.0 { continue; }
+            let mut best = coast_dist[i];
+            for &(dx, dy, d) in &[(-1_i32, 0_i32, 1.0_f32), (0, -1, 1.0),
+                                    (-1, -1, std::f32::consts::SQRT_2),
+                                    (1, -1, std::f32::consts::SQRT_2),
+                                    (-1, 1, std::f32::consts::SQRT_2)] {
+                let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
+                let proposal = coast_dist[j] + d;
+                if proposal < best { best = proposal; }
+            }
+            coast_dist[i] = best;
+        }
+    }
+    // Backward pass: bottom-right → top-left
+    for y in (0..h).rev() {
+        for x in (0..w).rev() {
+            let i = y * w + x;
+            if coast_dist[i] == 0.0 { continue; }
+            let mut best = coast_dist[i];
+            for &(dx, dy, d) in &[(1_i32, 0_i32, 1.0_f32), (0, 1, 1.0),
+                                    (1, 1, std::f32::consts::SQRT_2),
+                                    (-1, 1, std::f32::consts::SQRT_2),
+                                    (1, -1, std::f32::consts::SQRT_2)] {
+                let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
+                let proposal = coast_dist[j] + d;
+                if proposal < best { best = proposal; }
+            }
+            coast_dist[i] = best;
+        }
+    }
+    // Convert from cells to km
+    for v in coast_dist.iter_mut() {
+        *v *= grid.km_per_cell_x;
+        if *v > 99999.0 { *v = 0.0; } // ocean cells
+    }
+    progress.phase(progress_base, progress_span, 0.15);
+
     // --- Step 2: Per-row prevailing wind (upwind direction) ---
     // Trade winds (|lat|<30°): from east  → upwind = +x
     // Westerlies (30-60°):     from west  → upwind = −x
@@ -2450,7 +2492,18 @@ fn compute_climate_unified(
             );
             // Greenhouse effect from atmosphere (Earth = 1 bar → ~+5°C above baseline)
             let atm = 5.0 * planet.atmosphere_bar.max(0.01).ln_1p();
-            let temp = t_sea - lapse + ocean_mod + tn * 2.0 + atm - aerosol * 5.0;
+
+            // Continentality: inland areas have more extreme annual temperatures.
+            // At high latitudes, colder winters dominate the annual mean.
+            // Moscow (55°N, ~600 km inland): annual mean 5.8°C vs London (51°N, coast): 11.3°C
+            // Empirical: ΔT ≈ −0.008 °C/km × dist × sin(lat)
+            // (Terjung & Louie 1972; Conrad continentality index)
+            let cont_cooling = if elev > 0.0 {
+                coast_dist[i] * 0.008 * (abs_lat * RADIANS).sin()
+            } else {
+                0.0
+            };
+            let temp = t_sea - lapse + ocean_mod + tn * 2.0 + atm - aerosol * 5.0 - cont_cooling;
             temperature[i] = temp.clamp(-70.0, 55.0);
 
             // ---- Precipitation ----
@@ -2496,11 +2549,21 @@ fn compute_climate_unified(
             // Atmosphere moisture scaling
             let atm_factor = planet.atmosphere_bar.max(0.01).sqrt();
 
+            // Continentality drying: inland areas receive less precipitation.
+            // Moisture decays exponentially with distance from coast.
+            // e-folding distance ~800 km: at 800 km, 37% of coastal precip remains.
+            // Central Asia (~1500 km inland): 200-300 mm/yr despite 40°N latitude.
+            let cont_dry = if elev > 0.0 {
+                (-coast_dist[i] / 800.0).exp()  // 1.0 at coast, 0.37 at 800 km
+            } else {
+                1.0
+            };
+
             let p = if elev <= 0.0 {
                 // Ocean: zonal base only (for biome classification of seafloor is N/A)
                 hadley * atm_factor
             } else {
-                let raw = (hadley + windward + coastal + orographic - shadow)
+                let raw = (hadley * cont_dry + windward + coastal + orographic - shadow)
                     * alt_factor
                     + pn * 60.0;
                 (raw * atm_factor - aerosol * 200.0).clamp(20.0, 4500.0)
