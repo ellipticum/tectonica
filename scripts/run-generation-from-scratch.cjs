@@ -11,7 +11,7 @@ if (!fs.existsSync(pkgPath)) {
 const { run_simulation_with_progress } = require(pkgPath);
 
 const EXPECTED_SIZE = {
-  planet: { width: 2048, height: 1024 },
+  planet: { width: 4096, height: 2048 },
   island: { width: 1024, height: 512 },
 };
 

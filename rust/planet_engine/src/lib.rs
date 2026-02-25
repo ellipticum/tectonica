@@ -5,8 +5,8 @@ use std::collections::{BinaryHeap, VecDeque};
 use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
 
-const WORLD_WIDTH: usize = 2048;
-const WORLD_HEIGHT: usize = 1024;
+const WORLD_WIDTH: usize = 4096;
+const WORLD_HEIGHT: usize = 2048;
 const WORLD_SIZE: usize = WORLD_WIDTH * WORLD_HEIGHT;
 const ISLAND_WIDTH: usize = 1024;
 const ISLAND_HEIGHT: usize = 512;
@@ -1993,6 +1993,16 @@ fn compute_relief_physics(
     smooth_field(&mut div_def, 3, grid);
     smooth_field(&mut trans_def, 3, grid);
 
+    // Suppress residual deformation in continental interiors.
+    // conv_def < 0.10 represents the diffuse tail of the deformation field
+    // (>400 km from boundary), where lithosphere has relaxed.  Cratonic
+    // interiors (Canadian Shield, Russian Platform) show no active
+    // convergent thickening.  Clamping to zero creates flat continental
+    // lowlands instead of uniform mild plateaus.
+    for v in conv_def.iter_mut() {
+        if *v < 0.10 { *v = 0.0; }
+    }
+
     // Compute crustal thickness using propagated deformation fields.
     // Base: continental 43 km, oceanic 7 km (Christensen & Mooney 1995).
     let mut crust_thickness = vec![0.0_f32; size];
@@ -2001,7 +2011,7 @@ fn compute_relief_physics(
         let cf = continental_frac[i];
         // Continental base thickness with cratonic variation.
         // Global range 25–55 km (Rudnick & Gao 2003, Table 2).
-        // Multi-octave noise adds ±8 km variation (3000–6500 km wavelengths)
+        // Multi-octave noise adds ±15 km variation (3000–6500 km wavelengths)
         // to create natural basins (thin crust → low elevation) and shields
         // (thick crust → elevated plateaus).  This spreads the continental
         // hypsometric distribution, so the 67th-percentile sea level falls
@@ -2256,17 +2266,27 @@ fn compute_relief_physics(
             // Earth's median land elevation ≈ 400 m (Cogley 1984, Harrison et al. 1983).
             let target_median = 400.0;
 
-            if median_fb > target_median * 1.5 && max_land > median_fb * 1.2 {
+            if median_fb > target_median * 1.2 && max_land > median_fb * 1.2 {
                 // Power-law: (median_fb/max_land)^α = target_median/max_land
                 // → α = ln(target/max) / ln(median/max)
                 let alpha = (target_median / max_land).ln() / (median_fb / max_land).ln();
-                let alpha = alpha.clamp(1.0, 5.0);
+                let alpha = alpha.clamp(1.0, 8.0);
 
-                for v in relief.iter_mut() {
-                    if *v > sl_pre {
-                        let t = (*v - sl_pre) / max_land; // 0..1
-                        *v = sl_pre + t.powf(alpha) * max_land;
+                // Compute the correction delta: positive = lowering amount.
+                // At peaks (t=1) delta≈0; at lowlands delta is large.
+                // Smoothing delta spreads the correction gradually, softening
+                // mountain-flank gradients without blunting peaks.
+                let mut delta = vec![0.0_f32; size];
+                for i in 0..size {
+                    if relief[i] > sl_pre {
+                        let t = (relief[i] - sl_pre) / max_land;
+                        let remapped = sl_pre + t.powf(alpha) * max_land;
+                        delta[i] = relief[i] - remapped;
                     }
+                }
+                smooth_field(&mut delta, 5, grid);
+                for i in 0..size {
+                    relief[i] -= delta[i];
                 }
             }
         }
@@ -2767,8 +2787,9 @@ fn compute_climate_unified(
             };
 
             let p = if elev <= 0.0 {
-                // Ocean: zonal base only (for biome classification of seafloor is N/A)
-                hadley * atm_factor
+                // Ocean: zonal base × 1.2 (open-water evaporation exceeds
+                // zonal mean by ~20 %, Trenberth et al. 2007).
+                hadley * 1.2 * atm_factor
             } else {
                 let raw = (hadley * cont_dry + windward + coastal + orographic - shadow)
                     * alt_factor
@@ -3156,7 +3177,7 @@ fn classify_biome_whittaker(temp: f32, precip: f32, height: f32) -> u8 {
     const IDS: [u8; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11];
 
     let mut best_dist = f32::MAX;
-    let mut best_id = 8_u8; // default: temperate grassland
+    let mut best_id = 8_u8; // default: desert (ID 8; unreachable — centroid search always finds a match)
     for (idx, &(tc, pc)) in CENTROIDS.iter().enumerate() {
         let dt = (temp - tc) / 15.0;
         let dp = (precip - pc) / 500.0;
@@ -3206,6 +3227,37 @@ fn compute_biomes_grid(
         }
         biomes[i] = biome;
     }
+
+    // Biome smoothing: 2-pass mode filter eliminates single-cell biome
+    // anomalies (coastal "eyelash" fringe, isolated riparian pixels).
+    // For each land cell, if fewer than 2 of its 4 cardinal neighbors
+    // share its biome, replace with the most common non-ocean neighbor.
+    for _ in 0..2 {
+        let prev = biomes.clone();
+        for i in 0..size {
+            if prev[i] == 0 { continue; }
+            let x = i % width;
+            let y = i / width;
+            let mut same = 0_u32;
+            let mut counts = [0_u32; 12];
+            for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
+                let nx = (x as i32 + dx).rem_euclid(width as i32) as usize;
+                let ny = (y as i32 + dy).clamp(0, height_grid as i32 - 1) as usize;
+                let j = ny * width + nx;
+                let nb = prev[j];
+                if nb == prev[i] { same += 1; }
+                if nb != 0 && (nb as usize) < 12 { counts[nb as usize] += 1; }
+            }
+            if same < 2 {
+                if let Some((best_id, _)) = counts.iter().enumerate()
+                    .skip(1).max_by_key(|(_, &c)| c)
+                {
+                    biomes[i] = best_id as u8;
+                }
+            }
+        }
+    }
+
     biomes
 }
 

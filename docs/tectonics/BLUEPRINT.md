@@ -230,12 +230,20 @@ Three separate fields are propagated (one per boundary type):
 
 | Boundary type | L_d (km) | Physical reference |
 |---|---|---|
-| Convergent | 300 | Tibet ~1500 km, Andes ~700 km, Alps ~200 km |
+| Convergent | 200 | England & McKenzie 1982: 200–500 km; 200 km prevents small plates from being entirely covered by deformation |
 | Divergent | 150 | Mid-ocean ridge thinning ~200-300 km |
 | Transform | 100 | Narrow shear zones ~100-150 km |
 
 After propagation, 3 passes of diffusive smoothing remove pixel-scale
 jaggedness from the Voronoi boundary shape.
+
+**Interior dead zone:**  After smoothing, convergent deformation values below 0.10
+are clamped to zero.  This removes the diffuse tail of the deformation field
+that extends >400 km from the boundary, where cratonic lithosphere has fully
+relaxed (Canadian Shield, Russian Platform, West African Craton show no active
+convergent thickening).  Without this clamp, the entire continental interior
+receives 5–15 % residual deformation → +1–3 km crust → uniform mild plateaus
+instead of lowlands.
 
 ### 3.3 Crustal Thickness from Deformation Fields
 
@@ -243,11 +251,14 @@ For each cell, crustal thickness `C` is computed from the **propagated**
 deformation fields:
 
 ```
-C_base = 35 km  (continental, buoyancy > 0)                             (3.1)
-       =  7 km  (oceanic, buoyancy ≤ 0)
+C_base = 43 km + noise_var  (continental)                               (3.1)
+       =  7 km              (oceanic; White et al. 1992)
 
-ΔC = + conv_def × 30 km    (continental convergent, CC collision)
-     + conv_def × 18 km    (oceanic convergent, subduction arc)
+noise_var = N(3f, seed) × 10 + N(6f, seed+1) × 5   [km]               (3.1a)
+            range: ±15 km  (wavelengths ~1300–2600 km on unit sphere)
+
+ΔC = + conv_def × 22 km    (continental convergent, CC collision)
+     + conv_def × 13 km    (oceanic convergent, subduction arc)
      − div_def  × 20 km    (divergent, rifting)
      + trans_def × 2 km    (transform, transpression)
 
@@ -255,9 +266,36 @@ C = clamp(C_base + ΔC, 5, 75) km
 ```
 
 **Physical basis:**
-- Tibet has crust ~70 km from India-Asia collision (Dewey & Burke, 1973)
+- Continental base 43 km: cratonic/shield average (Rudnick & Gao 2003, Table 2).
+  With ±15 km noise → range 28–58 km, matching the observed global distribution
+  (25–55 km; thin mobile belts to thick shields).
+- Peak thickness: 43 + 22 = 65 km ≈ Tibet (Dewey & Burke, 1973)
 - Mid-ocean ridges thin to ~5 km
 - Subduction arcs: ~25 km (Christensen & Mooney, 1995)
+
+**Continental assignment (area-aware):**
+
+Plates are sorted by buoyancy (descending) and greedily assigned to the
+continental category until total area reaches a target fraction:
+
+```
+target_continental = min(land_frac + 0.20, 0.85) × total_cells          (3.1b)
+```
+
+where `land_frac = 1 − ocean_percent / 100`. The +0.20 buffer creates
+submerged continental shelf: on Earth, ~40% of the surface is continental crust
+but only ~29% is exposed land (Cogley 1984; Taylor & McLennan 1995).
+
+**Coastline perturbation:** After smoothing the continental fraction field
+(20 passes, σ ≈ 80 km), multi-octave noise breaks Voronoi-straight coastlines:
+
+```
+n = N(4f) × 0.10 + N(8f) × 0.04 + N(16f) × 0.01                      (3.1c)
+cf_perturbed = clamp(cf + n × margin_factor, 0, 1)
+margin_factor = 1 − |2 × cf − 1|    [tent: peak at cf = 0.5, zero at 0/1]
+```
+
+Followed by 3 smoothing passes. Only applies to spherical (planet) grids.
 
 ### 3.4 Flexural Smoothing
 
@@ -275,6 +313,13 @@ C_new = 0.5 × C_old + 0.5 × C_neighbors_mean                          (3.2)
 8 passes at ~20 km/cell → σ ≈ 113 km. Combined with the deformation
 propagation (§3.2), the total smoothing creates geologically realistic wide
 mountain belts with gradual transitions.
+
+**cos(φ) cap in iterative smoothing:** On the equirectangular grid, the E-W
+physical distance per cell is `Δx × cos(φ)`. At high latitudes, smoothing
+weights the E-W direction by `1/cos(φ)`, which compounds across multiple
+passes. To prevent horizontal strip artifacts at poles, iterative smoothing
+(but NOT single-pass propagation) caps `cos(φ) ≥ 0.30` (≈ 72.5°), limiting
+the E-W/N-S ratio to 3.3:1 instead of 11.5:1 at 85°.
 
 **⚠ Approximation:** True flexure solves a 4th-order PDE (D∇⁴w = q). The
 diffusion averaging is a low-pass filter that produces similar spatial
@@ -305,15 +350,14 @@ erodibility).
 
 Given crustal thickness C, the elevation relative to sea level is:
 
-**For thickened crust (C > C_ref, land/mountains):**
+**Airy column buoyancy (Turcotte & Schubert 2002, eq 2.4):**
 ```
-h = (C − C_ref) × 1000 × (ρ_m − ρ_c_eff) / ρ_c_eff     [meters]      (3.3)
+h = C × 1000 × (ρ_m − ρ_c_eff) / ρ_m     [meters]                    (3.3)
 ```
 
-**For thinned crust (C < C_ref, ocean basins):**
-```
-h = (C − C_ref) × 1000 × (ρ_m − ρ_c_eff) / (ρ_m − ρ_w)  [meters]     (3.4)
-```
+This gives absolute freeboard above the compensation depth. Sea level is
+determined separately (§4.6) as the `ocean_percent` percentile of all
+elevations, which acts as the C_ref subtraction.
 
 **Densities:**
 
@@ -323,8 +367,12 @@ h = (C − C_ref) × 1000 × (ρ_m − ρ_c_eff) / (ρ_m − ρ_w)  [meters]    
 | ρ_c (oceanic) | 2900 kg/m³ | Turcotte & Schubert (2002) |
 | ρ_m (mantle) | 3300 kg/m³ | Turcotte & Schubert (2002) |
 | ρ_w (water) | 1030 kg/m³ | Standard |
-| C_ref (continental) | 35 km | Christensen & Mooney (1995) |
-| C_ref (oceanic) | 7 km | Christensen & Mooney (1995) |
+
+**Note on water loading:** Earth's ocean basins are deepened by the weight
+of the water column (yielding eq 3.4 in earlier versions of this document).
+The implementation uses the simpler eq 3.3 for all cells. The missing water
+loading, thermal subsidence (Parsons & Sclater 1977), and dynamic topography
+are compensated by the hypsometric correction (§3.8).
 
 **Thermal correction:**
 ```
@@ -494,9 +542,42 @@ observations of 0.5–10 mm/yr for active orogens (Bevis et al.). Combined with
 7.5 Myr of simulation, this produces realistic mountain heights (6–8 km max)
 balanced by Braun-Willett erosion.
 
-### 4.5 Sea Level Determination
+### 4.5 Hypsometric Curve Correction
 
-After erosion, sea level is set by the `ocean_percent` parameter:
+The Airy model (eq 3.3) produces ~3 km median continental freeboard because
+it ignores water loading, thermal subsidence (Parsons & Sclater 1977),
+sediment loading, and dynamic topography. A power-law remapping compresses
+land hypsometry to match Earth's observed distribution (Cogley 1984):
+
+1. Compute preliminary sea level (ocean_percent percentile)
+2. Find **median** of land elevations (P50) and max land above sea level
+
+```
+α = ln(target_median / max_land) / ln(median_fb / max_land)            (4.7)
+α = clamp(α, 1.0, 5.0)
+
+For each cell above sea level:
+  t = (h − sea_level) / max_land         [normalized: 0..1]
+  h_new = sea_level + t^α × max_land                                   (4.8)
+```
+
+**Target:** median land elevation = 400 m (Cogley 1984, Harrison et al. 1983).
+
+**Delta smoothing:** To avoid gradient amplification at mountain flanks
+(the derivative α·t^(α−1) reaches 2.5× at peaks), the correction is applied
+via a smoothed delta field rather than directly:
+
+```
+delta[i] = h_original[i] − h_remapped[i]          [large in lowlands, ~0 at peaks]
+smooth(delta, 5 passes)                            [blends correction boundaries]
+h_final[i] = h_original[i] − delta[i]                                  (4.9)
+```
+
+This preserves peak heights (delta ≈ 0) while softening transitions.
+
+### 4.6 Sea Level Determination
+
+After the hypsometric correction, sea level is set by `ocean_percent`:
 
 1. Sort all elevation values
 2. Sea level = elevation at the `ocean_percent` percentile
@@ -546,12 +627,15 @@ T(lat, h) = T_sea(lat) − Γ × h                                        (5.2)
 
 **Modifiers:**
 ```
-T_final = T_sea − Γ×h + T_ocean + T_atmosphere + T_noise − T_aerosol   (5.3)
+T_final = T_sea − Γ×h + T_ocean + T_atm + T_noise − T_aerosol         (5.3)
+        − T_continentality
 
-T_ocean     = +2°C if cell is underwater (ocean thermal inertia)
-T_atmosphere = 5 × ln(1 + P_atm)  [°C, greenhouse effect]
-T_noise     = ±3°C (spatial noise for local variability)
-T_aerosol   = event-driven cooling (meteorite impacts)
+T_ocean          = +2°C if cell is underwater (ocean thermal inertia)
+T_atm            = 5 × ln(1 + P_atm)  [°C, greenhouse effect]
+T_noise          = ±2°C (spatial noise for local variability)
+T_aerosol        = event-driven cooling (meteorite impacts)
+T_continentality = 0.008 × d_coast_km × sin(|lat|)   [°C]             (5.3a)
+                   (Terjung & Louie 1972; Conrad continentality index)
 ```
 
 **Final:** clamp to [−70, +55] °C.
@@ -658,15 +742,23 @@ The coefficient 0.0004 /m derives from: lapse rate 6 K/km × Clausius-Clapeyron
 **Final precipitation (land cells):**
 
 ```
-P = (P_hadley + P_windward + P_coastal + P_orographic − P_shadow)       (5.10)
-    × f_altitude × f_atmosphere + noise × 60
+P = (P_hadley × f_cont + P_windward + P_coastal + P_orographic          (5.10)
+    − P_shadow) × f_altitude + noise × 60
 
-f_atmosphere = √(P_atm)
+P_final = clamp(P × f_atmosphere − P_aerosol, 20, 4500) mm/yr
 
-P_final = clamp(P, 20, 4500) mm/yr
+f_cont        = exp(−d_coast / 800 km)    [continentality drying]      (5.10a)
+f_atmosphere  = √(P_atm)
+P_aerosol     = aerosol × 200 mm/yr       [impact winter]
 ```
 
-Ocean cells receive `P_hadley × 1.2`.
+**Continentality drying (eq 5.10a):** inland areas receive less precipitation
+as moisture decays exponentially with distance from coast. e-folding distance
+800 km: at 800 km inland, 37% of coastal precipitation remains. Central Asia
+(~1500 km inland) receives only 200–300 mm/yr despite 40°N latitude.
+
+Ocean cells receive `P_hadley × 1.2 × f_atmosphere` (open-water evaporation
+exceeds zonal mean by ~20%, Trenberth et al. 2007).
 
 ---
 
@@ -797,6 +889,14 @@ If river_map[i] > 0.12 and biome ∈ {Desert, Steppe, Mediterranean,      (7.3)
 River corridors support vegetation even in dry climates (gallery forests,
 riparian woodlands).
 
+### 7.5 Biome Smoothing
+
+2-pass mode filter applied after classification.  For each land cell, if fewer
+than 2 of its 4 cardinal neighbors share its biome, the cell is replaced by the
+most common non-ocean neighbor biome.  This removes single-cell biome anomalies
+— primarily the coastal "eyelash" fringe where thin river channels create
+isolated forest pixels in desert zones.
+
 ---
 
 ## 8. Settlement Suitability
@@ -804,13 +904,11 @@ riparian woodlands).
 A simple habitability score:
 
 ```
-settlement = 0.45 × comfort_T + 0.45 × comfort_P                       (8.1)
-           + 0.42 × river + 0.30 × coast − h/3000
+comfort_T = 1 − |T − 18| / 45                                          (8.1)
+comfort_P = 1 − |P − 1400| / 2200
+elevation_penalty = max(h − 1200, 0) / 2600
 
-comfort_T = max(0, 1 − |T − 17| / 32)
-comfort_P = max(0, 1 − |P − 1200| / 1800)
-
-settlement_final = clamp(settlement, 0, 1)
+settlement = clamp((comfort_T + comfort_P) / 2 − elevation_penalty, 0, 1)
 ```
 
 **Interpretation:** Peak suitability at T = 17°C, P = 1200 mm/yr (temperate
@@ -953,10 +1051,11 @@ noisy boundaries.
 
 | Parameter | Value | Units | Source |
 |-----------|-------|-------|--------|
-| C_ref continental | 35 | km | Christensen & Mooney (1995) |
-| C_ref oceanic | 7 | km | Christensen & Mooney (1995) |
-| CC collision thickening | bstr × 30 | km | ~ Dewey & Burke (1973) |
-| OC subduction thickening | bstr × 18 | km | ~ Christensen & Mooney (1995) |
+| C_base continental | 43 | km | Rudnick & Gao (2003), cratonic base |
+| C_base noise | ±15 | km | Multi-octave 3D noise (28–58 km range) |
+| C_base oceanic | 7 | km | White et al. (1992) |
+| CC collision thickening | bstr × 22 | km | Peak: 43+22=65 km ≈ Tibet |
+| OC subduction thickening | bstr × 13 | km | Andes ~55 km total |
 | Rift thinning | bstr × 20 | km | General |
 | Transform thickening | bstr × 2 | km | Minor transpression (Alpine Fault) |
 | Crust clamp | [5, 75] | km | Physical bounds |
