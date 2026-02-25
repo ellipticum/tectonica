@@ -111,14 +111,29 @@ function estimateLandToneRange(heightMap, maxHeight) {
 }
 
 function landHillshade(heightMap, width, height, x, y, wrapX = true) {
-  const yUp = Math.max(0, y - 1);
-  const yDown = Math.min(height - 1, y + 1);
+  // Spherical Y-wrapping at poles: reflect y and shift x by half-width
+  // (same as equirectangular → sphere mapping used in the Rust engine).
+  let yUp, yDown, xForUp, xForDown;
+  if (y === 0) {
+    yUp = 0;
+    xForUp = wrapX ? (x + (width >> 1)) % width : x;
+  } else {
+    yUp = y - 1;
+    xForUp = x;
+  }
+  if (y === height - 1) {
+    yDown = height - 1;
+    xForDown = wrapX ? (x + (width >> 1)) % width : x;
+  } else {
+    yDown = y + 1;
+    xForDown = x;
+  }
   const xLeft = wrapX ? (x - 1 + width) % width : Math.max(0, x - 1);
   const xRight = wrapX ? (x + 1) % width : Math.min(width - 1, x + 1);
   const left = heightMap[y * width + xLeft] || 0;
   const right = heightMap[y * width + xRight] || 0;
-  const up = heightMap[yUp * width + x] || 0;
-  const down = heightMap[yDown * width + x] || 0;
+  const up = heightMap[yUp * width + xForUp] || 0;
+  const down = heightMap[yDown * width + xForDown] || 0;
 
   const dzdx = (right - left) * 0.5;
   const dzdy = (down - up) * 0.5;

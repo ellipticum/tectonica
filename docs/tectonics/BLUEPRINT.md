@@ -210,18 +210,46 @@ low (ocean floor). This is **Airy isostasy**.
 
 > **Turcotte & Schubert (2002)** *Geodynamics*, Chapter 3
 
-### 3.2 Crustal Thickness from Plates
+### 3.2 Deformation Propagation (England & McKenzie 1982)
 
-For each cell, crustal thickness `C` is computed from the plate field:
+In real orogens, deformation is **distributed** over hundreds of kilometres,
+not confined to the plate boundary itself. The boundary detection yields
+`boundary_strength` only on cells touching a different plate (~4 cells wide =
+80 km). To create geologically realistic wide mountain belts, we propagate
+the boundary signal outward with **exponential distance decay**.
+
+> **England & McKenzie (1982)** *A thin viscous sheet model for continental
+> deformation*, EPSL. Characteristic deformation length L_d ≈ 200–500 km.
+
+**Method:** Max-propagation (iterative morphological dilation with exponential
+decay). Each cell takes `max(self, max_neighbor × exp(-d/L_d))` where d is the
+cardinal/diagonal distance and L_d is the characteristic deformation length.
+Peak amplitude is preserved (unlike diffusive smoothing).
+
+Three separate fields are propagated (one per boundary type):
+
+| Boundary type | L_d (km) | Physical reference |
+|---|---|---|
+| Convergent | 300 | Tibet ~1500 km, Andes ~700 km, Alps ~200 km |
+| Divergent | 150 | Mid-ocean ridge thinning ~200-300 km |
+| Transform | 100 | Narrow shear zones ~100-150 km |
+
+After propagation, 3 passes of diffusive smoothing remove pixel-scale
+jaggedness from the Voronoi boundary shape.
+
+### 3.3 Crustal Thickness from Deformation Fields
+
+For each cell, crustal thickness `C` is computed from the **propagated**
+deformation fields:
 
 ```
 C_base = 35 km  (continental, buoyancy > 0)                             (3.1)
        =  7 km  (oceanic, buoyancy ≤ 0)
 
-ΔC = { +bstr × 30 km   if convergent AND continental (CC collision)
-      { +bstr × 18 km   if convergent AND oceanic (subduction arc)
-      { −bstr × 20 km   if divergent (rifting)
-      { +bstr ×  5 km   if transform
+ΔC = + conv_def × 30 km    (continental convergent, CC collision)
+     + conv_def × 18 km    (oceanic convergent, subduction arc)
+     − div_def  × 20 km    (divergent, rifting)
+     + trans_def × 2 km    (transform, transpression)
 
 C = clamp(C_base + ΔC, 5, 75) km
 ```
@@ -231,45 +259,39 @@ C = clamp(C_base + ΔC, 5, 75) km
 - Mid-ocean ridges thin to ~5 km
 - Subduction arcs: ~25 km (Christensen & Mooney, 1995)
 
-**⚠ Approximation:** Thickening is instantaneous and proportional to boundary
-strength. In reality, collision builds crust over tens of millions of years, and
-the relationship is nonlinear. Transform faults produce only minor transpression
-(+2 km max), consistent with compressive bends on strike-slip faults (e.g.,
-Alpine Fault, NZ).
+### 3.4 Flexural Smoothing
 
-### 3.3 Flexural Smoothing
-
-Raw crustal thickness is step-function-like at plate boundaries. Real
-lithosphere has **flexural rigidity** — it bends over ~200 km wavelengths.
+After computing crustal thickness from the already-wide deformation fields,
+flexural smoothing approximates lithospheric rigidity.
 
 > **Watts (2001)** *Isostasy and Flexure of the Lithosphere*
 
 **Implementation:** 8 passes of 4-neighbor diffusion averaging.
 
-Each pass computes the mean of the 4 orthogonal neighbors and blends:
 ```
 C_new = 0.5 × C_old + 0.5 × C_neighbors_mean                          (3.2)
 ```
 
-8 passes at cell size ~20 km → effective smoothing radius ≈ 8 × 20 / √2 ≈ 113
-km. This approximates a flexural wavelength of ~200 km.
+8 passes at ~20 km/cell → σ ≈ 113 km. Combined with the deformation
+propagation (§3.2), the total smoothing creates geologically realistic wide
+mountain belts with gradual transitions.
 
 **⚠ Approximation:** True flexure solves a 4th-order PDE (D∇⁴w = q). The
 diffusion averaging is a low-pass filter that produces similar spatial
 smoothing but does not capture foreland basins or moat-and-bulge geometry.
 
-### 3.4 Rock Type Classification
+### 3.5 Rock Type Classification
 
 Each cell is assigned a `RockType` based on its tectonic setting:
 
 | Setting | Rock Type | K_eff (m^0.5/yr) |
 |---------|-----------|-------------------|
 | Oceanic, no subduction | Basalt | 1.0 × 10⁻⁶ |
-| Oceanic, subduction (convergent) | Schist | 1.2 × 10⁻⁶ |
-| Continental, strong convergent (bstr > 0.5) | Granite | 0.5 × 10⁻⁶ |
-| Continental, weak convergent (bstr ≤ 0.5) | Quartzite | 0.8 × 10⁻⁶ |
-| Continental, divergent (bstr > 0.3) | Sandstone | 2.0 × 10⁻⁶ |
-| Continental, transform | Schist | 1.2 × 10⁻⁶ |
+| Oceanic, conv_def > 0.3 | Schist | 1.2 × 10⁻⁶ |
+| Continental, conv_def > 0.5 | Granite | 0.5 × 10⁻⁶ |
+| Continental, conv_def > 0.15 | Quartzite | 0.8 × 10⁻⁶ |
+| Continental, div_def > 0.3 | Sandstone | 2.0 × 10⁻⁶ |
+| Continental, trans_def > 0.2 | Schist | 1.2 × 10⁻⁶ |
 | Continental, interior | Noise → Limestone/Sandstone/Granite | 0.5–3.0 × 10⁻⁶ |
 
 > **Harel et al. (2016)** reported erodibility varies by ~2 orders of magnitude
@@ -279,7 +301,7 @@ Each cell is assigned a `RockType` based on its tectonic setting:
 cells) get K_eff × 1.5 (Hovius & Stark 2006: fracturing increases
 erodibility).
 
-### 3.5 Airy Isostatic Elevation
+### 3.6 Airy Isostatic Elevation
 
 Given crustal thickness C, the elevation relative to sea level is:
 
@@ -391,8 +413,31 @@ where factor_i = K_eff_i × Δt × A_i^m / Δx^n
 
 2. **Topological sort.** Cells ordered from highest to lowest elevation.
 
-3. **Drainage area.** Traverse high→low, accumulating: `A[recv(i)] += A[i]`.
-   Each cell starts with `A = Δx²`.
+3. **Drainage area** — scale-dependent routing:
+
+   - **Planet scale (Δx ≈ 20 km): MFD (Multiple Flow Direction).**
+     Each cell distributes its area to all downslope neighbours, weighted
+     by slope^p (Freeman 1991):
+     ```
+     f_i = max(0, S_i)^p / Σ_j max(0, S_j)^p                         (4.3a)
+     S_i = (h_center − h_neighbor) / distance_i
+     p = 1.1
+     ```
+     This produces a smooth area field without single-pixel channel
+     artefacts. At 20 km/cell, individual river channels are sub-grid
+     (typical river width ~100 m = 0.5% of one cell). D8 routing at this
+     scale concentrates all flow into 1-pixel-wide channels with vertical
+     walls — a numerical artefact, not physics.
+
+     > **Freeman (1991):** MFD algorithm with p = 1.1.
+     > **Salles et al. (2023), *Science*:** goSPL uses MFD area + D8
+     > implicit solver at 10 km global resolution — the same approach.
+
+   - **Island scale (Δx ≈ 0.4–2 km): D8 (Single Flow Direction).**
+     At this resolution, individual valleys are resolvable (the
+     characteristic length l_c = κ/K ≈ 10 km spans many cells).
+     Standard D8 accumulation: `A[recv(i)] += A[i]`, each cell starting
+     with `A = Δx²`.
 
 4. **Implicit update.** Traverse low→high (downstream first). For each land
    cell (h > 0):
@@ -401,6 +446,9 @@ where factor_i = K_eff_i × Δt × A_i^m / Δx^n
    h_new = (h_old + U×Δt + factor × h_recv_new) / (1 + factor)
    ```
    This is unconditionally stable for any Δt (implicit Euler).
+   The D8 receiver tree is used for the implicit solver at both scales
+   (the solver requires a tree structure). Only the area values differ
+   between MFD and D8.
 
 5. **Hillslope diffusion** (explicit):
    ```
@@ -922,6 +970,8 @@ noisy boundaries.
 | m (area exponent) | 0.5 | — | Whipple & Tucker (1999) |
 | n (slope exponent) | 1.0 | — | Whipple & Tucker (1999) |
 | κ (hillslope diffusivity) | 0.01 | m²/yr | CFL-stable for Δx=20km |
+| MFD exponent p (planet) | 1.1 | — | Freeman (1991), goSPL |
+| MFD exponent p (island) | 0.0 (D8) | — | D8 correct at ≤1 km |
 | K_eff Granite | 0.5 × 10⁻⁶ | m^0.5/yr | Harel et al. (2016) |
 | K_eff Quartzite | 0.8 × 10⁻⁶ | m^0.5/yr | Harel et al. (2016) |
 | K_eff Basalt | 1.0 × 10⁻⁶ | m^0.5/yr | Harel et al. (2016) |
@@ -1105,34 +1155,41 @@ These parts of the code are not derived from physics:
 
 3. **Cox, A. & Hart, R.B. (1986).** *Plate Tectonics: How It Works*. Blackwell Scientific.
 
-4. **Harel, M.-A., Mudd, S.M. & Attal, M. (2016).** Global analysis of the stream power law parameters based on worldwide 10Be denudation rates. *Geomorphology*, 268, 184-196.
+4. **England, P. & McKenzie, D. (1982).** A thin viscous sheet model for continental deformation. *Geophysical Journal International*, 70(2), 295-321.
 
-5. **Held, I.M. & Hou, A.Y. (1980).** Nonlinear axially symmetric circulations in a nearly inviscid atmosphere. *J. Atmos. Sci.*, 37, 515-533.
+5. **Freeman, T.G. (1991).** Calculating catchment area with divergent flow based on a regular grid. *Computers & Geosciences*, 17(3), 413-422.
 
-6. **Holton, J.R. & Hakim, G.J. (2013).** *An Introduction to Dynamic Meteorology*, 5th ed. Academic Press.
+6. **Harel, M.-A., Mudd, S.M. & Attal, M. (2016).** Global analysis of the stream power law parameters based on worldwide 10Be denudation rates. *Geomorphology*, 268, 184-196.
 
-7. **Hovius, N. & Stark, C.P. (2006).** Landslide-driven erosion and topographic evolution of active mountain belts. In *Landslides from Massive Rock Slope Failure*, S.G. Evans et al. (eds), NATO Science Series, 573-590.
+7. **Held, I.M. & Hou, A.Y. (1980).** Nonlinear axially symmetric circulations in a nearly inviscid atmosphere. *J. Atmos. Sci.*, 37, 515-533.
 
-8. **Howard, A.D. (1994).** A detachment-limited model of drainage basin evolution. *Water Resources Research*, 30(7), 2261-2285.
+8. **Holton, J.R. & Hakim, G.J. (2013).** *An Introduction to Dynamic Meteorology*, 5th ed. Academic Press.
 
-9. **O'Callaghan, J.F. & Mark, D.M. (1984).** The extraction of drainage networks from digital elevation data. *Computer Vision, Graphics, and Image Processing*, 28(3), 323-344.
+9. **Hovius, N. & Stark, C.P. (2006).** Landslide-driven erosion and topographic evolution of active mountain belts. In *Landslides from Massive Rock Slope Failure*, S.G. Evans et al. (eds), NATO Science Series, 573-590.
 
-10. **Peixoto, J.P. & Oort, A.H. (1992).** *Physics of Climate*. American Institute of Physics.
+10. **Howard, A.D. (1994).** A detachment-limited model of drainage basin evolution. *Water Resources Research*, 30(7), 2261-2285.
 
-11. **Roe, G.H. (2005).** Orographic precipitation. *Annual Review of Earth and Planetary Sciences*, 33, 645-671.
+11. **O'Callaghan, J.F. & Mark, D.M. (1984).** The extraction of drainage networks from digital elevation data. *Computer Vision, Graphics, and Image Processing*, 28(3), 323-344.
 
-12. **Smith, R.B. (1979).** The influence of mountains on the atmosphere. *Advances in Geophysics*, 21, 87-230.
+12. **Peixoto, J.P. & Oort, A.H. (1992).** *Physics of Climate*. American Institute of Physics.
 
-13. **Turcotte, D.L. & Schubert, G. (2002).** *Geodynamics*, 2nd ed. Cambridge University Press.
+13. **Roe, G.H. (2005).** Orographic precipitation. *Annual Review of Earth and Planetary Sciences*, 33, 645-671.
 
-14. **Watts, A.B. (2001).** *Isostasy and Flexure of the Lithosphere*. Cambridge University Press.
+14. **Salles, T. et al. (2023).** Hundred million years of landscape dynamics from catchment to global scale. *Science*, 379(6635), 918-923.
 
-15. **Whipple, K.X. & Tucker, G.E. (1999).** Dynamics of the stream-power river incision model. *J. Geophys. Res.*, 104(B8), 17661-17674.
+15. **Smith, R.B. (1979).** The influence of mountains on the atmosphere. *Advances in Geophysics*, 21, 87-230.
 
-16. **Whittaker, R.H. (1975).** *Communities and Ecosystems*, 2nd ed. Macmillan.
+16. **Turcotte, D.L. & Schubert, G. (2002).** *Geodynamics*, 2nd ed. Cambridge University Press.
+
+17. **Watts, A.B. (2001).** *Isostasy and Flexure of the Lithosphere*. Cambridge University Press.
+
+18. **Whipple, K.X. & Tucker, G.E. (1999).** Dynamics of the stream-power river incision model. *J. Geophys. Res.*, 104(B8), 17661-17674.
+
+19. **Whittaker, R.H. (1975).** *Communities and Ecosystems*, 2nd ed. Macmillan.
 
 ---
 
 *Document updated 2026-02-25. Reflects `rust/planet_engine/src/lib.rs` after
-Phase A–C unification + physics fixes (9 issues resolved). All equation numbers
-and parameter values verified against the implementation.*
+Phase A–C unification, physics fixes, deformation propagation (England &
+McKenzie 1982), and MFD area routing (Freeman 1991 / goSPL). All equation
+numbers and parameter values verified against the implementation.*

@@ -1661,33 +1661,104 @@ fn compute_plates(
 
 // ---------------------------------------------------------------------------
 // Airy isostasy: crust thickness → elevation (m)
-// Based on: Turcotte & Schubert (2002), Geodynamics, Ch. 3
+// Turcotte & Schubert (2002), Geodynamics, §2.2 eq. 2.4
 // ---------------------------------------------------------------------------
+//
+// Isostatic balance: equal pressure at compensation depth D for all columns.
+// For a column of crust C (km) and density ρ_c on mantle ρ_m:
+//
+//   h = C × (ρ_m − ρ_c) / ρ_m     [surface height above compensation depth]
+//
+// Continental crust (40 km, ρ=2800): h = 6061 m
+// Oceanic crust    ( 7 km, ρ=2900): h =  848 m
+// Difference: 5213 m — gives ~300 m continental freeboard above sea level.
+//
+// Sea level is determined separately from ocean_percent.
 
-/// Compute isostatic elevation in metres from crust thickness.
-///
-/// * `crust_km`      — crustal thickness in km
-/// * `is_continental` — true = continental (ρ_c = 2800), false = oceanic (ρ_c = 2900)
-/// * `heat_anomaly`  — normalised thermal anomaly [0..1]; hot crust expands → lower ρ
-fn isostatic_elevation(crust_km: f32, is_continental: bool, heat_anomaly: f32) -> f32 {
-    let rho_c: f32 = if is_continental { 2800.0 } else { 2900.0 };
+/// Compute isostatic surface height (m) from crustal column buoyancy.
+/// `continental_frac` is 0.0 (oceanic) to 1.0 (continental), allowing
+/// smooth continent-ocean transitions (continental shelf).
+fn isostatic_elevation(crust_km: f32, continental_frac: f32, heat_anomaly: f32) -> f32 {
+    // Density interpolation: oceanic basalt 2900, continental granite 2800.
+    let rho_c: f32 = 2900.0 - continental_frac * 100.0;
     let rho_m: f32 = 3300.0;
-    let rho_w: f32 = 1030.0;
-    // Reference crustal thickness: 35 km continental, 7 km oceanic
-    let c_ref: f32 = if is_continental { 35.0 } else { 7.0 };
 
-    // Thermal correction: hot crust is up to 2 % less dense
+    // Thermal correction: hot crust is up to 2 % less dense (thermal expansion)
     let thermal_correction = 1.0 - heat_anomaly.clamp(0.0, 1.0) * 0.02;
     let rho_c_eff = rho_c * thermal_correction;
 
-    let delta_c = crust_km - c_ref; // km
+    // Turcotte & Schubert eq. 2.4: column buoyancy height
+    crust_km * 1000.0 * (rho_m - rho_c_eff) / rho_m
+}
 
-    if delta_c >= 0.0 {
-        // Continental root → positive elevation
-        delta_c * 1000.0 * (rho_m - rho_c_eff) / rho_c_eff
-    } else {
-        // Thinned crust → negative elevation (depth)
-        delta_c * 1000.0 * (rho_m - rho_c_eff) / (rho_m - rho_w)
+// ---------------------------------------------------------------------------
+// Deformation propagation: exponential decay from plate boundaries
+// ---------------------------------------------------------------------------
+//
+// England & McKenzie 1982 (EPSL): continental deformation in collision zones
+// decays exponentially from the plate boundary with characteristic length
+// L_d ≈ 200–500 km.  This function propagates a boundary-only seed field
+// outward using iterative max-dilation with per-step exponential decay,
+// equivalent to solving the eikonal equation with multiplicative cost.
+// Peak amplitude is preserved (unlike diffusive smoothing).
+
+/// Propagate boundary deformation field with exponential distance decay.
+fn propagate_deformation(
+    seed: &[f32],
+    decay_km: f32,
+    grid: &GridConfig,
+) -> Vec<f32> {
+    let l_cells = decay_km / grid.km_per_cell_x;
+    let decay_cardinal = (-1.0_f32 / l_cells).exp();
+    let decay_diagonal = (-std::f32::consts::SQRT_2 / l_cells).exp();
+
+    let mut field = seed.to_vec();
+    let mut scratch = vec![0.0_f32; grid.size];
+    let max_passes = (3.0 * l_cells).ceil() as usize + 5;
+
+    for _ in 0..max_passes {
+        let mut changed = false;
+        for y in 0..grid.height {
+            for x in 0..grid.width {
+                let i = grid.index(x, y);
+                let mut val = field[i];
+                for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
+                    let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
+                    let proposal = field[j] * decay_cardinal;
+                    if proposal > val { val = proposal; changed = true; }
+                }
+                for (dx, dy) in [(-1_i32, -1_i32), (-1, 1), (1, -1), (1, 1)] {
+                    let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
+                    let proposal = field[j] * decay_diagonal;
+                    if proposal > val { val = proposal; changed = true; }
+                }
+                scratch[i] = val;
+            }
+        }
+        field.copy_from_slice(&scratch);
+        if !changed { break; }
+    }
+    field
+}
+
+/// In-place 4-neighbor diffusive smoothing (N passes, center weight 4).
+fn smooth_field(field: &mut [f32], passes: usize, grid: &GridConfig) {
+    let mut scratch = vec![0.0_f32; grid.size];
+    for _ in 0..passes {
+        for y in 0..grid.height {
+            for x in 0..grid.width {
+                let i = grid.index(x, y);
+                let mut sum = field[i] * 4.0;
+                let mut wt = 4.0_f32;
+                for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
+                    let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
+                    sum += field[j];
+                    wt += 1.0;
+                }
+                scratch[i] = sum / wt;
+            }
+        }
+        field.copy_from_slice(&scratch);
     }
 }
 
@@ -1722,42 +1793,73 @@ fn compute_relief_physics(
     // --- 1. Continental vs oceanic per cell ---
     // Plates with buoyancy > 0 are continental lithosphere.
     let mut is_continental = vec![false; size];
+    let mut continental_frac = vec![0.0_f32; size];
     for i in 0..size {
         let pid = plates.plate_field[i] as usize;
         if pid < n_plates {
             is_continental[i] = plates.plate_vectors[pid].buoyancy > 0.0;
+            continental_frac[i] = if is_continental[i] { 1.0 } else { 0.0 };
         }
     }
 
+    // Smooth continental fraction to create gradual continent-ocean transition.
+    // 5 passes ≈ 100 km diffusion = realistic continental shelf/slope width
+    // (Bond et al. 1995; passive margin transition zone ~80-150 km).
+    smooth_field(&mut continental_frac, 5, grid);
+
     // --- 2. Crustal thickness from plate boundary physics ---
+    // Create per-type seed fields from boundary detection, then propagate
+    // with exponential decay to form wide deformation zones.
+    // Reference: England & McKenzie 1982 (EPSL) — distributed deformation.
+    let mut conv_seed = vec![0.0_f32; size];
+    let mut div_seed = vec![0.0_f32; size];
+    let mut trans_seed = vec![0.0_f32; size];
+
+    for i in 0..size {
+        match plates.boundary_types[i] {
+            1 => conv_seed[i] = plates.boundary_strength[i],
+            2 => div_seed[i] = plates.boundary_strength[i],
+            3 => trans_seed[i] = plates.boundary_strength[i],
+            _ => {}
+        }
+    }
+
+    // Propagate deformation zones: L_d from England & McKenzie 1982.
+    // Convergent ~300 km (Tibet 500, Andes 250, Alps 100 — compromise).
+    // Divergent ~150 km (rift/ridge thinning zone).
+    // Transform ~100 km (narrow shear zone).
+    let mut conv_def = propagate_deformation(&conv_seed, 300.0, grid);
+    let mut div_def = propagate_deformation(&div_seed, 150.0, grid);
+    let mut trans_def = propagate_deformation(&trans_seed, 100.0, grid);
+
+    // Smooth propagated fields to diffuse jagged Voronoi boundary edges.
+    // 3 passes ≈ σ ≈ 35 km — smooths pixel-scale jaggedness while preserving
+    // the macro-scale deformation pattern.
+    smooth_field(&mut conv_def, 3, grid);
+    smooth_field(&mut div_def, 3, grid);
+    smooth_field(&mut trans_def, 3, grid);
+
+    // Compute crustal thickness using propagated deformation fields.
     // Base: continental 35 km, oceanic 7 km (Christensen & Mooney 1995).
-    // Convergent boundaries thicken crust (CC: collision doubles, OC: arc volcanism).
-    // Divergent boundaries thin crust (rifting).
-    // Transform boundaries: minor transpressional thickening.
     let mut crust_thickness = vec![0.0_f32; size];
     for i in 0..size {
-        let base = if is_continental[i] { 35.0_f32 } else { 7.0_f32 };
-        let btype = plates.boundary_types[i];
-        let bstr = plates.boundary_strength[i];
+        // Base crust interpolated by continental fraction:
+        // Continental 40 km (Rudnick & Gao 2003, craton average),
+        // Oceanic 7 km (White et al. 1992).
+        // Gradual transition creates realistic continental shelf profile.
+        let cf = continental_frac[i];
+        let base = cf * 40.0 + (1.0 - cf) * 7.0;
 
-        let thickening = match btype {
-            1 => {
-                // Convergent: CC collision thickens up to +30 km (→ 65 km, like Tibet);
-                //             OC subduction arc: up to +18 km.
-                if is_continental[i] { bstr * 30.0 } else { bstr * 18.0 }
-            },
-            2 => {
-                // Divergent: rift thinning up to -20 km.
-                -bstr * 20.0
-            },
-            3 => {
-                // Transform: minor transpressional thickening only.
-                bstr * 2.0
-            },
-            _ => 0.0,
-        };
+        // Convergent thickening scaled by continent fraction:
+        // CC collision → up to +30 km (Tibet 65 km total);
+        // OC subduction → up to +18 km (arc volcanism).
+        let conv_thick = conv_def[i] * (cf * 30.0 + (1.0 - cf) * 18.0);
+        // Divergent: rift thinning up to -20 km.
+        let div_thick = -div_def[i] * 20.0;
+        // Transform: minor transpression up to +2 km.
+        let trans_thick = trans_def[i] * 2.0;
 
-        crust_thickness[i] = (base + thickening).clamp(5.0, 75.0);
+        crust_thickness[i] = (base + conv_thick + div_thick + trans_thick).clamp(5.0, 75.0);
     }
 
     // Smooth crust_thickness: flexural isostasy proxy.
@@ -1785,33 +1887,34 @@ fn compute_relief_physics(
     progress.phase(progress_base, progress_span, 0.08);
 
     // --- 3. Rock type from tectonic context → K_eff (Harel et al. 2016) ---
+    // Uses propagated deformation fields for wide lithology zones matching
+    // the deformation zones (fold belts, rift basins extend hundreds of km).
     let noise_seed = hash_u32(seed ^ 0x80C4_F1E1);
     let mut k_eff = vec![0.0_f32; size];
     for i in 0..size {
-        let btype = plates.boundary_types[i];
-        let bstr = plates.boundary_strength[i];
-
         let rock = if !is_continental[i] {
-            // Oceanic: basalt (MORB), schist near subduction
-            if btype == 1 && bstr > 0.3 { RockType::Schist } else { RockType::Basalt }
+            // Oceanic: basalt (MORB), schist near subduction zone
+            if conv_def[i] > 0.3 { RockType::Schist } else { RockType::Basalt }
         } else {
-            match btype {
-                1 if bstr > 0.5 => RockType::Granite,    // orogenic metamorphic core
-                1               => RockType::Quartzite,   // fold-and-thrust belt
-                2 if bstr > 0.3 => RockType::Sandstone,   // rift sediments
-                3               => RockType::Schist,       // sheared metamorphic
-                _ => {
-                    // Continental interior: noise-based sedimentary cover
-                    let n = value_noise3(
-                        cell_cache.noise_x[i] * 2.0,
-                        cell_cache.noise_y[i] * 2.0,
-                        cell_cache.noise_z[i] * 2.0,
-                        noise_seed,
-                    );
-                    if n > 0.3 { RockType::Limestone }
-                    else if n > -0.3 { RockType::Sandstone }
-                    else { RockType::Granite }
-                }
+            if conv_def[i] > 0.5 {
+                RockType::Granite    // orogenic metamorphic core
+            } else if conv_def[i] > 0.15 {
+                RockType::Quartzite  // fold-and-thrust belt
+            } else if div_def[i] > 0.3 {
+                RockType::Sandstone  // rift sediments
+            } else if trans_def[i] > 0.2 {
+                RockType::Schist     // sheared metamorphic
+            } else {
+                // Continental interior: noise-based sedimentary cover
+                let n = value_noise3(
+                    cell_cache.noise_x[i] * 2.0,
+                    cell_cache.noise_y[i] * 2.0,
+                    cell_cache.noise_z[i] * 2.0,
+                    noise_seed,
+                );
+                if n > 0.3 { RockType::Limestone }
+                else if n > -0.3 { RockType::Sandstone }
+                else { RockType::Granite }
             }
         };
 
@@ -1853,7 +1956,7 @@ fn compute_relief_physics(
 
     let mut relief = vec![0.0_f32; size];
     for i in 0..size {
-        relief[i] = isostatic_elevation(crust_thickness[i], is_continental[i], heat_map[i]);
+        relief[i] = isostatic_elevation(crust_thickness[i], continental_frac[i], heat_map[i]);
     }
 
     // Add small-scale initial roughness (4-octave noise, total ~120 m amplitude).
@@ -1877,18 +1980,23 @@ fn compute_relief_physics(
 
     let mut uplift = vec![0.0_f32; size];
     for i in 0..size {
+        // Active uplift uses RAW boundary_strength (narrow): GPS observations show
+        // active tectonic forcing is concentrated near the plate boundary front
+        // (~200 km wide), while cumulative deformation (crust_thickness above) is wide.
         let bstr = plates.boundary_strength[i];
         let btype = plates.boundary_types[i];
-        // Scale uplift by plate speed (faster plates → stronger collision → more uplift).
         let speed_factor = plate_speed / 5.0; // normalized to Earth-like 5 cm/yr
 
         uplift[i] = match btype {
-            1 => bstr * 0.005 * speed_factor,   // convergent: up to 5 mm/yr (GPS: 0.5-10)
-            2 => -bstr * 0.002 * speed_factor,  // divergent: up to -2 mm/yr subsidence
-            3 => bstr * 0.001 * speed_factor,   // transform: up to 1 mm/yr transpression
+            1 => bstr * 0.005 * speed_factor,   // convergent: up to 5 mm/yr
+            2 => -bstr * 0.002 * speed_factor,  // divergent: subsidence
+            3 => bstr * 0.001 * speed_factor,   // transform: transpression
             _ => 0.0,
         };
     }
+    // Smooth uplift to ~100 km wide zone (5 passes, σ ≈ 50 km).
+    // GPS observations show active deformation extends ~100 km from main thrust.
+    smooth_field(&mut uplift, 5, grid);
 
     // 3 epochs × 5 steps = 15 Braun-Willett passes.
     // dt = 500 kyr, total simulated time = 15 × 500 kyr = 7.5 Myr.
@@ -1917,7 +2025,8 @@ fn compute_relief_physics(
             dx_m,
             0.5,   // m: area exponent (Whipple & Tucker 1999)
             1.0,   // n: slope exponent
-            0.01,  // kappa: hillslope diffusivity (CFL-stable at dx=20km, dt=500ky)
+            0.01,  // kappa: hillslope diffusivity m²/yr
+            1.1,   // mfd_p: MFD area routing (Freeman 1991, goSPL)
             steps_per_epoch,
             grid,
             progress,
@@ -1928,8 +2037,36 @@ fn compute_relief_physics(
         // Isostatic relaxation after each epoch: relief drifts toward isostatic
         // equilibrium (Maxwell relaxation timescale ~1 Myr for lithosphere).
         for i in 0..size {
-            let target = isostatic_elevation(crust_thickness[i], is_continental[i], heat_map[i]);
+            let target = isostatic_elevation(crust_thickness[i], continental_frac[i], heat_map[i]);
             relief[i] = relief[i] * 0.85 + target * 0.15;
+        }
+    }
+
+    // --- 5b. Post-erosion land smoothing ---
+    // At 20 km/cell, D8 erosion creates sub-grid-scale channel artifacts (single-
+    // cell incised valleys).  3 passes of diffusive smoothing (~60 km σ) represent
+    // unresolved hillslope mass wasting, debris flows, and colluvial transport.
+    // Applied to land cells only to preserve ocean bathymetry.
+    {
+        let mut scratch = relief.clone();
+        for _ in 0..3 {
+            for y in 0..grid.height {
+                for x in 0..grid.width {
+                    let i = grid.index(x, y);
+                    if relief[i] <= 0.0 { scratch[i] = relief[i]; continue; }
+                    let mut sum = relief[i] * 4.0;
+                    let mut wt = 4.0_f32;
+                    for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
+                        let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
+                        if relief[j] > 0.0 {
+                            sum += relief[j];
+                            wt += 1.0;
+                        }
+                    }
+                    scratch[i] = sum / wt;
+                }
+            }
+            relief.copy_from_slice(&scratch);
         }
     }
 
@@ -2875,6 +3012,61 @@ fn topological_sort_descending(height: &[f32]) -> Vec<usize> {
     order
 }
 
+/// MFD (Multiple Flow Direction) drainage area accumulation (Freeman 1991).
+///
+/// Distributes each cell's area to all downslope neighbours, weighted by
+/// slope^p.  Process order: highest to lowest elevation (upstream → downstream).
+///
+/// This produces a smoother drainage area field than D8, eliminating the
+/// single-pixel channel artefacts at coarse grid resolution (≥10 km/cell).
+///
+/// Reference: goSPL (Salles et al., Science 2023) uses MFD area at 10 km scale.
+fn compute_mfd_area(
+    height: &[f32],
+    order: &[usize],
+    dx_m: f32,
+    p: f32,
+    grid: &GridConfig,
+) -> Vec<f32> {
+    let cell_area = dx_m * dx_m;
+    let mut area = vec![cell_area; grid.size];
+
+    for &i in order.iter() {
+        let y = i / grid.width;
+        let x = i % grid.width;
+        let hi = height[i];
+        let area_i = area[i];
+
+        let mut targets: [(usize, f32); 8] = [(0, 0.0); 8];
+        let mut w_sum = 0.0_f32;
+        let mut count = 0;
+
+        for oy in -1_i32..=1 {
+            for ox in -1_i32..=1 {
+                if ox == 0 && oy == 0 { continue; }
+                let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
+                let dist = if ox == 0 || oy == 0 { 1.0_f32 } else { std::f32::consts::SQRT_2 };
+                let slope = (hi - height[j]) / dist;
+                if slope > 0.0 {
+                    let w = slope.powf(p);
+                    targets[count] = (j, w);
+                    w_sum += w;
+                    count += 1;
+                }
+            }
+        }
+
+        if w_sum > 0.0 {
+            let inv = 1.0 / w_sum;
+            for k in 0..count {
+                let (j, w) = targets[k];
+                area[j] += area_i * w * inv;
+            }
+        }
+    }
+    area
+}
+
 /// Apply one implicit Braun-Willett stream power timestep.
 ///
 /// Stream power law:  E = K * A^m * S^n
@@ -2891,6 +3083,7 @@ fn stream_power_step(
     m: f32, // area exponent (canonical 0.5)
     n: f32, // slope exponent (canonical 1.0)
     kappa: f32, // hillslope diffusivity m²/yr
+    mfd_p: f32, // MFD exponent: 0.0 = D8, >0.0 = MFD (Freeman 1991, recommend 1.1)
     grid: &GridConfig,
 ) {
     let size = grid.size;
@@ -2901,16 +3094,23 @@ fn stream_power_step(
     // 2. Topological sort (high → low)
     let order = topological_sort_descending(height);
 
-    // 3. Drainage area accumulation (upstream → downstream, i.e. forward in order)
-    let cell_area = dx_m * dx_m;
-    let mut area = vec![cell_area; size];
-    for &i in order.iter() {
-        let r = receivers[i];
-        if r != i {
-            let area_i = area[i];
-            area[r] += area_i;
+    // 3. Drainage area accumulation (upstream → downstream)
+    let area = if mfd_p > 0.0 {
+        // MFD: distribute area across all downslope neighbours (goSPL approach).
+        // Eliminates single-pixel channel artefacts at coarse resolution.
+        compute_mfd_area(height, &order, dx_m, mfd_p, grid)
+    } else {
+        // D8: all area to steepest-descent receiver (correct at ≤1 km/cell).
+        let cell_area = dx_m * dx_m;
+        let mut area = vec![cell_area; size];
+        for &i in order.iter() {
+            let r = receivers[i];
+            if r != i {
+                area[r] += area[i];
+            }
         }
-    }
+        area
+    };
 
     // 4. Implicit elevation update (downstream → upstream, i.e. reverse order).
     //    Ocean/below-sea-level cells (h <= 0) are base-level boundaries: skip them.
@@ -2976,6 +3176,7 @@ fn stream_power_evolve(
     m: f32,
     n_exp: f32,
     kappa: f32,
+    mfd_p: f32,
     n_steps: usize,
     grid: &GridConfig,
     progress: &mut ProgressTap<'_>,
@@ -2985,7 +3186,7 @@ fn stream_power_evolve(
     for step in 0..n_steps {
         let t = step as f32 / n_steps.max(1) as f32;
         progress.phase(progress_base, progress_span, t);
-        stream_power_step(height, uplift, k_eff, dt_yr, dx_m, m, n_exp, kappa, grid);
+        stream_power_step(height, uplift, k_eff, dt_yr, dx_m, m, n_exp, kappa, mfd_p, grid);
     }
     progress.phase(progress_base, progress_span, 1.0);
 }
@@ -3491,6 +3692,7 @@ fn run_island_crop(
         dx_m,
         0.5, 1.0,   // m, n (standard stream power exponents)
         0.01,        // kappa (hillslope diffusion, CFL-safe)
+        0.0,         // mfd_p: 0 = D8 (correct at island ≤1 km/cell)
         10,          // 10 steps
         &island_grid,
         progress,
