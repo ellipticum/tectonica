@@ -286,6 +286,10 @@ struct GridConfig {
     is_spherical: bool,
     km_per_cell_x: f32,
     km_per_cell_y: f32,
+    /// cos(latitude) for each row; used for latitude-corrected smoothing
+    /// and deformation propagation on equirectangular grids.
+    /// All 1.0 for flat (island) grids.
+    cos_lat_by_y: Vec<f32>,
 }
 
 impl GridConfig {
@@ -293,6 +297,14 @@ impl GridConfig {
     fn planet() -> Self {
         let km_y = (std::f32::consts::PI * 6371.0) / WORLD_HEIGHT as f32; // ~19.6 km
         let km_x = (2.0 * std::f32::consts::PI * 6371.0) / WORLD_WIDTH as f32; // ~19.6 km at equator
+        // Precompute cos(latitude) per row, clamped to avoid pole singularity.
+        // At 85° cos ≈ 0.087; clamping preserves numerical stability while
+        // allowing strong latitude correction up to very high latitudes.
+        let mut cos_lat_by_y = vec![0.0_f32; WORLD_HEIGHT];
+        for y in 0..WORLD_HEIGHT {
+            let lat_rad = (90.0 - (y as f32 + 0.5) * (180.0 / WORLD_HEIGHT as f32)) * RADIANS;
+            cos_lat_by_y[y] = lat_rad.cos().abs().max(0.087); // clamp at ~85°
+        }
         Self {
             width: WORLD_WIDTH,
             height: WORLD_HEIGHT,
@@ -300,6 +312,7 @@ impl GridConfig {
             is_spherical: true,
             km_per_cell_x: km_x,
             km_per_cell_y: km_y,
+            cos_lat_by_y,
         }
     }
 
@@ -313,6 +326,7 @@ impl GridConfig {
             is_spherical: false,
             km_per_cell_x: km_per_cell,
             km_per_cell_y: km_per_cell,
+            cos_lat_by_y: vec![1.0; height], // flat grid — no latitude distortion
         }
     }
 
@@ -918,6 +932,14 @@ fn build_irregular_plate_field(plates: &[PlateSpec], seed: u32, cache: &WorldCac
         (-1, -1, std::f32::consts::SQRT_2),
     ];
 
+    // Precompute cos(lat) per row for latitude-corrected step distances.
+    // On an equirectangular grid, E-W physical distance = cos(φ) × cell_size.
+    let mut cos_lat_row = vec![0.0_f32; WORLD_HEIGHT];
+    for row in 0..WORLD_HEIGHT {
+        let lat_rad = (90.0 - (row as f32 + 0.5) * (180.0 / WORLD_HEIGHT as f32)) * RADIANS;
+        cos_lat_row[row] = lat_rad.cos().abs().max(0.087);
+    }
+
     let mut assigned = 0usize;
     while queue.size() > 0 && assigned < WORLD_SIZE {
         let Some(node) = queue.pop() else {
@@ -938,7 +960,7 @@ fn build_irregular_plate_field(plates: &[PlateSpec], seed: u32, cache: &WorldCac
         let y = node.index / WORLD_WIDTH;
         let gp = growth_params[node.plate as usize];
 
-        for (dx, dy, w) in STEPS {
+        for (dx, dy, _w) in STEPS {
             let j = index_spherical(x as i32 + dx, y as i32 + dy);
             if plate_field[j] != -1 {
                 continue;
@@ -955,7 +977,9 @@ fn build_irregular_plate_field(plates: &[PlateSpec], seed: u32, cache: &WorldCac
             let wave_a = (sx * scale_a + sy * scale_b + gp.phase_a).sin();
             let wave_b = (sy * scale_c - sz * scale_d + gp.phase_b).cos();
             let rough_factor = 1.0 + gp.roughness * (0.22 * wave_a + 0.18 * wave_b);
-            let drift_align = dx as f32 * gp.drift_x + dy as f32 * gp.drift_y;
+            // Latitude-corrected drift alignment: dx in physical space is dx × cos(φ)
+            let cl = cos_lat_row[y];
+            let drift_align = dx as f32 * cl * gp.drift_x + dy as f32 * gp.drift_y;
             let drift_factor = 1.03 - 0.12 * drift_align;
             let structural = structural_field[j];
             let structure_factor = clampf(
@@ -964,8 +988,12 @@ fn build_irregular_plate_field(plates: &[PlateSpec], seed: u32, cache: &WorldCac
                 1.9,
             );
             let polar_factor = 1.0 + (lat.abs() / 90.0) * 0.1;
+            // Latitude-corrected physical step distance:
+            // E-W = cos(φ), N-S = 1.0, diagonal = √(cos²φ + 1)
+            let phys_w = if dy == 0 { cl } else if dx == 0 { 1.0 }
+                         else { (cl * cl + 1.0).sqrt() };
             let step_cost =
-                (w * gp.spread * rough_factor * drift_factor * structure_factor * polar_factor)
+                (phys_w * gp.spread * rough_factor * drift_factor * structure_factor * polar_factor)
                     .max(0.08);
             let next_cost = node.cost + step_cost;
 
@@ -1562,12 +1590,20 @@ fn compute_plates(
         (-1, 1, std::f32::consts::FRAC_1_SQRT_2),
     ];
 
+    // Precompute cos(lat) for boundary detection latitude correction.
+    let mut bd_cos_lat = vec![0.0_f32; WORLD_HEIGHT];
+    for row in 0..WORLD_HEIGHT {
+        let lat_rad = (90.0 - (row as f32 + 0.5) * (180.0 / WORLD_HEIGHT as f32)) * RADIANS;
+        bd_cos_lat[row] = lat_rad.cos().abs().max(0.087);
+    }
+
     for y in 0..WORLD_HEIGHT {
         progress.phase(
             progress_base + progress_span * 0.45,
             progress_span * 0.55,
             y as f32 / WORLD_HEIGHT as f32,
         );
+        let cl = bd_cos_lat[y];
         for x in 0..WORLD_WIDTH {
             let i = index(x, y);
             let plate_a = plate_field[i] as usize;
@@ -1596,9 +1632,12 @@ fn compute_plates(
                 let (vbx, vby) = plate_velocity_xy_at_cell(b, sx, sy, sz, radius_cm);
                 let rel_x = vbx - vax;
                 let rel_y = vby - vay;
-                let n_len = (dx as f32).hypot(dy as f32).max(1.0);
-                let nx = dx as f32 / n_len;
-                let ny = dy as f32 / n_len;
+                // Physical-space normal: dx scaled by cos(φ) for equirectangular correction.
+                let phys_dx = dx as f32 * cl;
+                let phys_dy = dy as f32;
+                let n_len = phys_dx.hypot(phys_dy).max(0.01);
+                let nx = phys_dx / n_len;
+                let ny = phys_dy / n_len;
                 let tx = -ny;
                 let ty = nx;
                 let vn = rel_x * nx + rel_y * ny;
@@ -1703,14 +1742,17 @@ fn isostatic_elevation(crust_km: f32, continental_frac: f32, heat_anomaly: f32) 
 // Peak amplitude is preserved (unlike diffusive smoothing).
 
 /// Propagate boundary deformation field with exponential distance decay.
+/// Latitude-corrected: E-W physical step = cos(φ) × cell_size, so the decay
+/// per E-W cell step is exp(-cos(φ)/L_d) — less decay at high latitudes
+/// because the physical step is shorter (England & McKenzie 1982).
 fn propagate_deformation(
     seed: &[f32],
     decay_km: f32,
     grid: &GridConfig,
 ) -> Vec<f32> {
-    let l_cells = decay_km / grid.km_per_cell_x;
-    let decay_cardinal = (-1.0_f32 / l_cells).exp();
-    let decay_diagonal = (-std::f32::consts::SQRT_2 / l_cells).exp();
+    let l_cells = decay_km / grid.km_per_cell_x; // L_d in equatorial cells
+    // N-S decay is constant (physical step = km_per_cell_y ≈ km_per_cell_x)
+    let decay_ns = (-1.0_f32 / l_cells).exp();
 
     let mut field = seed.to_vec();
     let mut scratch = vec![0.0_f32; grid.size];
@@ -1719,17 +1761,30 @@ fn propagate_deformation(
     for _ in 0..max_passes {
         let mut changed = false;
         for y in 0..grid.height {
+            let cos_lat = grid.cos_lat_by_y[y];
+            // E-W physical step = cos(φ) cells → decay = exp(-cos(φ)/L_d)
+            let decay_ew = (-cos_lat / l_cells).exp();
+            // Diagonal physical step = √(cos²φ + 1) cells
+            let decay_diag = (-(cos_lat * cos_lat + 1.0).sqrt() / l_cells).exp();
             for x in 0..grid.width {
                 let i = grid.index(x, y);
                 let mut val = field[i];
-                for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                    let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
-                    let proposal = field[j] * decay_cardinal;
+                // N-S cardinal
+                for dy in [-1_i32, 1] {
+                    let j = grid.neighbor(x as i32, y as i32 + dy);
+                    let proposal = field[j] * decay_ns;
                     if proposal > val { val = proposal; changed = true; }
                 }
+                // E-W cardinal
+                for dx in [-1_i32, 1] {
+                    let j = grid.neighbor(x as i32 + dx, y as i32);
+                    let proposal = field[j] * decay_ew;
+                    if proposal > val { val = proposal; changed = true; }
+                }
+                // Diagonals
                 for (dx, dy) in [(-1_i32, -1_i32), (-1, 1), (1, -1), (1, 1)] {
                     let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
-                    let proposal = field[j] * decay_diagonal;
+                    let proposal = field[j] * decay_diag;
                     if proposal > val { val = proposal; changed = true; }
                 }
                 scratch[i] = val;
@@ -1741,23 +1796,47 @@ fn propagate_deformation(
     field
 }
 
-/// In-place 8-neighbor diffusive smoothing (N passes).
-/// Uses isotropic 3×3 kernel: cardinal weight 1, diagonal weight 1/√2,
-/// center weight 4.  Eliminates axis-aligned bias of the 4-neighbor stencil.
+/// In-place 8-neighbor diffusive smoothing (N passes) with latitude correction.
+/// On equirectangular grids, E-W cells are physically cos(φ) times narrower,
+/// so E-W neighbors are weighted ×1/cos(φ) and diagonals ×1/√(cos²φ+1).
+/// This produces isotropic physical diffusion on the sphere.
+/// For flat grids (island), cos_lat_by_y is all 1.0, giving the standard kernel.
 fn smooth_field(field: &mut [f32], passes: usize, grid: &GridConfig) {
-    let diag_w = std::f32::consts::FRAC_1_SQRT_2; // ~0.707
     let mut scratch = vec![0.0_f32; grid.size];
     for _ in 0..passes {
         for y in 0..grid.height {
+            // Cap cos_lat at 0.30 (≈cos 72.5°) for iterative smoothing to prevent
+            // extreme E-W anisotropy compounding over many passes at high latitudes.
+            // Full cos_lat (down to 0.087) is retained in GridConfig for single-pass
+            // operations (Dijkstra, propagate_deformation) where it doesn't compound.
+            let cos_lat = grid.cos_lat_by_y[y].max(0.30);
+            // E-W cardinal: physically closer at high lat → more weight
+            let ew_w = 1.0 / cos_lat;
+            // N-S cardinal: constant physical distance
+            let ns_w = 1.0_f32;
+            // Diagonal: physical dist = √(cos²φ + 1) × cell_size
+            let diag_w = 1.0 / (cos_lat * cos_lat + 1.0).sqrt();
+            // Center weight: keep same ratio to neighbor sum as the equatorial kernel
+            // (4.0 / 6.83 ≈ 0.586), so diffusion rate is physically uniform.
+            let neighbor_sum = 2.0 * ew_w + 2.0 * ns_w + 4.0 * diag_w;
+            let center_w = 0.586 * neighbor_sum;
             for x in 0..grid.width {
                 let i = grid.index(x, y);
-                let mut sum = field[i] * 4.0;
-                let mut wt = 4.0_f32;
-                for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                    let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
-                    sum += field[j];
-                    wt += 1.0;
+                let mut sum = field[i] * center_w;
+                let mut wt = center_w;
+                // N-S cardinal neighbors
+                for dy in [-1_i32, 1] {
+                    let j = grid.neighbor(x as i32, y as i32 + dy);
+                    sum += field[j] * ns_w;
+                    wt += ns_w;
                 }
+                // E-W cardinal neighbors
+                for dx in [-1_i32, 1] {
+                    let j = grid.neighbor(x as i32 + dx, y as i32);
+                    sum += field[j] * ew_w;
+                    wt += ew_w;
+                }
+                // Diagonal neighbors
                 for (dx, dy) in [(-1_i32, -1_i32), (-1, 1), (1, -1), (1, 1)] {
                     let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
                     sum += field[j] * diag_w;
@@ -1799,13 +1878,51 @@ fn compute_relief_physics(
     progress.phase(progress_base, progress_span, 0.0);
 
     // --- 1. Continental vs oceanic per cell ---
-    // Plates with buoyancy > 0 are continental lithosphere.
+    // Assign continental/oceanic based on plate buoyancy ranking, constrained
+    // so that total continental area ≈ target from ocean_percent.
+    // Without area constraint, random buoyancy > 0 can give anywhere from 10%
+    // to 60% continental area, causing wild freeboard variance between seeds.
+    // Earth's ocean coverage (71%) is a consequence of continental crust volume
+    // (Taylor & McLennan 1995); here we enforce the same relationship.
+    let mut plate_cells = vec![0usize; n_plates];
+    for i in 0..size {
+        let pid = plates.plate_field[i] as usize;
+        if pid < n_plates { plate_cells[pid] += 1; }
+    }
+    // Sort plates by buoyancy descending — most buoyant become continental first.
+    let mut plate_order: Vec<usize> = (0..n_plates).collect();
+    plate_order.sort_by(|&a, &b|
+        plates.plate_vectors[b].buoyancy.partial_cmp(&plates.plate_vectors[a].buoyancy)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    );
+    // Continental crust must exceed target land area to create submerged continental
+    // shelf.  On Earth, ~40 % of the surface is continental crust but only ~29 % is
+    // exposed land; the remaining ~11 % is shelf (Cogley 1984).  Without the shelf
+    // buffer, the 67th-percentile sea level sits in the oceanic elevation range,
+    // producing ~5 km freeboard instead of the realistic ~200 m.
+    // Minimum continental fraction ≈ land fraction + shelf fraction.
+    let land_frac = 1.0 - planet.ocean_percent / 100.0;          // 0.33 for 67 % ocean
+    let min_continental_frac = (land_frac + 0.20).min(0.85);     // ~0.53 for 67 % ocean
+    let target_continental = (min_continental_frac * size as f32) as usize;
+    let mut accumulated = 0usize;
+    let mut plate_is_continental = vec![false; n_plates];
+    for &pid in &plate_order {
+        let new_acc = accumulated + plate_cells[pid];
+        // Include this plate if it brings us closer to the target.
+        let undershoot = target_continental.saturating_sub(accumulated);
+        let overshoot = new_acc.saturating_sub(target_continental);
+        if overshoot > undershoot && accumulated > 0 {
+            break;
+        }
+        plate_is_continental[pid] = true;
+        accumulated = new_acc;
+    }
     let mut is_continental = vec![false; size];
     let mut continental_frac = vec![0.0_f32; size];
     for i in 0..size {
         let pid = plates.plate_field[i] as usize;
         if pid < n_plates {
-            is_continental[i] = plates.plate_vectors[pid].buoyancy > 0.0;
+            is_continental[i] = plate_is_continental[pid];
             continental_frac[i] = if is_continental[i] { 1.0 } else { 0.0 };
         }
     }
@@ -1815,6 +1932,31 @@ fn compute_relief_physics(
     // Matches realistic passive margin width: shelf ~100 km + slope ~100 km
     // (Bond et al. 1995; Watts 2001).
     smooth_field(&mut continental_frac, 20, grid);
+
+    // Perturb continental_frac in the transition zone with multi-octave 3D noise
+    // to break Voronoi-edge-following coastlines.  Only for spherical (planet) grids.
+    // Amplitudes: freq 4 → ~1600 km features, freq 16 → ~400 km fine detail.
+    // margin_factor tent function peaks at cf=0.5, zero at cf=0/1 — noise only
+    // affects the continent-ocean transition zone, not plate interiors.
+    if grid.is_spherical {
+        let coast_seed = hash_u32(seed ^ 0xC0A5_7F1E);
+        for i in 0..size {
+            let cf = continental_frac[i];
+            if cf > 0.05 && cf < 0.95 {
+                let margin_factor = 1.0 - (2.0 * cf - 1.0).abs();
+                let nx = cell_cache.noise_x[i];
+                let ny = cell_cache.noise_y[i];
+                let nz = cell_cache.noise_z[i];
+                let n = value_noise3(nx * 4.0, ny * 4.0, nz * 4.0, coast_seed) * 0.10
+                      + value_noise3(nx * 8.0 + 3.1, ny * 8.0 - 2.3, nz * 8.0, coast_seed.wrapping_add(1)) * 0.04
+                      + value_noise3(nx * 16.0 - 5.7, ny * 16.0 + 4.2, nz * 16.0, coast_seed.wrapping_add(2)) * 0.01;
+                continental_frac[i] = (cf + n * margin_factor).clamp(0.0, 1.0);
+            }
+        }
+        // 3 follow-up passes to blend noise into the field and smooth discontinuities
+        // at the 0.05/0.95 guard boundaries.
+        smooth_field(&mut continental_frac, 3, grid);
+    }
 
     // --- 2. Crustal thickness from plate boundary physics ---
     // Create per-type seed fields from boundary detection, then propagate
@@ -1834,10 +1976,13 @@ fn compute_relief_physics(
     }
 
     // Propagate deformation zones: L_d from England & McKenzie 1982.
-    // Convergent ~300 km (Tibet 500, Andes 250, Alps 100 — compromise).
+    // Convergent ~200 km: 3σ ≈ 600 km (Andes 700, Alps 200 — realistic average).
+    // Previous 300 km created 900 km 3σ zones that covered entire small plates,
+    // leaving no lowland interior.  200 km gives adequate flat continental interiors
+    // while still producing wide mountain belts at convergent margins.
     // Divergent ~150 km (rift/ridge thinning zone).
     // Transform ~100 km (narrow shear zone).
-    let mut conv_def = propagate_deformation(&conv_seed, 300.0, grid);
+    let mut conv_def = propagate_deformation(&conv_seed, 200.0, grid);
     let mut div_def = propagate_deformation(&div_seed, 150.0, grid);
     let mut trans_def = propagate_deformation(&trans_seed, 100.0, grid);
 
@@ -1849,20 +1994,33 @@ fn compute_relief_physics(
     smooth_field(&mut trans_def, 3, grid);
 
     // Compute crustal thickness using propagated deformation fields.
-    // Base: continental 35 km, oceanic 7 km (Christensen & Mooney 1995).
+    // Base: continental 43 km, oceanic 7 km (Christensen & Mooney 1995).
     let mut crust_thickness = vec![0.0_f32; size];
+    let base_noise_seed = hash_u32(seed ^ 0xBA5E_C8F7);
     for i in 0..size {
-        // Base crust interpolated by continental fraction:
-        // Continental 40 km (Rudnick & Gao 2003, craton average),
-        // Oceanic 7 km (White et al. 1992).
-        // Gradual transition creates realistic continental shelf profile.
         let cf = continental_frac[i];
-        let base = cf * 40.0 + (1.0 - cf) * 7.0;
+        // Continental base thickness with cratonic variation.
+        // Global range 25–55 km (Rudnick & Gao 2003, Table 2).
+        // Multi-octave noise adds ±8 km variation (3000–6500 km wavelengths)
+        // to create natural basins (thin crust → low elevation) and shields
+        // (thick crust → elevated plateaus).  This spreads the continental
+        // hypsometric distribution, so the 67th-percentile sea level falls
+        // within the continental range instead of at the oceanic floor.
+        // Oceanic base is fixed at 7 km (White et al. 1992).
+        let nx = cell_cache.noise_x[i];
+        let ny = cell_cache.noise_y[i];
+        let nz = cell_cache.noise_z[i];
+        let base_var = value_noise3(nx * 3.0, ny * 3.0, nz * 3.0, base_noise_seed) * 10.0
+                     + value_noise3(nx * 6.0 + 1.7, ny * 6.0 - 2.1, nz * 6.0,
+                                    base_noise_seed.wrapping_add(1)) * 5.0;
+        let base = cf * (43.0 + base_var) + (1.0 - cf) * 7.0;
 
         // Convergent thickening scaled by continent fraction:
-        // CC collision → up to +30 km (Tibet 65 km total);
-        // OC subduction → up to +18 km (arc volcanism).
-        let conv_thick = conv_def[i] * (cf * 30.0 + (1.0 - cf) * 18.0);
+        // CC collision → up to +22 km (base 43 + 22 = 65 km ≈ Tibet);
+        // OC subduction → up to +13 km (arc volcanism, Andes 55 km total).
+        // Reduced from 30/18: with 43 km base, 22 km gives ~8800 m peak
+        // at typical conv_def ~0.7, matching Everest.
+        let conv_thick = conv_def[i] * (cf * 22.0 + (1.0 - cf) * 13.0);
         // Divergent: rift thinning up to -20 km.
         let div_thick = -div_def[i] * 20.0;
         // Transform: minor transpression up to +2 km.
@@ -2035,22 +2193,31 @@ fn compute_relief_physics(
 
     // --- 5b. Post-erosion land smoothing ---
     // At 20 km/cell, D8 erosion creates sub-grid-scale channel artifacts (single-
-    // cell incised valleys).  5 passes of isotropic 8-neighbor diffusion (~100 km σ)
-    // represent unresolved hillslope mass wasting, debris flows, and colluvial
-    // transport.  Land cells only — preserves ocean bathymetry.
+    // cell incised valleys).  5 passes of latitude-corrected 8-neighbor diffusion
+    // (~100 km σ) represent unresolved hillslope mass wasting, debris flows, and
+    // colluvial transport.  Land cells only — preserves ocean bathymetry.
     {
-        let diag_w = std::f32::consts::FRAC_1_SQRT_2;
         let mut scratch = relief.clone();
         for _ in 0..5 {
             for y in 0..grid.height {
+                let cos_lat = grid.cos_lat_by_y[y].max(0.30); // same cap as smooth_field
+                let ew_w = 1.0 / cos_lat;
+                let ns_w = 1.0_f32;
+                let diag_w = 1.0 / (cos_lat * cos_lat + 1.0).sqrt();
+                let neighbor_sum = 2.0 * ew_w + 2.0 * ns_w + 4.0 * diag_w;
+                let center_w = 0.586 * neighbor_sum;
                 for x in 0..grid.width {
                     let i = grid.index(x, y);
                     if relief[i] <= 0.0 { scratch[i] = relief[i]; continue; }
-                    let mut sum = relief[i] * 4.0;
-                    let mut wt = 4.0_f32;
-                    for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                        let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
-                        if relief[j] > 0.0 { sum += relief[j]; wt += 1.0; }
+                    let mut sum = relief[i] * center_w;
+                    let mut wt = center_w;
+                    for dy in [-1_i32, 1] {
+                        let j = grid.neighbor(x as i32, y as i32 + dy);
+                        if relief[j] > 0.0 { sum += relief[j] * ns_w; wt += ns_w; }
+                    }
+                    for dx in [-1_i32, 1] {
+                        let j = grid.neighbor(x as i32 + dx, y as i32);
+                        if relief[j] > 0.0 { sum += relief[j] * ew_w; wt += ew_w; }
                     }
                     for (dx, dy) in [(-1_i32, -1_i32), (-1, 1), (1, -1), (1, 1)] {
                         let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
@@ -2065,7 +2232,47 @@ fn compute_relief_physics(
 
     progress.phase(progress_base, progress_span, 0.85);
 
-    // --- 6. Sea level from ocean_percent ---
+    // --- 6. Hypsometric curve correction ---
+    // The Airy model produces ~3 km median continental freeboard because it
+    // ignores water loading, thermal subsidence (Parsons & Sclater 1977),
+    // sediment loading, and dynamic topography.  We apply a power-law
+    // remapping of the land hypsometry: lowlands are compressed toward sea
+    // level while mountain peaks are preserved.  This matches the observed
+    // hypsometric curve (Cogley 1984) where most continental area clusters
+    // near sea level with a long tail to high peaks.
+    {
+        let ocean_frac_pre = (planet.ocean_percent / 100.0).clamp(0.3, 0.95);
+        let mut sorted_pre = relief.clone();
+        sorted_pre.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let cut_pre = ((size as f32 * ocean_frac_pre) as usize).min(size - 1);
+        let sl_pre = sorted_pre[cut_pre];
+
+        let land_count = size - cut_pre - 1;
+        if land_count > 100 {
+            // Median of land (P50) and max above preliminary sea level.
+            let p50_idx = (cut_pre + 1 + (land_count as f32 * 0.50) as usize).min(size - 1);
+            let median_fb = sorted_pre[p50_idx] - sl_pre;
+            let max_land = sorted_pre[size - 1] - sl_pre;
+            // Earth's median land elevation ≈ 400 m (Cogley 1984, Harrison et al. 1983).
+            let target_median = 400.0;
+
+            if median_fb > target_median * 1.5 && max_land > median_fb * 1.2 {
+                // Power-law: (median_fb/max_land)^α = target_median/max_land
+                // → α = ln(target/max) / ln(median/max)
+                let alpha = (target_median / max_land).ln() / (median_fb / max_land).ln();
+                let alpha = alpha.clamp(1.0, 5.0);
+
+                for v in relief.iter_mut() {
+                    if *v > sl_pre {
+                        let t = (*v - sl_pre) / max_land; // 0..1
+                        *v = sl_pre + t.powf(alpha) * max_land;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- 7. Sea level from ocean_percent ---
     let ocean_frac = (planet.ocean_percent / 100.0).clamp(0.3, 0.95);
     let mut sorted = relief.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
