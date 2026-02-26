@@ -16,14 +16,19 @@ export const OCEAN_STOPS: ColorStop[] = [
 ];
 
 export const LAND_STOPS: ColorStop[] = [
-  { t: 0, color: [4, 104, 64] },       // 0 m
-  { t: 0.118, color: [36, 129, 53] },  // 200 m
-  { t: 0.294, color: [215, 179, 95] }, // 500 m
-  { t: 0.471, color: [147, 51, 10] },  // 800 m
-  { t: 0.706, color: [99, 96, 94] },   // 1200 m
-  { t: 0.824, color: [219, 218, 218] }, // 1400 m
-  { t: 0.882, color: [253, 253, 251] }, // 1500 m
-  { t: 1, color: [247, 246, 244] },    // 1700 m
+  { t: 0,     color: [4,   104, 64]  },  // 0 m   — coastal lowland
+  { t: 0.06,  color: [34,  120, 58]  },  // 100 m — low plains
+  { t: 0.118, color: [56,  139, 53]  },  // 200 m — green hills
+  { t: 0.20,  color: [130, 160, 75]  },  // 350 m — olive foothills
+  { t: 0.294, color: [215, 179, 95]  },  // 500 m — tan plateau
+  { t: 0.38,  color: [185, 130, 60]  },  // 650 m — khaki
+  { t: 0.471, color: [147, 85,  40]  },  // 800 m — warm brown
+  { t: 0.59,  color: [125, 80,  55]  },  // 1000 m — dark brown
+  { t: 0.706, color: [105, 100, 95]  },  // 1200 m — gray rock
+  { t: 0.78,  color: [145, 140, 138] },  // 1300 m — light rock
+  { t: 0.824, color: [195, 192, 190] },  // 1400 m — light gray
+  { t: 0.882, color: [235, 233, 230] },  // 1500 m — near-white
+  { t: 1,     color: [250, 249, 247] },  // peak   — snow white
 ];
 
 export const clamp = (value: number, min: number, max: number) => {

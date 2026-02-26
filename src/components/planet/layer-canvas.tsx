@@ -181,8 +181,12 @@ function heightToRgb(
 }
 
 function landHillshade(heightMap: Float32Array, width: number, height: number, x: number, y: number): number {
-  const yUp = Math.max(0, y - 1);
-  const yDown = Math.min(height - 1, y + 1);
+  // Near poles (top/bottom 2 rows), disable hillshade to avoid artifacts
+  // from equirectangular distortion where one row = entire pole circle.
+  if (y <= 1 || y >= height - 2) return 0.93;
+
+  const yUp = y - 1;
+  const yDown = y + 1;
   const xLeft = (x - 1 + width) % width;
   const xRight = (x + 1) % width;
   const left = heightMap[y * width + xLeft] ?? 0;
