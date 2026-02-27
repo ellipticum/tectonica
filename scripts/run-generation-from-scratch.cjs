@@ -13,6 +13,7 @@ const { run_simulation_with_progress } = require(pkgPath);
 const EXPECTED_SIZE = {
   planet: { width: 4096, height: 2048 },
   island: { width: 1024, height: 512 },
+  continent: { width: 7680, height: 4320 },
 };
 
 function clamp(v, min, max) {
@@ -259,6 +260,7 @@ function run() {
   const scope = process.env.SCOPE || 'planet';
   const islandType = process.env.ISLAND_TYPE || 'continental';
   const islandScaleKm = Number(process.env.ISLAND_SCALE_KM || 400);
+  const continentScaleKm = Number(process.env.CONTINENT_SCALE_KM || 3000);
 
   const config = {
     seed,
@@ -281,6 +283,7 @@ function run() {
     generationPreset,
     scope,
     ...(scope === 'island' && { islandType, islandScaleKm }),
+    ...(scope === 'continent' && { continentScaleKm }),
   };
 
   let last = -1;

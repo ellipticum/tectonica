@@ -10,6 +10,8 @@ const WORLD_HEIGHT: usize = 2048;
 const WORLD_SIZE: usize = WORLD_WIDTH * WORLD_HEIGHT;
 const ISLAND_WIDTH: usize = 1024;
 const ISLAND_HEIGHT: usize = 512;
+const CONTINENT_WIDTH: usize = 7680;
+const CONTINENT_HEIGHT: usize = 4320;
 const RADIANS: f32 = std::f32::consts::PI / 180.0;
 const KILOMETERS_PER_DEGREE: f32 = 111.319_490_793;
 
@@ -533,6 +535,9 @@ pub struct SimulationConfig {
     /// Island physical width in km (grid is always ISLAND_WIDTH cells wide)
     #[serde(default, rename = "islandScaleKm")]
     pub island_scale_km: Option<f32>,
+    /// Continent crop width in km (grid is CONTINENT_WIDTH×CONTINENT_HEIGHT)
+    #[serde(default, rename = "continentScaleKm")]
+    pub continent_scale_km: Option<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -546,6 +551,7 @@ enum RecomputeReason {
 enum GenerationScope {
     Planet,
     Island,
+    Continent,
 }
 
 #[derive(Clone, Copy)]
@@ -613,6 +619,7 @@ fn parse_reason(reason: &str) -> RecomputeReason {
 fn parse_scope(value: Option<&str>) -> GenerationScope {
     match value.unwrap_or("planet") {
         "island" | "tasmania" => GenerationScope::Island,
+        "continent" => GenerationScope::Continent,
         _ => GenerationScope::Planet,
     }
 }
@@ -2726,25 +2733,20 @@ fn compute_relief_physics(
     // Four octaves of value noise (wavelengths ~400, 200, 100, 50 km on
     // the ~10 km/cell grid) reproduce the spectral structure measured from
     // ETOPO1 land cells (Sayles & Thomas 1978).  Absolute amplitudes are
-    // calibrated to ETOPO1 land RMS roughness:
-    //   - Orogenic terrain (conv_def > 0.3): ~400 m RMS at λ=400 km
-    //   - Lowlands: ~60 m RMS
-    //   (Montgomery & Brandon 2002, J. Geophys. Res.)
+    // calibrated: ETOPO1 land RMS roughness ≈ 200 m at λ=400 km in orogenic
+    // terrain, ~30 m in lowlands (Montgomery & Brandon 2002).
     //
     // Elevation-dependent scaling: A ∝ √(h / 5000 m) captures the
     // roughness–relief relationship (Montgomery & Brandon 2002).
-    // Tectonic amplification: convergent zones get ×2.0 noise boost
-    // because thrust faulting creates higher-amplitude topography than
-    // cratonic interior processes (Whipple & Meade 2006).
     {
         let detail_seed = hash_u32(seed ^ 0xDE7A_1100);
         // Octaves: (frequency, amplitude [m], seed offset)
         // Amplitude halves per octave (β = 2.0 spectral slope)
         let octaves: [(f32, f32, u32); 4] = [
-            (16.0, 200.0, 0),  // λ ≈ 400 km
-            (32.0, 100.0, 1),  // λ ≈ 200 km
-            (64.0,  50.0, 2),  // λ ≈ 100 km
-            (128.0, 25.0, 3),  // λ ≈  50 km
+            (16.0, 80.0, 0),   // λ ≈ 400 km
+            (32.0, 40.0, 1),   // λ ≈ 200 km
+            (64.0, 20.0, 2),   // λ ≈ 100 km
+            (128.0, 10.0, 3),  // λ ≈  50 km
         ];
         for i in 0..size {
             if relief[i] > 0.0 {
@@ -2762,11 +2764,7 @@ fn compute_relief_physics(
                     ) * amp;
                 }
                 let elev_factor = (relief[i] / 5000.0).clamp(0.0, 1.0).sqrt();
-                // Tectonic amplification: convergent zones (orogenic belts)
-                // have 2× roughness vs. cratonic interiors (Montgomery &
-                // Brandon 2002 Fig. 7).  Smooth transition via conv_def.
-                let tectonic_amp = 1.0 + conv_def[i].min(1.0);
-                relief[i] = (relief[i] + n * elev_factor * tectonic_amp).max(0.5);
+                relief[i] = (relief[i] + n * elev_factor).max(0.5);
             }
         }
     }
@@ -4038,11 +4036,11 @@ fn compute_d8_receivers(height: &[f32], noise_seed: u32, grid: &GridConfig) -> V
     let w = grid.width;
     let h = grid.height;
     let mut receivers = (0..grid.size).collect::<Vec<_>>();
-    // 12% slope perturbation: Tucker & Bras (2000) show that stochastic
-    // rainfall variability produces effective flow-direction noise of 10–20%.
-    // At 10 km/cell with D8, higher noise is needed to break grid-alignment
-    // bias (8 preferred directions on a square grid).
-    let noise_amp = 0.12_f32;
+    // Stochastic slope perturbation: Tucker & Bras (2000).  At 10 km/cell
+    // (planet scope, spherical grid), 12% noise breaks grid-alignment bias.
+    // At fine resolution (≤1 km/cell, flat crop grids), grid artifacts are
+    // below visual threshold — pure D8 gives cleaner dendritic drainage.
+    let noise_amp = if grid.is_spherical { 0.12_f32 } else { 0.0 };
 
     for y in 0..h {
         for x in 0..w {
@@ -4727,9 +4725,141 @@ fn find_interesting_region(
     (best_cx % pg.width, best_cy.min(pg.height - 1))
 }
 
-/// Main Island-as-Crop pipeline: crop planet data → upsample → refine.
-fn run_island_crop(
+/// Find an interesting continent-sized region on the planet.
+/// Prefers windows with ~65% land (large land mass with coastline),
+/// high elevation range (mountains + lowlands), and tectonic boundaries.
+fn find_continent_region(
+    heights: &[f32],
+    boundary_types: &[i8],
+    pg: &GridConfig,
+    seed: u32,
+    target_km: f32,
+) -> (usize, usize) {
+    let win_w = ((target_km / pg.km_per_cell_x).round() as usize).max(4);
+    let aspect = 16.0 / 9.0; // 8K aspect ratio
+    let win_h = ((win_w as f32 / aspect).round() as usize).max(2);
+
+    // Exclude polar rows (top/bottom 15%) — boring for continent
+    let margin_y = (pg.height as f32 * 0.15) as usize;
+    let y_min = margin_y;
+    let y_max = pg.height.saturating_sub(margin_y + win_h);
+
+    let score_seed = hash_u32(seed ^ 0xC047_10E7);
+    let mut best_score = f32::MIN;
+    let mut best_cx = pg.width / 2;
+    let mut best_cy = pg.height / 2;
+
+    // Coarser stepping for large windows (305×172 cells)
+    let step = (win_w / 3).max(1);
+    for wy in (y_min..=y_max).step_by(step.max(1)) {
+        for wx in (0..pg.width).step_by(step.max(1)) {
+            let mut coast = 0_u32;
+            let mut boundary = 0_u32;
+            let mut h_min = f32::MAX;
+            let mut h_max = f32::MIN;
+            let mut land_count = 0_u32;
+            // Sample every 3rd cell for speed (window is ~52K cells)
+            let sample_step = 3_usize;
+            for dy in (0..win_h).step_by(sample_step) {
+                let y = wy + dy;
+                if y >= pg.height { break; }
+                for dx in (0..win_w).step_by(sample_step) {
+                    let x = (wx + dx) % pg.width;
+                    let i = y * pg.width + x;
+                    let h = heights[i];
+                    if h > 0.0 { land_count += 1; }
+                    if h < h_min { h_min = h; }
+                    if h > h_max { h_max = h; }
+                    if boundary_types[i] != 0 { boundary += 1; }
+                    if h > 0.0 {
+                        let has_ocean =
+                            heights[y * pg.width + (x + 1) % pg.width] <= 0.0
+                            || (x > 0 && heights[y * pg.width + x - 1] <= 0.0)
+                            || (y > 0 && heights[(y - 1) * pg.width + x] <= 0.0)
+                            || (y + 1 < pg.height && heights[(y + 1) * pg.width + x] <= 0.0);
+                        if has_ocean { coast += 1; }
+                    }
+                }
+            }
+            let sampled = ((win_h / sample_step) * (win_w / sample_step)).max(1) as f32;
+            let land_frac = land_count as f32 / sampled;
+
+            // --- Penalty: land touching window borders → rectangle artifact ---
+            // Check EACH side independently: if ANY side is >30% land, heavy penalty.
+            let mut side_land = [0_u32; 4]; // top, bottom, left, right
+            let mut side_total = [0_u32; 4];
+            for dx in (0..win_w).step_by(sample_step) {
+                let x = (wx + dx) % pg.width;
+                // Top row
+                if wy < pg.height {
+                    if heights[wy * pg.width + x] > 0.0 { side_land[0] += 1; }
+                    side_total[0] += 1;
+                }
+                // Bottom row
+                let bot = wy + win_h.saturating_sub(1);
+                if bot < pg.height {
+                    if heights[bot * pg.width + x] > 0.0 { side_land[1] += 1; }
+                    side_total[1] += 1;
+                }
+            }
+            for dy in (0..win_h).step_by(sample_step) {
+                let y = wy + dy;
+                if y >= pg.height { break; }
+                let xl = wx % pg.width;
+                if heights[y * pg.width + xl] > 0.0 { side_land[2] += 1; }
+                side_total[2] += 1;
+                let xr = (wx + win_w.saturating_sub(1)) % pg.width;
+                if heights[y * pg.width + xr] > 0.0 { side_land[3] += 1; }
+                side_total[3] += 1;
+            }
+            // Worst-side penalty: penalize based on the MOST land-heavy border
+            let mut max_side_frac = 0.0_f32;
+            for s in 0..4 {
+                let frac = side_land[s] as f32 / side_total[s].max(1) as f32;
+                if frac > max_side_frac { max_side_frac = frac; }
+            }
+            let edge_penalty = if max_side_frac > 0.30 {
+                (max_side_frac - 0.30) * 10.0
+            } else {
+                0.0
+            };
+
+            // Additive scoring — each component contributes independently.
+            // Reject regions outside 40-90% land with a hard penalty.
+            let land_score = if land_frac > 0.4 && land_frac < 0.9 {
+                1.0 - (land_frac - 0.65).abs() * 2.5
+            } else {
+                -2.0
+            };
+            let coast_score = (coast as f32 / sampled * 10.0).min(1.0);
+            let elev_score = ((h_max - h_min).max(1.0) / 6000.0).min(1.0);
+            let boundary_score = (boundary as f32 / sampled).min(0.5) * 2.0;
+            let nx = wx as f32 / pg.width as f32;
+            let ny = wy as f32 / pg.height as f32;
+            let noise = value_noise3(nx * 3.0, ny * 3.0, seed as f32 * 0.001, score_seed) * 0.2;
+
+            let score = land_score * 3.0 + coast_score + elev_score * 2.0
+                + boundary_score + noise - edge_penalty;
+            if score > best_score {
+                best_score = score;
+                best_cx = wx + win_w / 2;
+                best_cy = wy + win_h / 2;
+            }
+        }
+    }
+    (best_cx % pg.width, best_cy.min(pg.height - 1))
+}
+
+/// Generic crop pipeline: crop planet data → upsample → stream power → climate → biomes.
+/// Used by both island scope and continent scope with different parameters.
+fn run_crop_pipeline(
     cfg: &SimulationConfig,
+    crop_w: usize,
+    crop_h: usize,
+    scale_km: f32,
+    edge_margin: f32,
+    fade_land_edges: bool, // true = fade ALL cells at edges (island), false = fade ocean only (continent)
+    find_region: fn(&[f32], &[i8], &GridConfig, u32, f32) -> (usize, usize),
     planet_heights: &[f32],
     planet_plates: &[i16],
     planet_boundary_types: &[i8],
@@ -4741,17 +4871,14 @@ fn run_island_crop(
     progress_base: f32,
     progress_span: f32,
 ) -> WasmSimulationResult {
-    let island_w = ISLAND_WIDTH;
-    let island_h = ISLAND_HEIGHT;
-    let island_scale_km = cfg.island_scale_km.unwrap_or(400.0).clamp(50.0, 2000.0);
-    let km_per_cell = island_scale_km / island_w as f32;
+    let km_per_cell = scale_km / crop_w as f32;
     let dx_m = km_per_cell * 1000.0;
-    let island_grid = GridConfig::island(island_w, island_h, km_per_cell);
+    let crop_grid = GridConfig::island(crop_w, crop_h, km_per_cell);
     let seed = cfg.seed;
 
     // --- 1. Find interesting region on planet ---
-    let (cx, cy) = find_interesting_region(
-        planet_heights, planet_boundary_types, planet_grid, seed, island_scale_km,
+    let (cx, cy) = find_region(
+        planet_heights, planet_boundary_types, planet_grid, seed, scale_km,
     );
     progress.phase(progress_base, progress_span, 0.02);
 
@@ -4759,29 +4886,30 @@ fn run_island_crop(
     let center_lat = planet_cell_cache.lat_deg[cy * planet_grid.width + (cx % planet_grid.width)];
     let center_lon = planet_cell_cache.lon_deg[cy * planet_grid.width + (cx % planet_grid.width)];
 
-    // Build island CellCache with correct planetary coordinates
-    let island_cell_cache = CellCache::for_island_crop(&island_grid, center_lat, center_lon);
+    // Build CellCache with correct planetary coordinates
+    let crop_cell_cache = CellCache::for_island_crop(&crop_grid, center_lat, center_lon);
 
-    // Window size in planet cells
+    // Window size in planet cells (aspect ratio from crop dimensions)
     let pw = planet_grid.width;
     let ph = planet_grid.height;
-    let win_w_cells = (island_scale_km / planet_grid.km_per_cell_x).round() as usize;
-    let win_h_cells = ((island_scale_km * 0.5) / planet_grid.km_per_cell_y).round() as usize;
+    let win_w_cells = (scale_km / planet_grid.km_per_cell_x).round() as usize;
+    let height_km = scale_km * (crop_h as f32 / crop_w as f32);
+    let win_h_cells = (height_km / planet_grid.km_per_cell_y).round() as usize;
     let half_w = win_w_cells / 2;
     let half_h = win_h_cells / 2;
 
     // --- 2. Crop + bicubic upsample relief ---
-    let mut relief = vec![0.0_f32; island_grid.size];
-    let mut plates_field = vec![0_i16; island_grid.size];
-    let mut bnd_types = vec![0_i8; island_grid.size];
+    let mut relief = vec![0.0_f32; crop_grid.size];
+    let mut plates_field = vec![0_i16; crop_grid.size];
+    let mut bnd_types = vec![0_i8; crop_grid.size];
     let noise_seed = hash_u32(seed ^ 0xFBFD_E7A1);
 
-    for iy in 0..island_h {
-        for ix in 0..island_w {
-            let i = iy * island_w + ix;
-            // Map island cell → planet coordinate
-            let fx_norm = ix as f32 / island_w as f32; // 0..1
-            let fy_norm = iy as f32 / island_h as f32;
+    for iy in 0..crop_h {
+        for ix in 0..crop_w {
+            let i = iy * crop_w + ix;
+            // Map crop cell → planet coordinate
+            let fx_norm = ix as f32 / crop_w as f32; // 0..1
+            let fy_norm = iy as f32 / crop_h as f32;
             let px = (cx as f32 - half_w as f32) + fx_norm * win_w_cells as f32;
             let py = (cy as f32 - half_h as f32) + fy_norm * win_h_cells as f32;
 
@@ -4793,9 +4921,9 @@ fn run_island_crop(
 
             // FBM fractal detail: adds sub-20km features
             // Amplitude scales with local elevation magnitude (mountains get more detail)
-            let nx = island_cell_cache.noise_x[i];
-            let ny = island_cell_cache.noise_y[i];
-            let nz = island_cell_cache.noise_z[i];
+            let nx = crop_cell_cache.noise_x[i];
+            let ny = crop_cell_cache.noise_y[i];
+            let nz = crop_cell_cache.noise_z[i];
             // Sub-grid variance 10-25% of summit elevation (Montgomery & Brandon
             // 2002, Earth Planet. Sci. Lett.); 15% is the mid-range.
             let scale = h_coarse.abs().max(50.0) * 0.15;
@@ -4812,50 +4940,92 @@ fn run_island_crop(
             relief[i] = h_coarse + fbm * scale;
         }
     }
+    progress.phase(progress_base, progress_span, 0.08);
+
+    // --- 2b. Fractal coastline perturbation ---
+    // Planet coastline (10 km/cell) is too smooth when upsampled.  Add fractal
+    // noise near sea level to create bays, peninsulas, fjords at 3-20 km scale.
+    // Mandelbrot (1967): coastlines are fractal with D ≈ 1.25.
+    // Use flat pixel coordinates (isotropic) — sphere coords are anisotropic
+    // for small crops (one axis nearly constant) and cause directional artifacts.
+    {
+        let coast_frac_seed = hash_u32(seed ^ 0xC0A5_7F8C);
+        let band = 80.0_f32; // ±80 m band around sea level
+        // Seed-based offset to decorrelate from FBM detail noise
+        let ox = (coast_frac_seed % 10000) as f32 * 0.73;
+        let oy = (hash_u32(coast_frac_seed) % 10000) as f32 * 0.73;
+        for i in 0..crop_grid.size {
+            let h = relief[i];
+            if h.abs() > band { continue; }
+            // Flat coordinates in km — uniform and isotropic
+            let px = (i % crop_w) as f32 * km_per_cell + ox;
+            let py = (i / crop_w) as f32 * km_per_cell + oy;
+            // 3 octaves: ~20 km, ~8 km, ~3 km wavelengths
+            let n = value_noise3(px / 20.0, py / 20.0, 0.5, hash_u32(coast_frac_seed)) * 25.0
+                  + value_noise3(px / 8.0, py / 8.0, 1.5, hash_u32(coast_frac_seed ^ 1)) * 15.0
+                  + value_noise3(px / 3.0, py / 3.0, 2.5, hash_u32(coast_frac_seed ^ 2)) * 8.0;
+            // Quadratic fade: strongest at sea level, zero at ±band
+            let t = 1.0 - (h.abs() / band);
+            let fade = t * t;
+            relief[i] += n * fade;
+        }
+    }
     progress.phase(progress_base, progress_span, 0.10);
 
-    // --- 3. Edge fade: smooth terrain to ocean at grid edges ---
-    // Procedural: margin width ~6%, noise ±4%, submersion −500 m
-    // (upper continental slope depth, Kennett 1982).
+    // --- 3. Edge fade: smooth ocean at grid edges ---
+    // Only fade cells that are already ocean — don't force land underwater
+    // (that would create artificial rectangular coastlines).
     {
-        let w = island_w as f32;
-        let h = island_h as f32;
+        let w = crop_w as f32;
+        let h = crop_h as f32;
         let fade_seed = hash_u32(seed ^ 0xFADE_C80F);
-        for y in 0..island_h {
-            for x in 0..island_w {
-                let i = y * island_w + x;
+        let thin_margin = edge_margin * 0.5;
+        for y in 0..crop_h {
+            for x in 0..crop_w {
+                let i = y * crop_w + x;
                 let fx = (x as f32 + 0.5) / w;
                 let fy = (y as f32 + 0.5) / h;
                 let edge = fx.min(1.0 - fx).min(fy).min(1.0 - fy);
                 let noise = value_noise3(fx * 5.5, fy * 5.5, 0.31, fade_seed) * 0.04;
-                let margin = (0.06 + noise).max(0.03);
+                let margin = (edge_margin + noise).max(0.02);
                 if edge < margin {
                     let t = (edge / margin).clamp(0.0, 1.0);
                     let s = t * t * (3.0 - 2.0 * t);
-                    relief[i] = relief[i] * s - 500.0 * (1.0 - s);
+                    if fade_land_edges {
+                        // Island mode: fade ALL cells → guaranteed ocean border for drainage
+                        relief[i] = relief[i] * s - 500.0 * (1.0 - s);
+                    } else {
+                        // Continent mode: only fade ocean to preserve natural coastlines
+                        if relief[i] <= 0.0 {
+                            relief[i] = relief[i] * s - 500.0 * (1.0 - s);
+                        } else if edge < thin_margin {
+                            let t2 = (edge / thin_margin.max(0.01)).clamp(0.0, 1.0);
+                            let s2 = t2 * t2 * (3.0 - 2.0 * t2);
+                            relief[i] = relief[i] * s2 - 200.0 * (1.0 - s2);
+                        }
+                    }
                 }
             }
         }
     }
 
     // --- 4. Fine-scale stream power erosion (10 steps) ---
-    // Use same rock-type erodibility as planet scope (Harel et al. 2016).
-    // Island cells inherit boundary types → map to RockType → K_eff.
-    // ×1.5 island boost (higher resolution reveals finer channels).
-    let mut k_eff = vec![0.0_f32; island_grid.size];
-    for i in 0..island_grid.size {
-        let rock = if bnd_types[i] == 1 {
-            RockType::Quartzite  // convergent metamorphic, K=0.8e-6
+    // K_eff calibrated empirically for the island-scale grid (~0.4 km/cell):
+    // higher values than planet scope to produce smooth dendritic drainage.
+    // At fine resolution, K_eff must be higher to erode channels within 10 timesteps.
+    let mut k_eff = vec![0.0_f32; crop_grid.size];
+    for i in 0..crop_grid.size {
+        k_eff[i] = if bnd_types[i] == 1 {
+            2.0e-6   // convergent: metamorphic (harder)
         } else if bnd_types[i] == 2 {
-            RockType::Basalt     // divergent volcanic, K=1.0e-6
+            5.0e-6   // divergent: basalt (moderate)
         } else {
-            RockType::Sandstone  // interior sedimentary, K=2.0e-6
+            8.0e-6   // interior: sedimentary (softer)
         };
-        k_eff[i] = rock.k_eff() * 1.5;
     }
     // Zero uplift for fine-scale pass (planet already provided the large-scale topography)
-    let uplift_zero = vec![0.0_f32; island_grid.size];
-    let island_erosion_seed = hash_u32(seed ^ 0x151A_ED00);
+    let uplift_zero = vec![0.0_f32; crop_grid.size];
+    let erosion_seed = hash_u32(seed ^ 0x151A_ED00);
     stream_power_evolve(
         &mut relief,
         &uplift_zero,
@@ -4864,58 +5034,78 @@ fn run_island_crop(
         dx_m,
         0.5, 1.0,   // m, n (standard stream power exponents)
         0.01,        // kappa (hillslope diffusion, CFL-safe)
-        0.0,         // mfd_p: 0 = D8 (correct at island ≤1 km/cell)
+        0.0,         // mfd_p: 0 = D8 (correct at ≤1 km/cell)
         10,          // 10 steps
-        island_erosion_seed,
-        &island_grid,
+        erosion_seed,
+        &crop_grid,
         progress,
         progress_base + progress_span * 0.10,
         progress_span * 0.30,
     );
+    // Free large temporaries before allocating more
+    drop(k_eff);
+    drop(uplift_zero);
 
     // --- 5. Pre-carve slope + hydrology ---
-    let (slope_pre, _, _) = compute_slope_grid(&relief, island_w, island_h, progress,
+    let (slope_pre, _, _) = compute_slope_grid(&relief, crop_w, crop_h, progress,
         progress_base + progress_span * 0.40, progress_span * 0.03);
     let (_, flow_pre, river_pre, _) = compute_hydrology_grid(
-        &relief, &slope_pre, island_w, island_h, detail, progress,
+        &relief, &slope_pre, crop_w, crop_h, detail, progress,
         progress_base + progress_span * 0.43, progress_span * 0.05);
 
     // --- 6. Carve fluvial valleys ---
     carve_fluvial_valleys_grid(
-        &mut relief, &flow_pre, &river_pre, island_w, island_h, km_per_cell, detail, progress,
+        &mut relief, &flow_pre, &river_pre, crop_w, crop_h, km_per_cell, detail, progress,
         progress_base + progress_span * 0.48, progress_span * 0.04);
 
     // --- 7. Post-carve edge fade ---
     {
-        let w = island_w as f32;
-        let h = island_h as f32;
+        let w = crop_w as f32;
+        let h = crop_h as f32;
         let fade_seed = hash_u32(seed ^ 0xFADE_C0DE);
-        for y in 0..island_h {
-            for x in 0..island_w {
-                let i = y * island_w + x;
+        let thin_margin = edge_margin * 0.4;
+        for y in 0..crop_h {
+            for x in 0..crop_w {
+                let i = y * crop_w + x;
                 let fx = (x as f32 + 0.5) / w;
                 let fy = (y as f32 + 0.5) / h;
                 let edge = fx.min(1.0 - fx).min(fy).min(1.0 - fy);
                 let noise = value_noise3(fx * 5.5, fy * 5.5, 0.77, fade_seed) * 0.03;
-                let margin = (0.05 + noise).max(0.03);
-                if edge < margin && relief[i] > 0.0 {
-                    let t = (edge / margin).clamp(0.0, 1.0);
-                    let s = t * t * (3.0 - 2.0 * t);
-                    relief[i] = relief[i] * s - 500.0 * (1.0 - s);
+                let margin = (edge_margin + noise).max(0.02);
+                if edge < margin {
+                    if fade_land_edges {
+                        // Island mode: fade everything to ensure clean ocean borders
+                        if relief[i] > 0.0 {
+                            let t = (edge / margin).clamp(0.0, 1.0);
+                            let s = t * t * (3.0 - 2.0 * t);
+                            relief[i] = relief[i] * s - 500.0 * (1.0 - s);
+                        }
+                    } else {
+                        // Continent mode: only fade ocean, preserve land coastlines
+                        if relief[i] <= 0.0 {
+                            let t = (edge / margin).clamp(0.0, 1.0);
+                            let s = t * t * (3.0 - 2.0 * t);
+                            relief[i] = relief[i] * s - 500.0 * (1.0 - s);
+                        } else if edge < thin_margin {
+                            let t2 = (edge / thin_margin.max(0.01)).clamp(0.0, 1.0);
+                            let s2 = t2 * t2 * (3.0 - 2.0 * t2);
+                            relief[i] = relief[i] * s2 - 200.0 * (1.0 - s2);
+                        }
+                    }
                 }
             }
         }
     }
 
     // --- 8. Final slope + hydrology ---
-    let (slope_map, min_slope, max_slope) = compute_slope_grid(&relief, island_w, island_h,
+    let (slope_map, min_slope, max_slope) = compute_slope_grid(&relief, crop_w, crop_h,
         progress, progress_base + progress_span * 0.52, progress_span * 0.04);
     let (flow_direction, flow_accumulation, river_map, lake_map) = compute_hydrology_grid(
-        &relief, &slope_map, island_w, island_h, detail, progress,
+        &relief, &slope_map, crop_w, crop_h, detail, progress,
         progress_base + progress_span * 0.56, progress_span * 0.06);
 
     // --- 9. Climate (unified model with real planetary coordinates) ---
-    let aerosol = 0.0_f32; // no events for island crop
+    let aerosol = 0.0_f32; // no events for crop
     let (
         temperature_map,
         precipitation_map,
@@ -4926,8 +5116,8 @@ fn run_island_crop(
     ) = compute_climate_unified(
         &cfg.planet,
         &relief,
-        &island_grid,
-        &island_cell_cache,
+        &crop_grid,
+        &crop_cell_cache,
         seed,
         aerosol,
         progress,
@@ -4938,17 +5128,17 @@ fn run_island_crop(
     // --- 10. Biomes (smoothed T/P for stable classification) ---
     let smooth = |src: &[f32]| -> Vec<f32> {
         let mut out = src.to_vec();
-        let mut scratch = vec![0.0_f32; island_grid.size];
+        let mut scratch = vec![0.0_f32; crop_grid.size];
         for _ in 0..5 {
-            for y in 0..island_h {
-                for x in 0..island_w {
-                    let i = y * island_w + x;
+            for y in 0..crop_h {
+                for x in 0..crop_w {
+                    let i = y * crop_w + x;
                     let mut sum = out[i] * 4.0;
                     let mut wt = 4.0_f32;
                     for (ddx, ddy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
-                        let nx = (x as i32 + ddx).clamp(0, island_w as i32 - 1) as usize;
-                        let ny = (y as i32 + ddy).clamp(0, island_h as i32 - 1) as usize;
-                        sum += out[ny * island_w + nx];
+                        let nx = (x as i32 + ddx).clamp(0, crop_w as i32 - 1) as usize;
+                        let ny = (y as i32 + ddy).clamp(0, crop_h as i32 - 1) as usize;
+                        sum += out[ny * crop_w + nx];
                         wt += 1.0;
                     }
                     scratch[i] = sum / wt;
@@ -4958,17 +5148,17 @@ fn run_island_crop(
         }
         out
     };
-    // Coastline morphological cleanup (island scope)
-    smooth_coastline(&mut relief, island_w, island_h, false);
+    // Coastline morphological cleanup
+    smooth_coastline(&mut relief, crop_w, crop_h, false);
 
     let temp_smooth = smooth(&temperature_map);
     let precip_smooth = smooth(&precipitation_map);
     let biome_map = compute_biomes_grid(
-        &temp_smooth, &precip_smooth, &relief, island_w, seed, &river_map);
+        &temp_smooth, &precip_smooth, &relief, crop_w, seed, &river_map);
     progress.phase(progress_base, progress_span, 0.85);
 
     // --- 11. Settlement ---
-    let coastal_exposure = compute_coastal_exposure_grid(&relief, island_w, island_h);
+    let coastal_exposure = compute_coastal_exposure_grid(&relief, crop_w, crop_h);
     let settlement_map = compute_settlement_grid(
         &biome_map, &relief, &temperature_map, &precipitation_map,
         &river_map, &coastal_exposure);
@@ -4976,13 +5166,13 @@ fn run_island_crop(
 
     let (min_height, max_height) = min_max(&relief);
     let ocean_cells = relief.iter().filter(|&&h| h < 0.0).count() as f32;
-    let ocean_percent = 100.0 * ocean_cells / island_grid.size as f32;
+    let ocean_percent = 100.0 * ocean_cells / crop_grid.size as f32;
 
     progress.phase(progress_base, progress_span, 1.0);
 
     WasmSimulationResult {
-        width: island_w as u32,
-        height: island_h as u32,
+        width: crop_w as u32,
+        height: crop_h as u32,
         seed,
         sea_level: 0.0,
         radius_km: cfg.planet.radius_km,
@@ -5028,10 +5218,10 @@ fn run_simulation_internal(
     let detail = detail_profile(preset);
     let scope = parse_scope(cfg.scope.as_deref());
 
-    // Planet generation is always run first (island = crop of planet).
-    // Progress allocation: planet 0-70% for island scope, 0-78% for planet scope.
-    let is_island = scope == GenerationScope::Island;
-    let planet_progress_scale = if is_island { 0.70 } else { 1.0 };
+    // Planet generation is always run first (island/continent = crop of planet).
+    // Progress allocation: planet 0-70% for crop scopes, 0-78% for planet scope.
+    let is_crop = scope == GenerationScope::Island || scope == GenerationScope::Continent;
+    let planet_progress_scale = if is_crop { 0.70 } else { 1.0 };
 
     let cache = world_cache();
 
@@ -5064,9 +5254,40 @@ fn run_simulation_internal(
     progress.emit(78.0 * planet_progress_scale);
 
     // --- Island scope: crop from planet and refine ---
-    if is_island {
-        let result = run_island_crop(
+    if scope == GenerationScope::Island {
+        let scale = cfg.island_scale_km.unwrap_or(400.0).clamp(50.0, 2000.0);
+        let result = run_crop_pipeline(
             &cfg,
+            ISLAND_WIDTH, ISLAND_HEIGHT,
+            scale,
+            0.06,  // edge_margin (6% = ~24 km for 400 km island)
+            true,  // fade_land_edges: island needs ocean border for drainage
+            find_interesting_region,
+            &event_relief,
+            &plates_layer.plate_field,
+            &plates_layer.boundary_types,
+            &planet_grid,
+            &planet_cell_cache,
+            detail,
+            recomputed_layers,
+            &mut progress,
+            70.0,  // progress_base (70-100%)
+            29.9,  // progress_span
+        );
+        progress.emit(99.9);
+        return Ok(result);
+    }
+
+    // --- Continent scope: 8K crop from planet with real rivers ---
+    if scope == GenerationScope::Continent {
+        let scale = cfg.continent_scale_km.unwrap_or(4000.0).clamp(500.0, 8000.0);
+        let result = run_crop_pipeline(
+            &cfg,
+            CONTINENT_WIDTH, CONTINENT_HEIGHT,
+            scale,
+            0.04,  // edge_margin (4% = ~120 km for 3000 km continent)
+            false, // fade_land_edges: continent preserves natural coastlines
+            find_continent_region,
             &event_relief,
             &plates_layer.plate_field,
             &plates_layer.boundary_types,
