@@ -10,8 +10,8 @@ const WORLD_HEIGHT: usize = 2048;
 const WORLD_SIZE: usize = WORLD_WIDTH * WORLD_HEIGHT;
 const ISLAND_WIDTH: usize = 1024;
 const ISLAND_HEIGHT: usize = 512;
-const CONTINENT_WIDTH: usize = 7680;
-const CONTINENT_HEIGHT: usize = 4320;
+const CONTINENT_WIDTH: usize = 1920;
+const CONTINENT_HEIGHT: usize = 1080;
 const RADIANS: f32 = std::f32::consts::PI / 180.0;
 const KILOMETERS_PER_DEGREE: f32 = 111.319_490_793;
 
@@ -2472,14 +2472,16 @@ fn compute_relief_physics(
             let dist_km = dist_from_ridge[i];
             let age_ma = (dist_km / speed_km_myr).min(200.0); // cap at 200 Ma
 
-            // Parsons & Sclater 1977 / Stein & Stein 1992:
+            // Parsons & Sclater 1977 / Stein & Stein 1992 (GDH1):
             // Depth below ridge crest (differential subsidence):
             //   t < 80 Ma: Δd = 350√t  (half-space cooling)
-            //   t ≥ 80 Ma: Δd = 3151 − 2473·exp(−0.0278·t)  (plate model, GDH1)
+            //   t ≥ 80 Ma: Δd = C − 2473·exp(−0.0278·t)  (plate model, GDH1)
+            // Continuity at t=80: 350√80 = 3130, exp(−2.224) = 0.1083
+            //   C = 3130 + 2473×0.1083 = 3398
             let subsidence = if age_ma < 80.0 {
                 350.0 * age_ma.sqrt()
             } else {
-                3151.0 - 2473.0 * (-0.0278 * age_ma).exp()
+                3398.0 - 2473.0 * (-0.0278 * age_ma).exp()
             };
 
             let ocean_weight = 1.0 - (cf / 0.3); // 1.0 at cf=0, 0.0 at cf=0.3
@@ -2864,14 +2866,21 @@ fn apply_events(
             // Minimum 8 km to avoid sub-grid craters.
             let crater_diameter_km = 0.0133 * energy.powf(0.22);
             let crater_radius_km = (crater_diameter_km / 2.0).max(8.0);
-            // Crater depth: simple craters D/d ≈ 5:1 (Pike 1977);
-            // complex craters (D > 4 km) D/d ≈ 20:1 (Melosh 1989).
-            let crater_depth = if crater_diameter_km < 4.0 {
-                crater_diameter_km * 1000.0 / 5.0   // simple: d = D/5
+            // Crater depth: smooth transition from simple (D/d≈5:1, Pike 1977)
+            // to complex (D/d≈20:1, Melosh 1989) over 2–8 km diameter range.
+            // Avoids the factor-4 depth discontinuity at the simple/complex boundary.
+            let depth_ratio = if crater_diameter_km < 2.0 {
+                5.0_f32  // pure simple
+            } else if crater_diameter_km < 8.0 {
+                // Smooth interpolation: 5 → 20 over 2–8 km
+                let t = (crater_diameter_km - 2.0) / 6.0;
+                let s = t * t * (3.0 - 2.0 * t); // Hermite smoothstep
+                5.0 + s * 15.0
             } else {
-                crater_diameter_km * 1000.0 / 20.0   // complex: d = D/20
-            }
-            .min(9000.0); // cap at 9 km (largest known: Chicxulub ~2-3 km deep)
+                20.0  // pure complex
+            };
+            let crater_depth = (crater_diameter_km * 1000.0 / depth_ratio)
+                .min(9000.0); // cap at 9 km (largest known: Chicxulub ~2-3 km deep)
             let center_index = nearest_cell(event.latitude, event.longitude);
             let cx = center_index % WORLD_WIDTH;
             let cy = center_index / WORLD_WIDTH;
@@ -3159,7 +3168,7 @@ fn compute_climate_unified(
         // Factor 0.35: meridional wind is ~20-40% of zonal (Peixoto & Oort 1992).
         let meridional = 0.35 * (lat_deg * RADIANS).sin();
         let noise = value_noise3(0.0, y as f32 / h as f32 * 4.0, 0.5, wind_noise_seed) * 0.2;
-        let angle = zonal.atan2(meridional) + noise;
+        let angle = meridional.atan2(zonal) + noise;
         upwind_dx[y] = angle.cos();
         upwind_dy[y] = angle.sin();
     }
@@ -4038,9 +4047,10 @@ fn compute_d8_receivers(height: &[f32], noise_seed: u32, grid: &GridConfig) -> V
     let mut receivers = (0..grid.size).collect::<Vec<_>>();
     // Stochastic slope perturbation: Tucker & Bras (2000).  At 10 km/cell
     // (planet scope, spherical grid), 12% noise breaks grid-alignment bias.
-    // At fine resolution (≤1 km/cell, flat crop grids), grid artifacts are
-    // below visual threshold — pure D8 gives cleaner dendritic drainage.
-    let noise_amp = if grid.is_spherical { 0.12_f32 } else { 0.0 };
+    // At crop resolution (~0.4 km/cell), 3% noise is enough to break
+    // residual D8 grid-alignment on smooth upsampled terrain without
+    // introducing the stripe artifacts that 12% caused on flat grids.
+    let noise_amp = if grid.is_spherical { 0.12_f32 } else { 0.03 };
 
     for y in 0..h {
         for x in 0..w {
@@ -4354,6 +4364,220 @@ fn stream_power_evolve(
 }
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SPACE erosion model — Shobe, Tucker & Barnhart (2017), Geosci. Model Dev.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Extends stream power (Braun & Willett 2013) with explicit sediment tracking.
+// Bedrock erosion is shielded by alluvial cover; entrained sediment is routed
+// downstream and deposited proportional to settling velocity.
+//
+// This produces alluvial valleys, piedmont fans, deltas, and natural coastal
+// complexity — features that pure bedrock-incision SPL cannot generate.
+//
+// Equations (Shobe et al. 2017, §2):
+//   E_r = K_br · A^m · S^n · exp(−H_s / H*)         bedrock erosion
+//   E_s = K_s  · A^m · S^n · (1 − exp(−H_s / H*))   sediment entrainment
+//   D_s = V_s  · Q_s / Q                              deposition
+//   ∂z_r/∂t = U − E_r                                 bedrock surface
+//   ∂H_s/∂t = D_s − E_s + E_r·(1 − F_f)              sediment layer
+//
+// Parameters (published sources):
+//   K_br   : bedrock erodibility [yr⁻¹], per-cell (Harel et al. 2016)
+//   K_s    : sediment erodibility [yr⁻¹], 2–10× K_br (Shobe et al. 2017 §3.2)
+//   H*     : characteristic sediment depth [m] (Shobe et al. 2017: 0.1–1.0 m)
+//   V_s    : effective settling velocity [m/yr] (controls deposition rate)
+//   F_f    : fine fraction (0–1): wash load leaving system (Shobe et al. 2017 §2.3)
+//   m, n   : area & slope exponents (canonical 0.5, 1.0; Howard 1994)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn space_erosion_step(
+    bedrock: &mut [f32],
+    sediment: &mut [f32],
+    uplift: &[f32],
+    k_br: &[f32],
+    k_sed: f32,
+    h_star: f32,
+    v_s: f32,
+    f_f: f32,
+    dt_yr: f32,
+    dx_m: f32,
+    m: f32,
+    n: f32,
+    kappa: f32,
+    mfd_p: f32,
+    noise_seed: u32,
+    grid: &GridConfig,
+) {
+    let size = grid.size;
+    let cell_area = dx_m * dx_m;
+
+    // --- 1. Total surface elevation ---
+    let mut surface = vec![0.0_f32; size];
+    for i in 0..size {
+        surface[i] = bedrock[i] + sediment[i];
+    }
+
+    // --- 2. Flow routing (D8 receivers + MFD area) ---
+    let receivers = compute_d8_receivers(&surface, noise_seed, grid);
+    let order = topological_sort_descending(&surface);
+    let area = if mfd_p > 0.0 {
+        compute_mfd_area(&surface, &order, dx_m, mfd_p, grid)
+    } else {
+        let mut area = vec![cell_area; size];
+        for &i in order.iter() {
+            let r = receivers[i];
+            if r != i { area[r] += area[i]; }
+        }
+        area
+    };
+
+    // --- 3. Implicit bedrock erosion (downstream → upstream) ---
+    // Braun & Willett (2013) implicit scheme with SPACE sediment-shielding
+    // factor exp(−H_s/H*).  Operator splitting: shielding from current H_s
+    // (Shobe et al. 2017 §2.2).
+    let mut e_r_rate = vec![0.0_f32; size]; // bedrock erosion rate [m/yr]
+
+    for &i in order.iter().rev() {
+        if surface[i] <= 0.0 { continue; }
+        let r = receivers[i];
+        if r == i {
+            bedrock[i] += uplift[i] * dt_yr;
+            continue;
+        }
+
+        let h_s = sediment[i].max(0.0);
+        let shielding = (-h_s / h_star).exp(); // 1.0 = bare rock, → 0 under cover
+        let a_pow = area[i].powf(m);
+        let factor = k_br[i] * shielding * dt_yr * a_pow / dx_m.powf(n);
+
+        let z_recv = surface[r].max(0.0);
+        let z_old = bedrock[i];
+        let z_new = (z_old + uplift[i] * dt_yr + factor * z_recv) / (1.0 + factor);
+        bedrock[i] = z_new.max(0.0);
+
+        e_r_rate[i] = ((z_old + uplift[i] * dt_yr - bedrock[i]) / dt_yr).max(0.0);
+    }
+
+    // --- 4. Explicit sediment transport (upstream → downstream) ---
+    // Route sediment flux Q_s along D8 receivers.
+    // Runoff 400 mm/yr global mean (Fekete et al. 2002, J. Hydrol.).
+    let mut q_s = vec![0.0_f32; size]; // sediment flux [m³/yr]
+    let runoff = 0.4_f32; // m/yr
+
+    for &i in order.iter() {
+        let z_total = bedrock[i] + sediment[i];
+        if z_total <= 0.0 { continue; }
+
+        let r = receivers[i];
+        if r == i { continue; }
+
+        let z_recv = (bedrock[r] + sediment[r]).max(0.0);
+        let s = ((z_total - z_recv) / dx_m).max(1e-8);
+        let a_pow = area[i].powf(m);
+        let s_pow = s.powf(n);
+
+        let h_s = sediment[i].max(0.0);
+        let cover = 1.0 - (-h_s / h_star).exp();
+
+        // Sediment entrainment [m/yr]  (Shobe et al. 2017 eq. 3)
+        let e_s = (k_sed * a_pow * s_pow * cover).min(h_s / dt_yr);
+
+        // Deposition [m/yr]  (Shobe et al. 2017 eq. 4)
+        // D_s = V_s · Q_s / Q, where Q = A·runoff [m³/yr]
+        // Q_s/Q = volumetric sediment concentration — cap at 1% (physical limit
+        // for turbulent water-borne transport; Mulder & Syvitski 1996).
+        let q_water = area[i] * runoff;
+        let concentration = if q_water > 1e-3 {
+            (q_s[i] / q_water).min(0.01)
+        } else {
+            0.0
+        };
+        let d_s = v_s * concentration;
+
+        // Sediment balance (Shobe et al. 2017 eq. 2)
+        // ∂H_s/∂t = D_s − E_s + E_r·(1 − F_f)
+        sediment[i] = (sediment[i] + (d_s - e_s + e_r_rate[i] * (1.0 - f_f)) * dt_yr).max(0.0);
+
+        // Route sediment flux downstream
+        let flux_out = (e_s - d_s + e_r_rate[i] * f_f).max(0.0) * cell_area;
+        q_s[r] += q_s[i] + flux_out;
+    }
+
+    // --- 5. Hillslope diffusion (Culling 1963, Soil Sci.) ---
+    // Linear diffusion ∂z/∂t = κ·∇²z on total surface.  Applied to sediment
+    // preferentially; only erodes bedrock when sediment is depleted.
+    if kappa > 0.0 {
+        let kdt = kappa * dt_yr;
+        let inv_dx2 = 1.0 / (dx_m * dx_m);
+        for i in 0..size {
+            surface[i] = bedrock[i] + sediment[i];
+        }
+        let mut laplacian = vec![0.0_f32; size];
+        for y in 0..grid.height {
+            for x in 0..grid.width {
+                let i = grid.index(x, y);
+                if surface[i] <= 0.0 { continue; }
+                let h_c = surface[i];
+                let h_r = surface[grid.neighbor(x as i32 + 1, y as i32)].max(0.0);
+                let h_l = surface[grid.neighbor(x as i32 - 1, y as i32)].max(0.0);
+                let h_u = surface[grid.neighbor(x as i32, y as i32 - 1)].max(0.0);
+                let h_d = surface[grid.neighbor(x as i32, y as i32 + 1)].max(0.0);
+                laplacian[i] = (h_r + h_l + h_u + h_d - 4.0 * h_c) * inv_dx2;
+            }
+        }
+        for i in 0..size {
+            if surface[i] > 0.0 {
+                let dh = kdt * laplacian[i];
+                sediment[i] += dh;
+                if sediment[i] < 0.0 {
+                    bedrock[i] += sediment[i]; // erode bedrock when sediment exhausted
+                    sediment[i] = 0.0;
+                    bedrock[i] = bedrock[i].max(0.0);
+                }
+            }
+        }
+    }
+}
+
+/// Run `n_steps` iterations of the SPACE erosion model.
+/// Each step uses a different noise seed for stochastic flow direction
+/// (Tucker & Bras 2000).
+fn space_erosion_evolve(
+    bedrock: &mut [f32],
+    sediment: &mut [f32],
+    uplift: &[f32],
+    k_br: &[f32],
+    k_sed: f32,
+    h_star: f32,
+    v_s: f32,
+    f_f: f32,
+    dt_yr: f32,
+    dx_m: f32,
+    m: f32,
+    n_exp: f32,
+    kappa: f32,
+    mfd_p: f32,
+    n_steps: usize,
+    base_seed: u32,
+    grid: &GridConfig,
+    progress: &mut ProgressTap<'_>,
+    progress_base: f32,
+    progress_span: f32,
+) {
+    for step in 0..n_steps {
+        let t = step as f32 / n_steps.max(1) as f32;
+        progress.phase(progress_base, progress_span, t);
+        let step_seed = hash_u32(base_seed.wrapping_add(step as u32 * 0x85EB_CA6B));
+        space_erosion_step(
+            bedrock, sediment, uplift, k_br, k_sed, h_star, v_s, f_f,
+            dt_yr, dx_m, m, n_exp, kappa, mfd_p, step_seed, grid,
+        );
+    }
+    progress.phase(progress_base, progress_span, 1.0);
+}
+
+
 /// Rock type determines erodibility (K_eff) for stream power erosion.
 /// Values from Harel et al. (2016) global erodibility analysis.
 #[derive(Clone, Copy, PartialEq)]
@@ -4367,8 +4591,8 @@ enum RockType {
 }
 
 impl RockType {
-    /// Base erodibility K in m^{0.5}/yr.  Range spans ~8x from most resistant
-    /// (granite) to least resistant (limestone).
+    /// Base erodibility K in yr^{-1} (for SPL with m=0.5, n=1.0, A in m²).
+    /// Range spans ~6x from most resistant (granite) to least (limestone).
     fn k_eff(self) -> f32 {
         match self {
             RockType::Granite   => 0.5e-6,
@@ -4926,7 +5150,10 @@ fn run_crop_pipeline(
             let nz = crop_cell_cache.noise_z[i];
             // Sub-grid variance 10-25% of summit elevation (Montgomery & Brandon
             // 2002, Earth Planet. Sci. Lett.); 15% is the mid-range.
-            let scale = h_coarse.abs().max(50.0) * 0.15;
+            // Minimum 200 m: coastal terrain has significant variance from wave-cut
+            // platforms, marine terraces, and rift-margin topography even at low
+            // mean elevation (Trenhaile 2000; Burbank & Anderson 2011 §8.3).
+            let scale = h_coarse.abs().max(200.0) * 0.15;
             let mut fbm = 0.0_f32;
             let mut freq = 8.0_f32;
             let mut amp = 1.0_f32;
@@ -4943,27 +5170,44 @@ fn run_crop_pipeline(
     progress.phase(progress_base, progress_span, 0.08);
 
     // --- 2b. Fractal coastline perturbation ---
+    //
     // Planet coastline (10 km/cell) is too smooth when upsampled.  Add fractal
-    // noise near sea level to create bays, peninsulas, fjords at 3-20 km scale.
-    // Mandelbrot (1967): coastlines are fractal with D ≈ 1.25.
-    // Use flat pixel coordinates (isotropic) — sphere coords are anisotropic
-    // for small crops (one axis nearly constant) and cause directional artifacts.
+    // noise in a coastal elevation band to create bays, peninsulas, and fjords
+    // at scales from 3 km to 80 km.
+    //
+    // Scientific basis:
+    //   - Mandelbrot (1967): coastlines are fractal, D ≈ 1.25
+    //   - Huang & Turcotte (1989, J. Geophys. Res.): topographic power spectrum
+    //     P(k) ∝ k^(-β) with β ≈ 2.0, giving amplitude A ∝ wavelength λ.
+    //   - Reference amplitude: A₀ = 8 m at λ₀ = 3 km (smallest resolved
+    //     feature at ~0.4 km/cell).  Spectral scaling → A(λ) = A₀ × (λ/λ₀).
+    //
+    // Band width: ±300 m.  Mountainous coasts (e.g., Norway, Patagonia, NZ)
+    // have terrain ranging 0–500 m within 10–30 km of the coast (Trenhaile
+    // 2000, Prog. Phys. Geogr.).  ±300 m captures the vast majority of the
+    // near-coast elevation distribution while the quadratic fade ensures smooth
+    // transition to unperturbed interior.
+    //
+    // Flat pixel coordinates (isotropic) — sphere coords are anisotropic
+    // for small crops (one axis nearly constant) → directional artifacts.
     {
         let coast_frac_seed = hash_u32(seed ^ 0xC0A5_7F8C);
-        let band = 80.0_f32; // ±80 m band around sea level
-        // Seed-based offset to decorrelate from FBM detail noise
+        let band = 300.0_f32; // ±300 m band around sea level
         let ox = (coast_frac_seed % 10000) as f32 * 0.73;
         let oy = (hash_u32(coast_frac_seed) % 10000) as f32 * 0.73;
         for i in 0..crop_grid.size {
             let h = relief[i];
             if h.abs() > band { continue; }
-            // Flat coordinates in km — uniform and isotropic
             let px = (i % crop_w) as f32 * km_per_cell + ox;
             let py = (i / crop_w) as f32 * km_per_cell + oy;
-            // 3 octaves: ~20 km, ~8 km, ~3 km wavelengths
-            let n = value_noise3(px / 20.0, py / 20.0, 0.5, hash_u32(coast_frac_seed)) * 25.0
-                  + value_noise3(px / 8.0, py / 8.0, 1.5, hash_u32(coast_frac_seed ^ 1)) * 15.0
-                  + value_noise3(px / 3.0, py / 3.0, 2.5, hash_u32(coast_frac_seed ^ 2)) * 8.0;
+            // 5 octaves: 80 → 3 km wavelengths.
+            // Amplitudes follow spectral scaling A = A₀×(λ/λ₀) with A₀=8m at λ₀=3km
+            // (Huang & Turcotte 1989, β = 2.0).
+            let n = value_noise3(px / 80.0, py / 80.0, 0.3, hash_u32(coast_frac_seed ^ 5)) * 213.0  // 8×(80/3)
+                  + value_noise3(px / 40.0, py / 40.0, 0.7, hash_u32(coast_frac_seed ^ 4)) * 107.0  // 8×(40/3)
+                  + value_noise3(px / 20.0, py / 20.0, 0.5, hash_u32(coast_frac_seed))     * 53.0   // 8×(20/3)
+                  + value_noise3(px / 8.0,  py / 8.0,  1.5, hash_u32(coast_frac_seed ^ 1)) * 21.0   // 8×(8/3)
+                  + value_noise3(px / 3.0,  py / 3.0,  2.5, hash_u32(coast_frac_seed ^ 2)) * 8.0;   // reference
             // Quadratic fade: strongest at sea level, zero at ±band
             let t = 1.0 - (h.abs() / band);
             let fade = t * t;
@@ -5009,56 +5253,78 @@ fn run_crop_pipeline(
         }
     }
 
-    // --- 4. Fine-scale stream power erosion (10 steps) ---
-    // K_eff calibrated empirically for the island-scale grid (~0.4 km/cell):
-    // higher values than planet scope to produce smooth dendritic drainage.
-    // At fine resolution, K_eff must be higher to erode channels within 10 timesteps.
-    let mut k_eff = vec![0.0_f32; crop_grid.size];
+    // --- 4. SPACE erosion (Shobe et al. 2017) with tectonic uplift ---
+    //
+    // Bedrock erodibility K_br per rock type (Harel et al. 2016, EPSL):
+    //   convergent → metamorphic (harder), divergent → basalt, interior → sedimentary
+    let mut k_br = vec![0.0_f32; crop_grid.size];
     for i in 0..crop_grid.size {
-        k_eff[i] = if bnd_types[i] == 1 {
-            2.0e-6   // convergent: metamorphic (harder)
-        } else if bnd_types[i] == 2 {
-            5.0e-6   // divergent: basalt (moderate)
-        } else {
-            8.0e-6   // interior: sedimentary (softer)
+        k_br[i] = match bnd_types[i] {
+            1 => 1.0e-6,  // metamorphic/granitic (convergent) — Stock & Montgomery 1999
+            2 => 2.5e-6,  // basaltic (divergent) — Harel et al. 2016
+            _ => 5.0e-6,  // sedimentary (interior) — Harel et al. 2016
         };
     }
-    // Zero uplift for fine-scale pass (planet already provided the large-scale topography)
-    let uplift_zero = vec![0.0_f32; crop_grid.size];
+
+    // Tectonic uplift rates from boundary type (Montgomery & Brandon 2002,
+    // Earth Planet. Sci. Lett.; Whipple 2009, Nat. Geosci.):
+    //   convergent margins 0.5–5 mm/yr, divergent 0.1–0.5 mm/yr (rift shoulders),
+    //   stable interior 0.01–0.1 mm/yr (isostatic, Peltier 2004).
+    let mut uplift = vec![0.0_f32; crop_grid.size];
+    for i in 0..crop_grid.size {
+        uplift[i] = match bnd_types[i] {
+            1 => 1.0e-3,   // convergent: 1.0 mm/yr (active orogeny)
+            2 => 0.3e-3,   // divergent: 0.3 mm/yr (rift shoulder, Weissel & Karner 1989)
+            3 => 0.1e-3,   // transform: 0.1 mm/yr (localized transpression)
+            _ => 0.05e-3,  // interior: 0.05 mm/yr (GIA, Peltier 2004)
+        };
+    }
+
+    // Sediment layer starts at zero — bare bedrock.
+    let mut bedrock = relief.clone();
+    let mut sediment_layer = vec![0.0_f32; crop_grid.size];
     let erosion_seed = hash_u32(seed ^ 0x151A_ED00);
-    stream_power_evolve(
-        &mut relief,
-        &uplift_zero,
-        &k_eff,
+
+    // SPACE parameters (Shobe et al. 2017, Table 1):
+    let k_sed = 1.0e-5;  // sediment erodibility [yr⁻¹] — ~5× mean K_br (Shobe §3.2)
+    let h_star = 1.0;    // characteristic sediment depth [m] (Shobe §3.1)
+    let v_s = 0.5;       // settling velocity [m/yr] (controls deposition rate)
+    let f_f = 0.25;      // fine fraction — 25% wash load (Shobe §2.3)
+
+    // 100 steps × 100 kyr = 10 Myr.  Perron et al. (2008, J. Geophys. Res.)
+    // show drainage network equilibrium timescale ~ 1–10 Myr.
+    space_erosion_evolve(
+        &mut bedrock,
+        &mut sediment_layer,
+        &uplift,
+        &k_br,
+        k_sed,
+        h_star,
+        v_s,
+        f_f,
         100_000.0,  // dt = 100 kyr
         dx_m,
-        0.5, 1.0,   // m, n (standard stream power exponents)
-        0.01,        // kappa (hillslope diffusion, CFL-safe)
-        0.0,         // mfd_p: 0 = D8 (correct at ≤1 km/cell)
-        10,          // 10 steps
+        0.5, 1.0,   // m, n (Howard 1994; Whipple & Tucker 1999)
+        0.01,        // kappa: hillslope diffusivity [m²/yr] (Culling 1963)
+        1.1,         // mfd_p: Freeman (1991) MFD, eliminates D8 grid artifacts
+        100,         // 100 steps = 10 Myr landscape evolution
         erosion_seed,
         &crop_grid,
         progress,
         progress_base + progress_span * 0.10,
-        progress_span * 0.30,
+        progress_span * 0.38,
     );
-    // Free large temporaries before allocating more
-    drop(k_eff);
-    drop(uplift_zero);
 
-    // --- 5. Pre-carve slope + hydrology ---
-    let (slope_pre, _, _) = compute_slope_grid(&relief, crop_w, crop_h, progress,
-        progress_base + progress_span * 0.40, progress_span * 0.03);
-    let (_, flow_pre, river_pre, _) = compute_hydrology_grid(
-        &relief, &slope_pre, crop_w, crop_h, detail, progress,
-        progress_base + progress_span * 0.43, progress_span * 0.05);
+    // Combine bedrock + sediment → total surface elevation
+    for i in 0..crop_grid.size {
+        relief[i] = bedrock[i] + sediment_layer[i];
+    }
+    drop(bedrock);
+    drop(sediment_layer);
+    drop(k_br);
+    drop(uplift);
 
-    // --- 6. Carve fluvial valleys ---
-    carve_fluvial_valleys_grid(
-        &mut relief, &flow_pre, &river_pre, crop_w, crop_h, km_per_cell, detail, progress,
-        progress_base + progress_span * 0.48, progress_span * 0.04);
-
-    // --- 7. Post-carve edge fade ---
+    // --- 5. Post-erosion edge fade ---
     {
         let w = crop_w as f32;
         let h = crop_h as f32;
@@ -5097,14 +5363,14 @@ fn run_crop_pipeline(
         }
     }
 
-    // --- 8. Final slope + hydrology ---
+    // --- 6. Final slope + hydrology ---
     let (slope_map, min_slope, max_slope) = compute_slope_grid(&relief, crop_w, crop_h,
-        progress, progress_base + progress_span * 0.52, progress_span * 0.04);
+        progress, progress_base + progress_span * 0.50, progress_span * 0.04);
     let (flow_direction, flow_accumulation, river_map, lake_map) = compute_hydrology_grid(
         &relief, &slope_map, crop_w, crop_h, detail, progress,
-        progress_base + progress_span * 0.56, progress_span * 0.06);
+        progress_base + progress_span * 0.54, progress_span * 0.06);
 
-    // --- 9. Climate (unified model with real planetary coordinates) ---
+    // --- 7. Climate (unified model with real planetary coordinates) ---
     let aerosol = 0.0_f32; // no events for crop
     let (
         temperature_map,
@@ -5121,11 +5387,11 @@ fn run_crop_pipeline(
         seed,
         aerosol,
         progress,
-        progress_base + progress_span * 0.62,
+        progress_base + progress_span * 0.60,
         progress_span * 0.18,
     );
 
-    // --- 10. Biomes (smoothed T/P for stable classification) ---
+    // --- 8. Biomes (smoothed T/P for stable classification) ---
     let smooth = |src: &[f32]| -> Vec<f32> {
         let mut out = src.to_vec();
         let mut scratch = vec![0.0_f32; crop_grid.size];
@@ -5157,7 +5423,7 @@ fn run_crop_pipeline(
         &temp_smooth, &precip_smooth, &relief, crop_w, seed, &river_map);
     progress.phase(progress_base, progress_span, 0.85);
 
-    // --- 11. Settlement ---
+    // --- 9. Settlement ---
     let coastal_exposure = compute_coastal_exposure_grid(&relief, crop_w, crop_h);
     let settlement_map = compute_settlement_grid(
         &biome_map, &relief, &temperature_map, &precipitation_map,
