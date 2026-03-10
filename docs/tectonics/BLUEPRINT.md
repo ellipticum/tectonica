@@ -1,288 +1,433 @@
-# Tectonica — Blueprint (март 2026)
+# Tectonica — Blueprint (март 2026, аудит v2)
 
 Процедурная генерация планет на основе геофизики.
-Движок: `rust/planet_engine/src/lib.rs` (Rust -> WASM).
+Движок: `rust/planet_engine/src/lib.rs` (Rust → WASM, ~5800 строк).
 
 ---
 
-## Текущее состояние
+## Текущее состояние (после аудита)
 
-### Что работает хорошо
+### Что реализовано научно корректно
 
-- **Planet scope** (4096x2048): тектоника, изостазия, климат, биомы — научно обоснованы
-- **Береговая линия на planet scope**: BFS-perturbation ломает Voronoi-контуры,
-  coastline irregular на масштабе 200-2000 km
-- **Continent scope — западный берег**: спектральная пертурбация (Huang & Turcotte 1989)
-  дала бухты, острова, полуострова — визуально близко к реальным картам
-- **SPACE erosion model** (Shobe et al. 2017): заменил SPL в crop pipeline,
-  отслеживает bedrock + sediment раздельно
-- **MFD** (Freeman 1991): заменил D8 в crop scope, убрал параллельные полосы
-
-### Что НЕ работает
-
-| Проблема | Scope | Корневая причина |
-|----------|-------|-----------------|
-| Остров = blob | Island | `fade_land_edges=true` топит ВСЮ сушу по краям crop |
-| Континент = "тумбочка" | Continent | Суша заполняет 3-4 стороны crop окна |
-| Voronoi-артефакты | Continent | Plate tessellation bleeding через elevation field |
-| Нет речных долин | Island+Continent | SPACE не прорезает видимые каналы за 100 шагов |
-| Однородный interior | Island+Continent | Uplift field = 4 константы по boundary type |
-| Биомы однородны (island) | Island | Один широтный пояс на 400 km crop |
-
----
-
-## Диагностика
-
-### 1. Остров = blob
-
-**Симптом**: гладкая капля/овал вместо сложной формы.
-
-**Причина**: pipeline `run_crop_pipeline` с `fade_land_edges=true` применяет
-smoothstep fade ко ВСЕМ ячейкам у краёв, заставляя h → -500m. Любая
-естественная форма с планеты уничтожается.
-
-**Почему так сделано**: D8/MFD drainage требует океанического border — иначе
-реки не имеют outlet и flow accumulation не работает.
-
-**Научный анализ**: на реальной Земле острова имеют сложную форму из-за:
-- Тектонической структуры (разломы, субдукционные дуги, рифты)
-- Волновой эрозии побережья (Trenhaile 2000)
-- Речных устьев → эстуарии → rias
-- Изменений уровня моря (затопление долин → fjords, bays)
-
-Ни один из этих процессов не моделируется. Crop + edge fade — это zoom
-в гладкую планетарную карту с наложением пластилиновой маски.
-
-### 2. Континент = "тумбочка"
-
-**Симптом**: суша упирается в 3 из 4 границ crop окна, прямоугольная обрезка.
-
-**Причина**: `find_continent_region` ищет окно с 40-90% суши, но при
-target_km = 3000-4000 km и крупных континентах на планете, почти все
-окна имеют суши до краёв. Edge penalty штрафует только worst single side.
-
-**Научный анализ**: это не проблема физики, а проблема framing. Реальные
-карты континентов (Южная Америка, Австралия) показывают continent
-ВНУТРИ ocean frame. Нужно либо:
-- Уменьшить target_km чтобы окно было больше континента
-- Найти окно где continent не касается краёв (min 2 стороны ocean)
-- Перейти к подходу "continent mask" вместо rectangular crop
-
-### 3. Voronoi-артефакты в interior
-
-**Симптом**: шестиугольные пятна на height map, видимые как ступенчатые
-переходы elevation в interior континента.
-
-**Причина**: plate_field (Voronoi tessellation) → crustal thickness →
-isostatic elevation. Границы плит дают резкие jumps в crustal thickness.
-Flexural smoothing (34 прохода) сглаживает мелкие, но крупные (>200 km)
-структуры остаются.
-
-**Научный анализ**: на реальной Земле внутриплитные elevation variations
-определяются:
-- Литосферным возрастом → термальной субсидией (Parsons & Sclater 1977)
-- Мантийными плюмами → dynamic topography (Hager et al. 1985)
-- Осадочными бассейнами (flexural loading)
-
-В нашей модели нет dynamic topography и литосферного возраста → нет
-внутриплитных elevation gradients → Voronoi pattern dominates.
-
-### 4. Нет видимых речных долин
-
-**Симптом**: relief гладкий, нет V-образных каньонов или широких долин.
-
-**Причина двухслойная**:
-
-a) **SPACE параметры**: K_br = 1-5e-6, dt = 100 kyr, 100 steps = 10 Myr.
-   Steady-state relief для SPL: h_ss = (U/K)^(1/n) * (A^(-m/n)) * dx.
-   Для interior (U=0.05 mm/yr, K=5e-6): h_ss ≈ 10 m/km * distance.
-   За 10 Myr при 0.05 mm/yr uplift, суммарное поднятие = 500m.
-   Erosion incision depth ~ K*A^0.5*S * dt = десятки метров.
-   Valleys не видны потому что erosion << initial relief from planet crop.
-
-b) **MFD distributes flow**: вместо sharp channel (D8) flow spread across
-   multiple neighbors → diffuse erosion → smooth surface. MFD корректен
-   для area accumulation, но erosion incision в реальности идёт по
-   single channel (D8-like).
-
-### 5. Uplift поле однородно
-
-**Симптом**: купол вместо хребтов + долин.
-
-**Причина**: uplift назначается по boundary_type (4 константы).
-Большинство ячеек в crop = interior (type 0) → uniform 0.05 mm/yr.
-Нет spatial variation → нет differential erosion → нет topographic contrast.
-
-**Научный анализ**: реальный uplift определяется:
-- Мантийным потоком (dynamic topography, ±1 km, Hager et al. 1985)
-- Историей субдукции (slab pull, corner flow)
-- Flexural response to erosional unloading (Watts 2001)
-- Rift shoulder uplift (Weissel & Karner 1989)
+| Модуль | Реализация | Источник |
+|--------|-----------|---------|
+| PRNG | xoshiro128++ + SplitMix32 | Blackman & Vigna 2021 |
+| Изостазия Эйри | ρ_c × T_c = const + water loading | Turcotte & Schubert §2.6 |
+| Мощность коры | 40 км (конт.), 7 км (оке.), ±10.5 км шум | Christensen & Mooney 1995 |
+| Тепловая субсидия | d = 350√t / GDH1 плиточная модель | Parsons & Sclater 1977; Stein & Stein 1992 |
+| Флексуральная изостазия | N = α²/(2dx²) = 34 прохода из Te=25 км | Watts 2001 |
+| Тип породы → K_eff | Деформация → метаморфическая ступень | Harel et al. 2016; Bucher & Grapes 2011 |
+| Uplift (planet) | conv×2e-3 + div×(−1e-3) + trans×3e-4 [m/yr] | England & McKenzie 1982 |
+| Диффузия рельефа | κ = 0.02 m²/yr, 10 шагов | Fernandes & Dietrich 1997 |
+| Изостатическая релаксация | τ_eff = 5 Myr → f_relax = 0.26 | Watts 2001 §8.4 |
+| Динамическая топография | 2 октавы ±600м, λ=5000/2500 км | Hager 1985; Hoggard 2016 |
+| Спектральный шум рельефа | β=2.0, 4 октавы | Huang & Turcotte 1989 |
+| Гауссова пертурбация берегов | σ=1200/600м, два прохода | Wessel & Smith 1996 |
+| Температура | Полином 4-й степени + лапс-рейт + парник | Peixoto & Oort 1992; Pierrehumbert 2010 |
+| Континентальность | 0.008°C/км × sin(φ) | Terjung & Louie 1972 |
+| Осадки (зональные) | Двух-гауссовая модель GPCP | Adler et al. 2003 |
+| Ветер | Трёхклеточная циркуляция | Peixoto & Oort 1992 |
+| Влага с наветра | L = 700 км e-folding | van der Ent & Savenije 2011 |
+| Дождевая тень | 0.40 мм/м, спад 250 км | Smith 1979; Galewsky 2009 |
+| Биомы | Полигоны Уиттекера + Köppen ET | Ricklefs & Relyea 2014 |
+| SPACE эрозия | K_br, K_sed, H*, V_s, F_f из литературы | Shobe et al. 2017 |
+| Схема Браун-Уиллетт | Implicit + обновлённый приёмник | Braun & Willett 2013 |
+| MFD накопление площади | p=1.1 (Freeman 1991) | Freeman 1991 |
+| Deformation uplift (crop) | conv_def/div_def/trans_def → U | England & McKenzie 1982 |
 
 ---
 
-## План улучшений
+## Полный список хаков и эвристик (аудит март 2026)
 
-### Phase 1: Фундамент (crop pipeline)
-
-#### 1.1 Убрать "тумбочку" — adaptive framing
-
-**Проблема**: rectangular crop с фиксированным aspect ratio.
-
-**Решение**: вместо фиксированного окна, алгоритм flood-fill от выбранного
-seed point по connected land mass. Crop window = bounding box land mass +
-ocean padding (20% margin). Aspect ratio вычисляется из формы mass, не
-навязывается.
-
-**Результат**: окно подстраивается под форму континента/острова.
-Небольшие континенты (Австралия) получат квадратное окно.
-Длинные (Чили) — вытянутое.
-
-**Научное основание**: нет — это геометрия framing, не физика.
-
-#### 1.2 Объединить island и continent в единый scope
-
-**Проблема**: два отдельных pipeline с разными параметрами для по сути
-одной операции (crop + refine).
-
-**Решение**: единый `crop_scope` с параметрами:
-- `target_km`: физический размер (200-5000 km)
-- `land_fraction_target`: желаемая доля суши (0.3 = остров, 0.7 = континент)
-- `edge_policy`: "ocean" (force ocean at edges) | "natural" (preserve)
-
-Для "ocean" policy — найти регион где суша уже окружена океаном
-на планете (не навязывать edge fade).
-
-Для "natural" — использовать planet coastline как есть.
-
-**Научное основание**: нет — архитектурный рефакторинг.
-
-#### 1.3 Uplift из деформационного поля (не boundary type)
-
-**Проблема**: 4 константы uplift по boundary_type.
-
-**Решение**: crop из planet deformation field (conv_def, div_def, trans_def)
-→ вычислить uplift rate для каждой ячейки:
+### H1: Параметры роста плит Вороного
+**Файл**: `build_irregular_plate_field`, ~строки 819–970
 
 ```
-U_conv = conv_def * 3.0e-3 * speed_factor     (0-3 mm/yr, Whipple 2009)
-U_div  = -div_def * 1.0e-3 * speed_factor     (subsidence in rift center)
-U_trans = trans_def * 0.5e-3 * speed_factor    (transpressional uplift)
-U_total = U_conv + U_div + U_trans + U_background
-U_background = 0.02e-3                         (GIA, Peltier 2004)
+spread: 0.82–1.22 (случайный)
+roughness: 0.26–1.08
+drift_factor: 1.03 − 0.12 × drift_align
+polar_factor: 1.0 + lat/90 × 0.1
+size_bias: (a×b)^0.74, a ∈ [0.7,1.55], b ∈ [0.76,1.34]
+start_cost нуклеусов: 0.1–2.8 (случайный)
 ```
 
-**Требует**: передать deformation fields в run_crop_pipeline (сейчас
-передаётся только boundary_types).
+**Обоснование**: Bird (2003) цитируется для статистики форм плит, но сам
+алгоритм роста — чистая процедура. Физически корректная альтернатива —
+мантийная конвекция (нерешаемо в реальном времени).
 
-**Научное основание**: England & McKenzie 1982; Whipple 2009; Weissel & Karner 1989.
-
-### Phase 2: Эрозия и рельеф
-
-#### 2.1 Hybrid flow routing: MFD area + D8 incision
-
-**Проблема**: MFD-only produces diffuse erosion without visible valleys.
-
-**Решение**: использовать MFD для drainage area accumulation (smooth,
-no artifacts), но D8 receivers для implicit bedrock incision (sharp channels).
-
-В space_erosion_step:
-- area = compute_mfd_area (как сейчас)
-- receivers = compute_d8_receivers (для bedrock implicit step)
-- Sediment routing по D8 receivers (single path)
-
-Это стандартный подход в goSPL (Salles et al. 2023) и FastScape.
-
-**Научное основание**: Salles et al. 2023; Braun & Willett 2013.
-
-**Статус**: УЖЕ реализовано — SPACE step использует D8 receivers + MFD area.
-Проверить что channels действительно формируются (возможно K_br слишком мал).
-
-#### 2.2 Calibrate SPACE parameters для visible valleys
-
-**Проблема**: 100 шагов SPACE не прорезают видимые каналы.
-
-**Анализ**: при K_br = 1-5e-6 и dt = 100 kyr:
-- factor = K * dt * A^0.5 / dx
-- Для ячейки с A = 100 km^2 = 1e8 m^2, A^0.5 = 10000:
-  factor = 5e-6 * 1e5 * 10000 / 400 = 12.5
-  → (h_old + factor * h_recv) / (1 + factor) ≈ h_recv (converges)
-- Это значит каналы ДОЛЖНЫ формироваться. Проверить:
-  a) не перезаписывает ли sediment deposition каналы обратно
-  b) не слишком ли большой V_s (deposition rate)
-  c) начальный relief (planet crop) может быть слишком rough для
-     stream power to develop organized drainage
-
-**Действие**: тестовый запуск с V_s = 0 (no deposition) чтобы изолировать
-проблему. Если каналы появятся → V_s слишком высок. Если нет → проблема
-в flow routing или initial conditions.
-
-**Научное основание**: Shobe et al. 2017 Table 1 (параметры).
-
-#### 2.3 Climate-erosion coupling (Roe et al. 2003)
-
-**Проблема**: климат вычисляется один раз после эрозии. Обратная связь
-precipitation → erosion → relief change → precipitation change отсутствует.
-
-**Решение**: каждые N erosion steps, пересчитывать orographic precipitation
-и модулировать K_eff:
-
-```
-K_eff = K_br * (P_local / P_mean)^alpha
-alpha = 1.0 (Whipple 2009: 1-2)
-```
-
-**Результат**: windward slopes erode faster → asymmetric valleys,
-leeward slopes accumulate sediment → rain shadow plains.
-
-**Научное основание**: Roe et al. 2003; Whipple 2009.
-
-### Phase 3: Внутренняя структура
-
-#### 3.1 Dynamic topography (simplified)
-
-**Проблема**: interior elevation определяется только crustal thickness →
-Voronoi pattern dominates.
-
-**Решение**: добавить long-wavelength (>500 km) noise field, коррелированный
-с heat anomaly из plate properties:
-
-```
-dyn_topo = sum_octaves(freq=2,4,8; amp from heat) * 500 m
-```
-
-Физически: мантийные плюмы и downwellings создают ±0.5-1 km topography
-с длиной волны 1000-5000 km (Hager et al. 1985; Flament et al. 2013).
-
-Это не полная dynamic topography model (нужна мантийная конвекция),
-но правильный СПЕКТР вариаций на правильных масштабах.
-
-**Научное основание**: Hager et al. 1985; Flament et al. 2013.
-
-#### 3.2 Разрешение и производительность
-
-**Текущее**:
-- Planet: 4096x2048 (8M cells)
-- Island: 1024x512 (0.5M cells)
-- Continent: 1920x1080 (2M cells)
-
-**Предложение**: сделать разрешения настраиваемыми:
-- Crop scope: default 1024x1024 (1M cells) для любого target_km
-- Planet: оставить 4096x2048
-
-1M cells × 100 SPACE steps = manageable (30-60 sec).
-Качество определяется физикой модели, не пикселями.
+**Статус**: ⚪ Неустранимо на данной архитектуре. Результат достаточно
+реалистичен статистически.
 
 ---
 
-## Приоритеты
+### H2: Историческая траектория нуклеусов плиты
+**Файл**: строки 921–970
 
-1. **Phase 2.2** — calibrate SPACE (V_s, K_br) → видимые долины (быстрый тест)
-2. **Phase 1.3** — uplift из deformation field → differential erosion
-3. **Phase 1.1** — adaptive framing → убрать "тумбочку"
-4. **Phase 1.2** — unified crop scope → убрать blob
-5. **Phase 3.1** — dynamic topography → убрать Voronoi
-6. **Phase 2.3** — climate coupling → asymmetric erosion
+```
+history_steps: 6–18, step_len: 22–86 ячеек
+bend: ±0.34 рад, branch_count: 2/3 (62%/38%)
+```
+
+**Статус**: ⚪ Та же категория что H1. Создаёт нелинейные, нестрогие формы плит.
+
+---
+
+### H3: Структурное поле (`structural_field`)
+**Файл**: строки 856–873
+
+```
+structural_field = clamp(0.5 + 0.5 × (0.62×low + 0.38×mid))
+```
+
+Два FBM октавы с весами 0.62/0.38 управляют предпочтительными путями
+роста плит, имитируя "слабые зоны" в литосфере. Веса подобраны визуально.
+
+**Статус**: 🟡 Качественно обоснован (литосферная гетерогенность существует),
+но конкретные веса — fudge. Улучшение: использовать реальные данные о
+распределении кратонов и орогенов.
+
+---
+
+### H4: Модуляция динамической топографии
+**Файл**: строки 2567–2576
+
+```
+scale = 0.4 + 0.6 × activity
+```
+
+40% в стабильных кратонах, 100% у активных границ. Artemieva (2009)
+подтверждает качественную тенденцию но не конкретные числа.
+
+**Статус**: 🟡 Разумное приближение. Улучшение: модулировать амплитуду
+литосферным возрастом (толстая кратонная литосфера реально подавляет
+динамическую топографию на 50-80%).
+
+---
+
+### H5: Maintenance uplift в crop pipeline
+**Файл**: строки 5461–5469
+
+```
+u_conv  = crop_conv_def[i] × 1e-3 × speed_factor    // 0–1.0 мм/год
+u_div   = crop_div_def[i]  × 3e-4 × speed_factor    // 0–0.3 мм/год
+u_trans = crop_trans_def[i]× 1.5e-4 × speed_factor  // 0–0.15 мм/год
+```
+
+33% от полных тектонических скоростей. Выбрано empirically чтобы
+давать 2–7 км пики вместо 18–21 км при полных скоростях.
+
+**Научное обоснование**: Willett & Brandon (2002, Geology) показывают
+"steady-state uplift ≈ erosion rate, typically 0.1–0.5 mm/yr" — это
+поддерживает низкие maintenance rates. Но конкретное соотношение 33%
+не из измерений.
+
+**Статус**: 🔴 Важный калибровочный хак. Правильная физика: использовать
+isostatic unloading rate как функцию эрозии вместо фиксированной доли
+от тектонических скоростей. (Isostatic rebound = erosion × ρ_c/Δρ = ~80%.)
+
+**Целевое исправление (Phase H5)**:
+```
+u_isostatic = erosion_rate × rho_c / (rho_m - rho_c) ≈ erosion_rate × 2.8
+```
+
+---
+
+### H6: Масштаб FBM детали в crop
+**Файл**: строки 5336
+
+```
+scale = h_coarse.abs().max(200.0) × 0.15
+```
+
+15% от высоты + пол 200м. Montgomery & Brandon (2002) — "sub-grid variance
+10-25% of summit elevation" — используется как обоснование, но в другом
+контексте (конкретно для оценки вершинного рельефа).
+
+**Статус**: 🟡 Приемлемо. 200м пол — empirical.
+
+---
+
+### H7: Пост-эрозионное сглаживание рельефа (5 проходов)
+**Файл**: строки 2693–2728
+
+Сглаживает "sub-grid artifacts" после диффузного тектонического uplift.
+σ ≈ 18 км. Чисто визуальная очистка.
+
+**Статус**: 🔴 Артефакт-подавляющий хак. Сигнализирует о том что диффузионная
+эрозия оставляет артефакты от дискретизации. Правильная физика:
+вместо post-hoc smoothing сделать диффузию на всё время.
+
+---
+
+### H8: Амплитуды детального шума (удвоены)
+**Файл**: строки 2813–2817
+
+```
+(16.0, 160.0, 0),  // было 80.0
+(32.0,  80.0, 1),  // было 40.0
+(64.0,  40.0, 2),  // было 20.0
+(128.0, 20.0, 3),  // было 10.0
+```
+
+Удвоены для "видимой текстуры на планетарном масштабе". Спектральный
+наклон β=2.0 правильный, но абсолютные амплитуды откалиброваны визуально.
+
+**Статус**: 🟡 Спектральная структура физически обоснована (Huang & Turcotte 1989).
+Абсолютные значения эмпирические, но в правильном диапазоне
+(ETOPO1 land RMS roughness ~200м при λ=400 км в орогенных районах).
+
+---
+
+### H9: Порог гипсометрической коррекции
+**Файл**: строки 2756–2758
+
+```
+if median_fb > target_median × 1.5 && max_land > median_fb × 1.2
+```
+
+Коэффициенты ×1.5 и ×1.2 произвольны.
+
+**Статус**: ⚪ Редко срабатывает; safety valve. Принципиально не важно.
+
+---
+
+### H10: Очистка береговой линии (1 проход)
+**Файл**: строки 2898–2931
+
+Морфологическая эрозия/дилатация: удаляет 1-ячеечные полуострова и бухты.
+Нет физики — визуальная постобработка.
+
+**Статус**: ⚪ При разрешении 10 км/ячейка это неустранимо — реальные
+1-ячеечные формы нефизичны.
+
+---
+
+### H11: Фильтр биомных мод (2 прохода)
+**Файл**: `compute_biomes_grid`, ~строки 4085–4100
+
+Удаляет изолированные пиксели биомов. Чисто визуальная очистка.
+
+**Статус**: ⚪ Аналогично H10. Неустранимо при данном разрешении.
+
+---
+
+### H12: Шум в тракте влаги с наветра
+**Файл**: строка 3358–3362
+
+```
+let pn = value_noise3(...) × 15.0;
+let eff_dist = (land_dist + pn).max(0.0);
+```
+
+Добавляет шум к "дальности прохождения над сушей" чтобы разбить
+прямолинейный артефакт трассировки.
+
+**Статус**: 🔴 Хак для маскировки дефекта модели прямолинейного ветра.
+Правильное решение: диффузия влаги (атмосферный транспорт не прямолинеен),
+или хотя бы небольшое угловое размытие вектора ветра при трассировке.
+
+---
+
+### H13: Равномерный сток (runoff = 0.4 м/год)
+**Файл**: строка 4621
+
+```
+let runoff = 0.4_f32; // м/год — глобальное среднее (Fekete et al. 2002)
+```
+
+Применяется равномерно ко всем ячейкам. Реально: Сахара <5 мм/год,
+Амазония >3000 мм/год. Ошибка × 600.
+
+**Статус**: 🔴 Значимое упрощение. SPACE эрозия использует сток для
+вычисления концентрации взвеси (D_s = V_s × Q_s / Q). С постоянным Q
+вся пространственная изменчивость депонирования потеряна.
+
+**Целевое исправление (Phase 2.3)**: `runoff[i] = precipitation[i] × infiltration_factor`
+
+---
+
+### H14: H* = 2.0 м вне опубликованного диапазона
+**Файл**: строка 5478
+
+```
+let h_star = 2.0;  // Shobe et al. 2017 рекомендуют 0.1–1.0 м
+```
+
+Намеренно завышен вдвое для усиления врезания каналов. Откалиброван
+эмпирически.
+
+**Статус**: 🟡 Вне рекомендованного диапазона но физически интерпретируемо
+как "толстый слой аллювия" в равнинных зонах. Документировать явно.
+
+---
+
+### H15: Скоринг при выборе региона crop
+**Файл**: `find_interesting_region` и `find_continent_region`, строки 5032–5244
+
+```
+score = mix_score × coast_norm × elev_norm × boundary_norm + noise×0.3
+```
+
+Полностью эмпирическая функция без физического обоснования.
+
+**Статус**: ⚪ Алгоритм фреймирования — физика здесь неприменима. Единственное
+"улучшение" — лучше подобранные веса.
+
+---
+
+### H16: Maintenance uplift не учитывает изостатический rebounds
+**Файл**: строки 5461–5469 (текущая реализация)
+
+Maintenance uplift = const × deformation_field. Не учитывает тот факт что
+SPACE эрозия должна запускать изостатическую разгрузку:
+`U_isostasy = erosion_rate × ρ_c/(ρ_m − ρ_c) ≈ erosion_rate × 2.8`
+
+Без этой обратной связи глубоко врезанные реки не вызывают uplift горных
+хребтов — одна из важнейших обратных связей в геоморфологии
+(Molnar & England 1990, Nature).
+
+**Статус**: 🔴 Важная отсутствующая физика. Без изостатической разгрузки
+crop-scope горы эродируются быстрее чем поднимаются, и долины не углубляются
+пропорционально.
+
+---
+
+### H17: dt = 1.5 Myr в планетарном uplift
+**Файл**: строка 2646
+
+```
+let dt_myr = 1.5_f32; // "1.5 Myr of tectonic evolution"
+```
+
+Откуда 1.5 Myr? Нет обоснования.
+
+**Статус**: 🟡 Влияет на итоговую амплитуду гор. Правильнее: dt = время
+одного шага plate evolution (~1–3 Myr), что примерно совпадает.
+
+---
+
+### H18: Центральный вес 0.586 в сглаживании рельефа
+**Файл**: строка 2706
+
+```
+let center_w = 0.586 * neighbor_sum;
+```
+
+Произвольный коэффициент. Не соответствует ни гауссовому ядру
+(было бы другое число), ни равновзвешенному усреднению.
+
+**Статус**: ⚪ Минорный. Влияет только на форму kernel сглаживания.
+
+---
+
+## Отсутствующая физика (пробелы модели)
+
+| # | Процесс | Последствие пропуска | Приоритет |
+|---|---------|---------------------|----------|
+| G1 | Осадочная нагрузка | Шельфы слишком крутые | Низкий |
+| G2 | Климат-эрозия связь | Постоянный сток, нет asymmetric valleys | **Высокий** (Phase 2.3) |
+| G3 | Изостатическая разгрузка от эрозии | Crop горы без rebound | **Высокий** (Phase H16) |
+| G4 | Возраст литосферы → K_eff | Старые породы не твёрже | Средний |
+| G5 | Вулканические острова (hotspot) | Нет гавайского типа | Низкий |
+| G6 | Эвстазия | Нет изменений уровня моря | Низкий |
+| G7 | Sub-grid channel width correction | K_eff не масштабируется с dx | Средний (Phase G7) |
+
+---
+
+## Устранённые хаки (история)
+
+| Дата | Хак | Замена |
+|------|-----|--------|
+| Фев 2026 | LCG PRNG | xoshiro128++ (Blackman & Vigna 2021) |
+| Фев 2026 | Нет water loading | Airy + rho_w = 1025 (Turcotte & Schubert §2.6) |
+| Фев 2026 | Нет thermal subsidence | Parsons & Sclater 1977 + GDH1 |
+| Фев 2026 | 12 проходов (подобрано) | N = α²/(2dx²) = 34 из Te=25 км |
+| Фев 2026 | Noise ±5 m после эрозии | Stochastic flow ±5% (Tucker & Bras 2000) |
+| Фев 2026 | Decision tree биомы | Polygon lookup Уиттекера (Shimrat 1962) |
+| Фев 2026 | Uplift = 4 константы по boundary_type | Деформационные поля conv/div/trans |
+| Фев 2026 | Stale receiver в SPACE | Обновлённый приёмник (Braun & Willett 2013) |
+| Мар 2026 | V_s=0.5, F_f=0.25 → заполнение каналов | V_s=0.1, F_f=0.5, H*=2.0 |
+| Мар 2026 | Uplift crop = полные тектонические скорости | 33% maintenance (Willett & Brandon 2002) |
+
+---
+
+## Приоритеты улучшений
+
+### 🔴 Высокий приоритет (значимая физика, достижимо)
+
+#### Phase H16: Изостатическая разгрузка от эрозии (crop pipeline)
+**Проблема**: SPACE эрозия удаляет материал, но нет изостатического
+подъёма в ответ. Реально: Molnar & England (1990) показали что
+эрозия → isostatic rebound → дополнительный uplift.
+
+**Решение**: После каждого SPACE шага:
+```
+erosion_thickness = (z_old - z_new) / rho_c * rho_m  // по столбцу
+uplift_isostatic = erosion_thickness * rho_c / (rho_m - rho_c)
+                 ≈ erosion × 2.8  (для rho_c=2750, rho_m=3300)
+```
+Применять как дополнительный uplift в следующем шаге.
+
+**Научное основание**: Molnar & England 1990, Nature; Isacks 1992;
+Tomkin & Roe 2007, Geophys. Res. Lett.
+
+---
+
+#### Phase 2.3: Климат-эрозия связь (Roe et al. 2003)
+**Проблема**: SPACE runoff = 0.4 м/год везде. Нет связи precipitation → Q.
+
+**Решение**:
+```
+runoff[i] = precipitation[i] * infiltration(biome)
+K_eff_climate[i] = K_br[i] * (runoff[i] / runoff_mean)^alpha  // alpha=1.0
+```
+
+**Результат**: Windward slopes erode faster → asymmetric valleys;
+leeward → rain shadow plains.
+
+**Научное основание**: Roe et al. 2003, J. Geophys. Res.; Whipple 2009.
+
+---
+
+### 🟡 Средний приоритет
+
+#### Phase 1.2: Единый crop scope (убрать island blob)
+**Проблема**: `fade_land_edges=true` уничтожает форму острова.
+Blob shape вместо реальных очертаний.
+
+**Решение**: Найти регион где планетная суша УЖЕ окружена океаном
+на 3+ сторонах → не нужен edge fade. Изменить `find_interesting_region`
+для поиска "enclosed land mass" вместо "mixed land/ocean window".
+
+```
+score += enclosed_bonus * (4 - land_sides)  // prefer fewer land borders
+```
+
+**Статус**: Архитектурный рефакторинг, не физика. Но важно визуально.
+
+---
+
+#### Phase G7: Sub-grid channel width correction
+**Проблема**: K_eff не масштабируется с шириной канала.
+Pelletier (2010): `K_eff_corrected = K_eff × W_ch / dx`
+где W_ch = channel width ∝ A^0.4 (Leopold & Maddock 1953).
+
+**Решение**:
+```
+w_ch = k_w * area[i].powf(0.4)  // Leopold & Maddock scaling
+k_eff_corrected = k_br[i] * (w_ch / dx_m).clamp(0.01, 1.0)
+```
+
+**Научное основание**: Pelletier 2010, Geomorphology; Leopold & Maddock 1953.
+
+---
+
+### ⚪ Низкий приоритет (неустранимо или незначимо)
+
+- **H1, H2**: Plate growth heuristics — неустранимо без мантийной конвекции
+- **H9**: Hypsometric trigger — редко срабатывает
+- **H10, H11**: Coastal/biome cleanup — неустранимо при данном разрешении
+- **H18**: Center weight 0.586 — незначимо
 
 ---
 
@@ -307,7 +452,9 @@ dyn_topo = sum_octaves(freq=2,4,8; amp from heat) * 500 m
 | 15 | [15_ХАКИ](15_ХАКИ.md) | Известные хаки и эвристики |
 | 16 | [16_ЛИТЕРАТУРА](16_ЛИТЕРАТУРА.md) | Список источников |
 
+---
+
 ## Принцип
 
 Каждый параметр указан с точным значением из кода и источником.
-Где физика упрощена или подобрана вручную — указано явно (см. [15_ХАКИ](15_ХАКИ.md)).
+Где физика упрощена или подобрана вручную — указано явно.

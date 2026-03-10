@@ -690,6 +690,12 @@ struct ComputePlatesResult {
 struct ReliefResult {
     relief: Vec<f32>,
     sea_level: f32,
+    /// Propagated convergent deformation field [0..1] — for crop pipeline uplift
+    conv_def: Vec<f32>,
+    /// Propagated divergent deformation field [0..1]
+    div_def: Vec<f32>,
+    /// Propagated transform deformation field [0..1]
+    trans_def: Vec<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1938,54 +1944,142 @@ fn compute_relief_physics(
     let n_plates = plates.plate_vectors.len();
     progress.phase(progress_base, progress_span, 0.0);
 
-    // --- 1. Continental vs oceanic per cell ---
-    // Assign continental/oceanic based on plate buoyancy ranking, constrained
-    // so that total continental area ≈ target from ocean_percent.
-    // Without area constraint, random buoyancy > 0 can give anywhere from 10%
-    // to 60% continental area, causing wild freeboard variance between seeds.
-    // Earth's ocean coverage (71%) is a consequence of continental crust volume
-    // (Taylor & McLennan 1995); here we enforce the same relationship.
-    let mut plate_cells = vec![0usize; n_plates];
+    // --- 1. Continental crust distribution: scattered Gaussian nucleus model ---
+    //
+    // Whole-plate continental assignment (buoyancy sort) causes supercontinents:
+    // when the most-buoyant plates happen to be adjacent (common with random
+    // placement), all continental crust forms a single cluster.
+    //
+    // Physical basis: Precambrian cratons formed ≥ 2.5 Ga and have drifted across
+    // many plate boundaries since.  Their current distribution is NOT correlated
+    // with modern plate motions — continents form wherever cratons have assembled,
+    // not where Voronoi plate-seeds happen to cluster (Rogers & Santosh 2004,
+    // Gondwana Res. 7, 421-433).
+    //
+    // Model: N_cont Gaussian continental nuclei at geographically spread positions.
+    //   cf(i) = Σ_j exp(−(1 − dot(v_i, v_j)) / σ_j²)
+    // where v_i is the unit-sphere vector of cell i, v_j of nucleus j, σ_j = σ_km/R.
+    // Approximation: 1−dot ≈ d²/(2R²) → exact Gaussian in great-circle km.
+    //
+    // Nucleus placement: golden-angle spiral (Saff & Kuijlaars 1997, Math. Intell.)
+    // distributes N points near-uniformly on the sphere; random jitter per nucleus
+    // prevents mechanical regularity while preserving global spread.
+    //
+    // Soft plate-buoyancy modulation (±25%): cells on high-buoyancy plates get a
+    // slight continental boost, giving physical correlation at plate boundaries
+    // without forcing whole-plate assignments (Rogers & Santosh 2004 §4).
+    //
+    // Archipelago FBM: medium-frequency noise adds scattered island groups
+    // (volcanic arcs, continental fragments) independent of main nuclei.
+    //
+    // Continental shelf: target_continental = land_frac + 0.12 (Cogley 1984,
+    // ~11-12 % of surface is submerged shelf).
+
+    let land_frac = 1.0 - planet.ocean_percent / 100.0;
+    let min_continental_target = (land_frac + 0.12).min(0.85); // Cogley 1984 shelf
+
+    let mut rng_cont = Rng::new(hash_u32(seed ^ 0xC053_0AD1));
+    let n_cont: usize = {
+        let base = ((n_plates as f32 * 0.40) as usize).clamp(3, 6);
+        let extra = (rng_cont.next_f32() * 3.0) as usize; // 0–2 random extra
+        (base + extra).clamp(3, 9)
+    };
+
+    // Golden-angle spiral placement (Saff & Kuijlaars 1997).
+    // golden ≈ 2.3998 rad — the most irrational angle, maximally spreads N points.
+    let golden: f32 = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
+    let phi0 = rng_cont.next_f32() * std::f32::consts::TAU;
+    let mut nuc_vx: Vec<f32> = Vec::with_capacity(n_cont);
+    let mut nuc_vy: Vec<f32> = Vec::with_capacity(n_cont);
+    let mut nuc_vz: Vec<f32> = Vec::with_capacity(n_cont);
+    let mut nuc_inv_sig2: Vec<f32> = Vec::with_capacity(n_cont); // (R/σ_km)²
+
+    for j in 0..n_cont {
+        let t = if n_cont > 1 { j as f32 / (n_cont - 1) as f32 } else { 0.5 };
+        // z ∈ [−0.88, 0.88]: exclude polar caps (|lat| < ~62°) like real cratons
+        let z_spiral = -0.88 + 1.76 * t;
+        let z_jitter = random_range(&mut rng_cont, -0.6, 0.6) / (n_cont as f32).max(2.0);
+        let nz = (z_spiral + z_jitter).clamp(-0.92, 0.92);
+        let r_xy = (1.0 - nz * nz).max(0.0).sqrt();
+        let phi = phi0 + j as f32 * golden;
+        let nx = r_xy * phi.cos();
+        let ny = r_xy * phi.sin();
+        // Unit length is guaranteed since nz²+nx²+ny² = nz²+r_xy² = 1.0
+
+        nuc_vx.push(nx);
+        nuc_vy.push(ny);
+        nuc_vz.push(nz);
+
+        // Nucleus σ: 1000–2500 km.  Smaller σ → compact isolated continents;
+        // larger σ → broad connected landmasses (like Pangea).
+        // Mixed sizes produce Earth-like variety: Africa (~1600 km half-width),
+        // Australia (~1200 km), Eurasia (~3000 km).
+        let sigma_km = random_range(&mut rng_cont, 1000.0, 2500.0);
+        let sigma_norm = sigma_km / planet.radius_km; // σ/R
+        nuc_inv_sig2.push(1.0 / (sigma_norm * sigma_norm));
+    }
+
+    // Compute raw continental field.
+    // cf_raw[i] = Σ_j exp(−(1−dot) × (R/σ_j)²)
+    // At nucleus center: cf = 1; at d = σ_km: cf = exp(−0.5) ≈ 0.607 per nucleus.
+    let mut cf_raw = vec![0.0_f32; size];
     for i in 0..size {
-        let pid = plates.plate_field[i] as usize;
-        if pid < n_plates { plate_cells[pid] += 1; }
-    }
-    // Sort plates by buoyancy descending — most buoyant become continental first.
-    let mut plate_order: Vec<usize> = (0..n_plates).collect();
-    plate_order.sort_by(|&a, &b|
-        plates.plate_vectors[b].buoyancy.partial_cmp(&plates.plate_vectors[a].buoyancy)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    );
-    // Continental crust must exceed target land area to create submerged continental
-    // shelf.  On Earth, ~40 % of the surface is continental crust but only ~29 % is
-    // exposed land; the remaining ~11 % is shelf (Cogley 1984).  Without the shelf
-    // buffer, the 67th-percentile sea level sits in the oceanic elevation range,
-    // producing ~5 km freeboard instead of the realistic ~200 m.
-    // Minimum continental fraction ≈ land fraction + shelf fraction.
-    let land_frac = 1.0 - planet.ocean_percent / 100.0;          // 0.33 for 67 % ocean
-    let min_continental_frac = (land_frac + 0.12).min(0.85);     // Cogley 1984: ~11-12% shelf
-    let target_continental = (min_continental_frac * size as f32) as usize;
-    let mut accumulated = 0usize;
-    let mut plate_is_continental = vec![false; n_plates];
-    for &pid in &plate_order {
-        let new_acc = accumulated + plate_cells[pid];
-        // Include this plate if it brings us closer to the target.
-        let undershoot = target_continental.saturating_sub(accumulated);
-        let overshoot = new_acc.saturating_sub(target_continental);
-        if overshoot > undershoot && accumulated > 0 {
-            break;
+        let vx = cell_cache.noise_x[i];
+        let vy = cell_cache.noise_y[i];
+        let vz = cell_cache.noise_z[i];
+        let mut sum = 0.0_f32;
+        for j in 0..n_cont {
+            let dot = (vx * nuc_vx[j] + vy * nuc_vy[j] + vz * nuc_vz[j]).clamp(-1.0, 1.0);
+            // 1−dot ≈ d²/(2R²); Gaussian: exp(−d²/2σ²) = exp(−(1−dot)/σ_norm²)
+            sum += (-(1.0 - dot) * nuc_inv_sig2[j]).exp();
         }
-        plate_is_continental[pid] = true;
-        accumulated = new_acc;
+        cf_raw[i] = sum;
     }
-    let mut is_continental = vec![false; size];
-    let mut continental_frac = vec![0.0_f32; size];
+
+    // Soft plate-buoyancy modulation: high-buoyancy plates → +25% boost.
+    // Preserves some tectonic correlation at plate boundaries (Rogers & Santosh 2004).
     for i in 0..size {
         let pid = plates.plate_field[i] as usize;
         if pid < n_plates {
-            is_continental[i] = plate_is_continental[pid];
-            continental_frac[i] = if is_continental[i] { 1.0 } else { 0.0 };
+            let b = plates.plate_vectors[pid].buoyancy; // ∈ [−1, 1]
+            cf_raw[i] *= 1.0 + b * 0.25;
         }
+    }
+
+    // Archipelago FBM: scattered island groups independent of main nuclei.
+    // Two octaves at ~1800 km and ~900 km scale.  Only additive (positive
+    // peaks add islands; negative peaks do not erase continents).
+    // Amplitude calibrated to create ~1–3% extra land as islands.
+    let arch_seed = hash_u32(seed ^ 0xA4C0_51AB);
+    for i in 0..size {
+        let nx = cell_cache.noise_x[i];
+        let ny = cell_cache.noise_y[i];
+        let nz = cell_cache.noise_z[i];
+        let n1 = value_noise3(nx * 22.0 + 5.3, ny * 22.0 - 4.1, nz * 22.0, arch_seed);
+        let n2 = value_noise3(nx * 44.0 - 9.7, ny * 44.0 + 7.3, nz * 44.0,
+                              arch_seed.wrapping_add(1));
+        let arch = (n1 * 0.20 + n2 * 0.10).max(0.0); // only peaks, not troughs
+        cf_raw[i] += arch;
+    }
+
+    // Threshold: find T such that exactly target_count cells have cf_raw ≥ T.
+    // Binary search via sorted copy (O(N log N) dominated by sort).
+    let target_count = (min_continental_target * size as f32) as usize;
+    let mut sorted_cf = cf_raw.clone();
+    sorted_cf.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let threshold = if target_count > 0 && target_count < size {
+        sorted_cf[target_count - 1]
+    } else {
+        0.0
+    };
+
+    // Binary assignment: continental_frac = 1 (land) or 0 (ocean).
+    // The existing 20-pass smoothing below creates the gradual shelf transition.
+    let mut is_continental = vec![false; size];
+    let mut continental_frac = vec![0.0_f32; size];
+    for i in 0..size {
+        is_continental[i] = cf_raw[i] >= threshold;
+        continental_frac[i] = if is_continental[i] { 1.0 } else { 0.0 };
     }
 
     // --- Coastline irregularity: pre-smoothing perturbation ---
@@ -2523,6 +2617,71 @@ fn compute_relief_physics(
     }
     progress.phase(progress_base, progress_span, 0.15);
 
+    // --- 4c. Dynamic topography (Hager et al. 1985; Flament et al. 2013) ---
+    //
+    // Mantle convection creates long-wavelength (1000–5000 km) topographic
+    // anomalies of ±0.5–1 km.  Downwelling slabs pull the surface down,
+    // mantle plumes push it up.  This breaks the Voronoi plate pattern in
+    // continental interiors and creates interior elevation diversity.
+    //
+    // We approximate this with a multi-octave noise field whose amplitude
+    // is modulated by plate properties: old, thick plates get negative
+    // anomaly (cratonic subsidence), young active boundaries get positive
+    // (dynamic uplift from slab-driven corner flow).
+    //
+    // Spectral content: 2 octaves at ~5000 km and ~2500 km wavelength,
+    // matching the observed power spectrum of residual topography
+    // (Hoggard et al. 2016, Nat. Geosci.).
+    {
+        let dyn_seed = hash_u32(seed ^ 0xDEAD_FACE);
+        let mut dyn_topo = vec![0.0_f32; size];
+        for y in 0..grid.height {
+            for x in 0..grid.width {
+                let i = y * grid.width + x;
+                // Use spherical 3D coordinates (from cell_cache) to avoid
+                // lattice-aligned diamond artifacts that flat UV noise produces
+                // at low frequencies — especially visible near poles where
+                // equirectangular projection compresses the X axis.
+                let sx = cell_cache.x_by_cell[i];
+                let sy = cell_cache.y_by_cell[i];
+                let sz = cell_cache.z_by_cell[i];
+
+                // Two octaves of coherent noise at planetary scale
+                // Octave 1: ~5000 km wavelength (freq ≈ 8 cycles around equator)
+                // Scale 1.3 on unit sphere ≈ 8 lobes around equator
+                let f1 = value_noise3(sx * 1.3, sy * 1.3, sz * 1.3, dyn_seed) * 400.0;
+                // Octave 2: ~2500 km wavelength (freq ≈ 16)
+                let f2 = value_noise3(sx * 2.6 + 3.7, sy * 2.6 - 2.1, sz * 2.6 + 1.9, dyn_seed ^ 0x1234) * 200.0;
+                // Total: ±600 m amplitude, consistent with Hoggard et al. (2016)
+                // who find ±1 km residual topography globally.
+                let raw = f1 + f2;
+
+                // Modulate by tectonic activity: amplify near active boundaries,
+                // attenuate in stable interiors (where dynamic topography is weak
+                // due to thick cratonic lithosphere — Jordan 1975, Artemieva 2009).
+                let activity = (conv_def[i] + div_def[i] * 0.7 + trans_def[i] * 0.3)
+                    .clamp(0.0, 1.0);
+                // Interior cells (low activity) get 40% of raw amplitude;
+                // active boundary cells get 100%.  This creates the observed
+                // pattern where dynamic topography is strongest near subduction
+                // zones and weakest in cratonic shields.
+                let scale = 0.4 + 0.6 * activity;
+                dyn_topo[i] = raw * scale;
+            }
+        }
+        // Smooth to ensure only long-wavelength features survive
+        // (20 passes ≈ 200 km smoothing length, removes sub-500 km features)
+        smooth_field(&mut dyn_topo, 20, grid);
+
+        // Apply only to land cells (ocean dynamic topography is expressed
+        // as geoid anomalies, not bathymetric changes at this resolution)
+        for i in 0..size {
+            if relief[i] > 0.0 {
+                relief[i] += dyn_topo[i];
+            }
+        }
+    }
+
     // --- 5. Tectonic uplift + diffusive landscape evolution ---
     //
     // At 10 km/cell, fluvial stream power erosion produces grid artifacts
@@ -2585,14 +2744,16 @@ fn compute_relief_physics(
             }
         }
 
-        // Diffusive erosion: 10 passes of isotropic landscape smoothing.
+        // Diffusive erosion: 20 passes of isotropic landscape smoothing.
         // kappa_eff ≈ 0.02 m²/yr (Fernandes & Dietrich 1997),
         // dt = 1.5 Myr → kappa×dt/dx² ≈ 0.00031 per pass (CFL-safe).
-        // 10 passes = effective σ ≈ 25 km, representing ~15 Myr of
-        // integrated landscape diffusion.
+        // 20 passes = effective σ ≈ 35 km, representing ~30 Myr of
+        // integrated landscape diffusion.  Extended from 10 to eliminate
+        // sub-grid artifacts from noise and discretization without requiring
+        // a separate post-hoc smoothing pass (which was a non-physical hack).
         let kdt = 0.02_f32 * dt_yr; // kappa × dt
         let inv_dx2 = 1.0 / (dx_m * dx_m);
-        for _ in 0..10 {
+        for _ in 0..20 {
             let mut laplacian = vec![0.0_f32; size];
             for y in 0..grid.height {
                 for x in 0..grid.width {
@@ -2624,43 +2785,10 @@ fn compute_relief_physics(
     }
     progress.phase(progress_base, progress_span, 0.70);
 
-    // --- 5b. Land smoothing ---
-    // 5 passes of latitude-corrected 8-neighbor diffusion on land cells.
-    // Final smoothing of remaining sub-grid artifacts from noise and
-    // discretization.  σ ≈ √(2N/3) × dx ≈ 18 km.  Preserves ocean.
-    {
-        let mut scratch = relief.clone();
-        for _ in 0..5 {
-            for y in 0..grid.height {
-                let cos_lat = grid.cos_lat_by_y[y].max(0.30); // same cap as smooth_field
-                let ew_w = 1.0 / cos_lat;
-                let ns_w = 1.0_f32;
-                let diag_w = 1.0 / (cos_lat * cos_lat + 1.0).sqrt();
-                let neighbor_sum = 2.0 * ew_w + 2.0 * ns_w + 4.0 * diag_w;
-                let center_w = 0.586 * neighbor_sum;
-                for x in 0..grid.width {
-                    let i = grid.index(x, y);
-                    if relief[i] <= 0.0 { scratch[i] = relief[i]; continue; }
-                    let mut sum = relief[i] * center_w;
-                    let mut wt = center_w;
-                    for dy in [-1_i32, 1] {
-                        let j = grid.neighbor(x as i32, y as i32 + dy);
-                        if relief[j] > 0.0 { sum += relief[j] * ns_w; wt += ns_w; }
-                    }
-                    for dx in [-1_i32, 1] {
-                        let j = grid.neighbor(x as i32 + dx, y as i32);
-                        if relief[j] > 0.0 { sum += relief[j] * ew_w; wt += ew_w; }
-                    }
-                    for (dx, dy) in [(-1_i32, -1_i32), (-1, 1), (1, -1), (1, 1)] {
-                        let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
-                        if relief[j] > 0.0 { sum += relief[j] * diag_w; wt += diag_w; }
-                    }
-                    scratch[i] = sum / wt;
-                }
-            }
-            relief.copy_from_slice(&scratch);
-        }
-    }
+    // (5b removed: post-hoc land smoothing was a non-physical hack — H7 in BLUEPRINT.
+    // Its artifact-suppression role is now handled by the extended diffusion in §5:
+    // 20 passes × κ×dt/dx² gives σ ≈ 35 km, sufficient to smooth sub-grid noise
+    // while preserving physically-generated terrain structure.)
 
     progress.phase(progress_base, progress_span, 0.85);
 
@@ -2745,10 +2873,10 @@ fn compute_relief_physics(
         // Octaves: (frequency, amplitude [m], seed offset)
         // Amplitude halves per octave (β = 2.0 spectral slope)
         let octaves: [(f32, f32, u32); 4] = [
-            (16.0, 80.0, 0),   // λ ≈ 400 km
-            (32.0, 40.0, 1),   // λ ≈ 200 km
-            (64.0, 20.0, 2),   // λ ≈ 100 km
-            (128.0, 10.0, 3),  // λ ≈  50 km
+            (16.0, 160.0, 0),  // λ ≈ 400 km — doubled for visible texture at planet scale
+            (32.0, 80.0, 1),   // λ ≈ 200 km
+            (64.0, 40.0, 2),   // λ ≈ 100 km
+            (128.0, 20.0, 3),  // λ ≈  50 km
         ];
         for i in 0..size {
             if relief[i] > 0.0 {
@@ -2771,14 +2899,101 @@ fn compute_relief_physics(
         }
     }
 
-    // --- 9. Coastline morphological cleanup ---
-    // Remove 1-cell peninsulas and fill 1-cell bays.  On a regular grid,
-    // diagonal coastlines produce a staircase ("dragon teeth") pattern.
-    // Two passes of morphological erosion/dilation clean the coast.
-    smooth_coastline(&mut relief, grid.width, grid.height, grid.is_spherical);
+    // --- 9. Fractal coastline perturbation (Mandelbrot 1967; Huang & Turcotte 1989) ---
+    //
+    // Real coastlines are fractal with dimension D ≈ 1.2–1.3 (Richardson 1961).
+    // At 10 km/cell, the Airy isostasy produces smooth land/ocean boundaries.
+    // We perturb coastal cells using fractal noise to create bays, peninsulas,
+    // and small islands that are unresolvable at this grid scale but statistically
+    // correct for the coastline power spectrum P(k) ∝ k^(-β), β ≈ 2.
+    //
+    // Method: cells within a narrow elevation band around sea level (±band_m)
+    // get noise added.  If the noise pushes them across 0, they flip land↔ocean.
+    // This is equivalent to the spectral perturbation used at crop scale but
+    // applied to the global coastline.
+    // Two-pass Gaussian-weighted elevation perturbation near sea level.
+    //
+    // Pass 1 — large scale (σ=2000m): creates 200–1000 km embayments,
+    //   peninsulas, and inland seas.  Low-frequency noise (λ = 2500–5000 km)
+    //   reshapes continental outlines.
+    //
+    // Pass 2 — medium scale (σ=600m): creates 30–200 km bays, islands,
+    //   and archipelagos.  Mid-frequency noise (λ = 600–1200 km).
+    //
+    // The Gaussian weight exp(−h²/2σ²) ensures maximum perturbation at the
+    // coast (h≈0) and rapid decay inland/seaward.  Physically, this models
+    // the variability of continental shelf width and coastal plain topography
+    // (Wessel & Smith 1996, J. Geophys. Res.).
+    {
+        let coast_seed = hash_u32(seed ^ 0xC0A5_7111);
+        // Pass 1: large-scale coastal reshaping
+        let sigma1 = 1200.0_f32;
+        let inv_2sig2_1 = 1.0 / (2.0 * sigma1 * sigma1);
+        for i in 0..size {
+            let h = relief[i];
+            let weight = (-h * h * inv_2sig2_1).exp();
+            if weight < 0.01 { continue; } // skip cells far from coast
+            let nx = cell_cache.noise_x[i];
+            let ny = cell_cache.noise_y[i];
+            let nz = cell_cache.noise_z[i];
+            let n1 = value_noise3(nx * 8.0, ny * 4.0, nz * 4.0, coast_seed) * 1000.0;
+            let n2 = value_noise3(nx * 16.0 + 3.7, ny * 8.0 - 1.3, nz * 8.0, coast_seed ^ 0x1111) * 500.0;
+            relief[i] += (n1 + n2) * weight;
+        }
+        // Pass 2: medium-scale coastal detail
+        let sigma2 = 600.0_f32;
+        let inv_2sig2_2 = 1.0 / (2.0 * sigma2 * sigma2);
+        let coast_seed2 = hash_u32(seed ^ 0xC0A5_7222);
+        for i in 0..size {
+            let h = relief[i];
+            let weight = (-h * h * inv_2sig2_2).exp();
+            if weight < 0.01 { continue; }
+            let nx = cell_cache.noise_x[i];
+            let ny = cell_cache.noise_y[i];
+            let nz = cell_cache.noise_z[i];
+            let n1 = value_noise3(nx * 32.0 + 5.1, ny * 16.0 - 2.7, nz * 16.0, coast_seed2) * 300.0;
+            let n2 = value_noise3(nx * 64.0 - 1.9, ny * 32.0 + 3.3, nz * 32.0, coast_seed2 ^ 0x2222) * 150.0;
+            relief[i] += (n1 + n2) * weight;
+        }
+    }
+
+    // --- 10. Coastline morphological cleanup (1 pass) ---
+    // Single pass removes only the most egregious 1-cell artifacts while
+    // preserving the fractal complexity added in step 9.
+    // (Was 2 passes — too aggressive, removed all small-scale coastline features.)
+    {
+        let size = grid.size;
+        let w = grid.width;
+        let h = grid.height;
+        let scratch = relief.to_vec();
+        for i in 0..size {
+            let x = i % w;
+            let y = i / w;
+            let mut ocean_n = 0_u32;
+            let mut land_n = 0_u32;
+            let mut land_min = f32::MAX;
+            for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
+                let ny = y as i32 + dy;
+                if ny < 0 || ny >= h as i32 { continue; }
+                let nx = ((x as i32 + dx) % w as i32 + w as i32) as usize % w;
+                let j = ny as usize * w + nx;
+                if scratch[j] <= 0.0 {
+                    ocean_n += 1;
+                } else {
+                    land_n += 1;
+                    land_min = land_min.min(scratch[j]);
+                }
+            }
+            if scratch[i] > 0.0 && ocean_n >= 3 {
+                relief[i] = -1.0;
+            } else if scratch[i] <= 0.0 && land_n >= 3 {
+                relief[i] = land_min.min(5.0).max(0.5);
+            }
+        }
+    }
 
     progress.phase(progress_base, progress_span, 1.0);
-    ReliefResult { relief, sea_level }
+    ReliefResult { relief, sea_level, conv_def, div_def, trans_def }
 }
 
 /// Morphological coastline cleanup: erode isolated land peninsulas, fill
@@ -3056,8 +3271,6 @@ fn compute_climate_unified(
 
     let temp_seed = hash_u32(seed ^ 0xC11_A7E0);
     let precip_seed = hash_u32(seed ^ 0xD0CC_EE01);
-    let path_noise_seed = hash_u32(seed ^ 0xD157_A4CE);
-
     // Resolution-adaptive trace distances (capped at 400 cells for performance)
     let windward_max_steps = (800.0 / grid.km_per_cell_x).min(400.0) as i32;
     let shadow_max_steps = (500.0 / grid.km_per_cell_x).min(400.0) as i32;
@@ -3177,33 +3390,56 @@ fn compute_climate_unified(
     // Trace upwind from each land cell; exponential moisture decay from coast.
     // e-folding distance L = 700 km over land (van der Ent & Savenije 2011,
     // Water Resources Research, Fig. 3: global average moisture recycling).
+    //
+    // Multi-ray angular spread: atmospheric moisture transport is not rectilinear —
+    // mesoscale eddies, synoptic-scale waves, and boundary-layer turbulence spread
+    // the effective fetch angle by ±10–20° (Skamarock et al. 2008; Trenberth 1991).
+    // We trace 5 rays at angles [−15°, −7.5°, 0°, +7.5°, +15°] from the prevailing
+    // wind direction and average the result.  This replaces the previous noise hack
+    // (H12) that added random jitter to land_dist to mask rectilinear artifacts.
     let l_moisture_km = 700.0_f32;
     let decay_rate = grid.km_per_cell_x / l_moisture_km;
     let mut windward_moisture = vec![0.0_f32; size];
+    // Angular offsets in radians: ±15° and ±7.5° (5 rays, Gaussian-weighted).
+    // Central ray gets weight 1.0, intermediate 0.8, outer 0.5 — physically
+    // motivated by the Gaussian angular distribution of eddy transport
+    // (Trenberth 1991, "Storm Tracks in the Southern Hemisphere").
+    const WIND_RAYS: [(f32, f32); 5] = [
+        (-0.262, 0.5),  // −15°
+        (-0.131, 0.8),  // −7.5°
+        ( 0.0,   1.0),  // center
+        ( 0.131, 0.8),  // +7.5°
+        ( 0.262, 0.5),  // +15°
+    ];
+    let wind_ray_wt_sum: f32 = WIND_RAYS.iter().map(|&(_, w)| w).sum();
+    let inv_ray_wt = 1.0 / wind_ray_wt_sum;
     for y in 0..h {
         let udx = upwind_dx[y];
         let udy = upwind_dy[y];
         for x in 0..w {
             let i = y * w + x;
             if heights[i] <= 0.0 { continue; }
-            let mut land_dist = 0.0_f32;
-            for d in 1..=windward_max_steps {
-                let sy = (y as i32 + (udy * d as f32) as i32).clamp(0, h_i32 - 1) as usize;
-                let sx = if grid.is_spherical {
-                    ((((x as i32 + (udx * d as f32) as i32) % w_i32) + w_i32) % w_i32) as usize
-                } else {
-                    (x as i32 + (udx * d as f32) as i32).clamp(0, w_i32 - 1) as usize
-                };
-                if heights[sy * w + sx] > 0.0 {
-                    land_dist += 1.0;
+            let mut weighted_dist = 0.0_f32;
+            for &(angle_offset, ray_weight) in &WIND_RAYS {
+                let (sin_a, cos_a) = angle_offset.sin_cos();
+                let rdx = udx * cos_a - udy * sin_a;
+                let rdy = udx * sin_a + udy * cos_a;
+                let mut land_dist = 0.0_f32;
+                for d in 1..=windward_max_steps {
+                    let sy = (y as i32 + (rdy * d as f32) as i32).clamp(0, h_i32 - 1) as usize;
+                    let sx = if grid.is_spherical {
+                        ((((x as i32 + (rdx * d as f32) as i32) % w_i32) + w_i32) % w_i32) as usize
+                    } else {
+                        (x as i32 + (rdx * d as f32) as i32).clamp(0, w_i32 - 1) as usize
+                    };
+                    if heights[sy * w + sx] > 0.0 {
+                        land_dist += 1.0;
+                    }
+                    if land_dist > 50.0 { break; }
                 }
-                // Stop after ~1000 km of cumulative land distance
-                if land_dist > 50.0 { break; }
+                weighted_dist += land_dist * ray_weight;
             }
-            let fx = x as f32 / w as f32;
-            let fy = y as f32 / h as f32;
-            let pn = value_noise3(fx * 6.0, fy * 6.0, 0.3, path_noise_seed) * 15.0;
-            let eff_dist = (land_dist + pn).max(0.0);
+            let eff_dist = (weighted_dist * inv_ray_wt).max(0.0);
             // Coastal precipitation excess 400-600 mm/yr (Trenberth et al. 2003,
             // "The changing character of precipitation").  500 mm = midpoint.
             windward_moisture[i] = 500.0 * (-eff_dist * decay_rate).exp();
@@ -4395,6 +4631,7 @@ fn space_erosion_step(
     bedrock: &mut [f32],
     sediment: &mut [f32],
     uplift: &[f32],
+    runoff: &[f32],  // [m/yr] per cell; climate-coupled (Roe et al. 2003)
     k_br: &[f32],
     k_sed: f32,
     h_star: f32,
@@ -4411,6 +4648,25 @@ fn space_erosion_step(
 ) {
     let size = grid.size;
     let cell_area = dx_m * dx_m;
+
+    // --- Climate-erosion coupling (Roe et al. 2003, J. Geophys. Res.) ---
+    // Erodibility scales with local runoff: wetter slopes erode faster.
+    // K_eff(i) = K_br(i) × (runoff(i) / runoff_mean)^α, α = 1.0
+    // This produces asymmetric valleys: windward (wet) slopes steeper than
+    // leeward (dry) slopes — a first-order observation in every major orogen
+    // (Roe 2005, Ann. Rev. Earth Planet. Sci.; Willett 1999, J. Geophys. Res.).
+    let runoff_mean = {
+        let mut sum = 0.0_f32;
+        let mut count = 0_u32;
+        for i in 0..size {
+            if bedrock[i] + sediment[i] > 0.0 {
+                sum += runoff[i];
+                count += 1;
+            }
+        }
+        if count > 0 { sum / count as f32 } else { 0.4 }
+    };
+    let inv_runoff_mean = 1.0 / runoff_mean.max(1e-6);
 
     // --- 1. Total surface elevation ---
     let mut surface = vec![0.0_f32; size];
@@ -4449,21 +4705,50 @@ fn space_erosion_step(
         let h_s = sediment[i].max(0.0);
         let shielding = (-h_s / h_star).exp(); // 1.0 = bare rock, → 0 under cover
         let a_pow = area[i].powf(m);
-        let factor = k_br[i] * shielding * dt_yr * a_pow / dx_m.powf(n);
+        // Climate-erosion coupling: K_eff = K_br × (runoff/mean)^1.0
+        // Clamp to [0.1, 5.0]: prevents runaway in extreme precipitation cells
+        // and ensures minimum erosion in arid zones (Roe et al. 2003).
+        let runoff_factor = (runoff[i] * inv_runoff_mean).clamp(0.1, 5.0);
+        // Sub-grid channel width correction (Pelletier 2010, Geomorphology).
+        // At grid scale dx, erosion acts over the full cell width.  Real channels
+        // are narrower: W_ch = k_w × A^b, b ≈ 0.4 (Leopold & Maddock 1953).
+        // Correction: K_eff *= W_ch / dx.  k_w = 4.0 m (typical bankfull width
+        // coefficient for A in m²; Knighton 1998).  Clamped to [0.01, 1.0]:
+        // max 1.0 when channel fills the cell (large rivers at fine grids).
+        let w_ch = 4.0 * area[i].powf(0.4); // channel width [m]
+        let width_correction = (w_ch / dx_m).clamp(0.01, 1.0);
+        let factor = k_br[i] * runoff_factor * width_correction * shielding * dt_yr * a_pow / dx_m.powf(n);
 
-        let z_recv = surface[r].max(0.0);
+        // Airy isostasy incorporated into B&W implicit scheme (Molnar & England 1990):
+        //   dz/dt = U_tectonic − (ρ_m−ρ_c)/ρ_m · K · A^m · S
+        // Derivation: gross erosion E removes crust; Airy rebound = ρ_c/ρ_m · E;
+        // net lowering = E − ρ_c/ρ_m · E = (ρ_m−ρ_c)/ρ_m · E.
+        // In implicit B&W form: replace factor with iso_factor = factor × RHO_FRAC.
+        // Equilibrium z_ss = z_recv + U / (RHO_FRAC · K · A^m / dx^n) — 6× taller
+        // than without isostasy (Molnar & England 1990, J. Geol.).
+        // ρ_c = 2750 kg/m³ (Christensen & Mooney 1995), ρ_m = 3300 kg/m³.
+        const RHO_FRAC: f32 = 1.0 - 2750.0_f32 / 3300.0_f32; // (ρ_m−ρ_c)/ρ_m ≈ 0.1667
+        let iso_factor = factor * RHO_FRAC;
+
+        // Braun & Willett (2013): use UPDATED receiver elevation.
+        let z_recv = (bedrock[r] + sediment[r]).max(0.0);
         let z_old = bedrock[i];
-        let z_new = (z_old + uplift[i] * dt_yr + factor * z_recv) / (1.0 + factor);
+        let z_new = (z_old + uplift[i] * dt_yr + iso_factor * z_recv) / (1.0 + iso_factor);
         bedrock[i] = z_new.max(0.0);
 
-        e_r_rate[i] = ((z_old + uplift[i] * dt_yr - bedrock[i]) / dt_yr).max(0.0);
+        // Gross bedrock erosion rate (enters sediment flux; isostatic rebound
+        // does not produce new material — it merely raises the crust column).
+        // E_gross = K · A^m · S = factor/dt × (z_new − z_recv)
+        //         = factor/dt × (z_old + U·dt − z_recv) / (1 + iso_factor)
+        let e_gross = (factor * (z_old + uplift[i] * dt_yr - z_recv).max(0.0)
+                       / (1.0 + iso_factor)) / dt_yr;
+        e_r_rate[i] = e_gross;
     }
 
     // --- 4. Explicit sediment transport (upstream → downstream) ---
     // Route sediment flux Q_s along D8 receivers.
-    // Runoff 400 mm/yr global mean (Fekete et al. 2002, J. Hydrol.).
+    // Runoff is climate-coupled: P × infiltration_coefficient (Roe et al. 2003).
     let mut q_s = vec![0.0_f32; size]; // sediment flux [m³/yr]
-    let runoff = 0.4_f32; // m/yr
 
     for &i in order.iter() {
         let z_total = bedrock[i] + sediment[i];
@@ -4481,13 +4766,17 @@ fn space_erosion_step(
         let cover = 1.0 - (-h_s / h_star).exp();
 
         // Sediment entrainment [m/yr]  (Shobe et al. 2017 eq. 3)
-        let e_s = (k_sed * a_pow * s_pow * cover).min(h_s / dt_yr);
+        // Climate-coupled + channel width correction (same as bedrock erosion).
+        let runoff_factor_s = (runoff[i] * inv_runoff_mean).clamp(0.1, 5.0);
+        let w_ch_s = 4.0 * area[i].powf(0.4);
+        let width_corr_s = (w_ch_s / dx_m).clamp(0.01, 1.0);
+        let e_s = (k_sed * runoff_factor_s * width_corr_s * a_pow * s_pow * cover).min(h_s / dt_yr);
 
         // Deposition [m/yr]  (Shobe et al. 2017 eq. 4)
         // D_s = V_s · Q_s / Q, where Q = A·runoff [m³/yr]
         // Q_s/Q = volumetric sediment concentration — cap at 1% (physical limit
         // for turbulent water-borne transport; Mulder & Syvitski 1996).
-        let q_water = area[i] * runoff;
+        let q_water = area[i] * runoff[i];
         let concentration = if q_water > 1e-3 {
             (q_s[i] / q_water).min(0.01)
         } else {
@@ -4547,6 +4836,7 @@ fn space_erosion_evolve(
     bedrock: &mut [f32],
     sediment: &mut [f32],
     uplift: &[f32],
+    runoff: &[f32],  // [m/yr] per cell; climate-coupled (Roe et al. 2003)
     k_br: &[f32],
     k_sed: f32,
     h_star: f32,
@@ -4570,7 +4860,7 @@ fn space_erosion_evolve(
         progress.phase(progress_base, progress_span, t);
         let step_seed = hash_u32(base_seed.wrapping_add(step as u32 * 0x85EB_CA6B));
         space_erosion_step(
-            bedrock, sediment, uplift, k_br, k_sed, h_star, v_s, f_f,
+            bedrock, sediment, uplift, runoff, k_br, k_sed, h_star, v_s, f_f,
             dt_yr, dx_m, m, n_exp, kappa, mfd_p, step_seed, grid,
         );
     }
@@ -4960,7 +5250,7 @@ fn find_continent_region(
     target_km: f32,
 ) -> (usize, usize) {
     let win_w = ((target_km / pg.km_per_cell_x).round() as usize).max(4);
-    let aspect = 16.0 / 9.0; // 8K aspect ratio
+    let aspect = CONTINENT_WIDTH as f32 / CONTINENT_HEIGHT as f32;
     let win_h = ((win_w as f32 / aspect).round() as usize).max(2);
 
     // Exclude polar rows (top/bottom 15%) — boring for continent
@@ -5036,24 +5326,39 @@ fn find_continent_region(
                 if heights[y * pg.width + xr] > 0.0 { side_land[3] += 1; }
                 side_total[3] += 1;
             }
-            // Worst-side penalty: penalize based on the MOST land-heavy border
-            let mut max_side_frac = 0.0_f32;
+            // Edge penalty: count how many sides have significant land contact.
+            // Real maps show continents with at most 1-2 sides touching the frame.
+            // Penalize EACH side that has >20% land, and scale by how much.
+            // Sum penalties → windows with 3-4 land sides are heavily penalized.
+            let mut edge_penalty = 0.0_f32;
+            let mut land_sides = 0_u32;
             for s in 0..4 {
                 let frac = side_land[s] as f32 / side_total[s].max(1) as f32;
-                if frac > max_side_frac { max_side_frac = frac; }
+                if frac > 0.20 {
+                    land_sides += 1;
+                    edge_penalty += frac;
+                }
             }
-            let edge_penalty = if max_side_frac > 0.30 {
-                (max_side_frac - 0.30) * 10.0
-            } else {
-                0.0
+            // Exponential penalty for multiple land sides:
+            // 0-1 land sides → no extra penalty
+            // 2 land sides → moderate (×1.5)
+            // 3+ land sides → severe (×4.0)
+            let multi_side_factor = match land_sides {
+                0 | 1 => 1.0,
+                2 => 1.5,
+                3 => 4.0,
+                _ => 8.0,
             };
+            let edge_penalty = edge_penalty * multi_side_factor;
 
             // Additive scoring — each component contributes independently.
-            // Reject regions outside 40-90% land with a hard penalty.
-            let land_score = if land_frac > 0.4 && land_frac < 0.9 {
-                1.0 - (land_frac - 0.65).abs() * 2.5
+            // Prefer 30-70% land: this gives enough ocean padding for the
+            // continent to sit naturally within the frame.  Target 50%
+            // (continent occupies half the view, surrounded by ocean).
+            let land_score = if land_frac > 0.25 && land_frac < 0.75 {
+                1.0 - (land_frac - 0.50).abs() * 3.0
             } else {
-                -2.0
+                -3.0
             };
             let coast_score = (coast as f32 / sampled * 10.0).min(1.0);
             let elev_score = ((h_max - h_min).max(1.0) / 6000.0).min(1.0);
@@ -5087,6 +5392,9 @@ fn run_crop_pipeline(
     planet_heights: &[f32],
     planet_plates: &[i16],
     planet_boundary_types: &[i8],
+    planet_conv_def: &[f32],
+    planet_div_def: &[f32],
+    planet_trans_def: &[f32],
     planet_grid: &GridConfig,
     planet_cell_cache: &CellCache,
     detail: DetailProfile,
@@ -5126,6 +5434,9 @@ fn run_crop_pipeline(
     let mut relief = vec![0.0_f32; crop_grid.size];
     let mut plates_field = vec![0_i16; crop_grid.size];
     let mut bnd_types = vec![0_i8; crop_grid.size];
+    let mut crop_conv_def = vec![0.0_f32; crop_grid.size];
+    let mut crop_div_def = vec![0.0_f32; crop_grid.size];
+    let mut crop_trans_def = vec![0.0_f32; crop_grid.size];
     let noise_seed = hash_u32(seed ^ 0xFBFD_E7A1);
 
     for iy in 0..crop_h {
@@ -5142,6 +5453,10 @@ fn run_crop_pipeline(
             // Nearest for discrete fields
             plates_field[i] = nearest_sample_i16(planet_plates, pw, ph, px, py, planet_grid.is_spherical);
             bnd_types[i] = nearest_sample_i8(planet_boundary_types, pw, ph, px, py, planet_grid.is_spherical);
+            // Bicubic for continuous deformation fields (smooth spatial variation)
+            crop_conv_def[i] = bicubic_sample(planet_conv_def, pw, ph, px, py, planet_grid.is_spherical).max(0.0);
+            crop_div_def[i] = bicubic_sample(planet_div_def, pw, ph, px, py, planet_grid.is_spherical).max(0.0);
+            crop_trans_def[i] = bicubic_sample(planet_trans_def, pw, ph, px, py, planet_grid.is_spherical).max(0.0);
 
             // FBM fractal detail: adds sub-20km features
             // Amplitude scales with local elevation magnitude (mountains get more detail)
@@ -5255,29 +5570,36 @@ fn run_crop_pipeline(
 
     // --- 4. SPACE erosion (Shobe et al. 2017) with tectonic uplift ---
     //
-    // Bedrock erodibility K_br per rock type (Harel et al. 2016, EPSL):
-    //   convergent → metamorphic (harder), divergent → basalt, interior → sedimentary
+    // Bedrock erodibility K_br from deformation fields (Harel et al. 2016, EPSL).
+    // High convergent deformation → metamorphic/granitic rock (harder, lower K).
+    // High divergent deformation → basaltic (intermediate K).
+    // Low deformation → sedimentary (softer, higher K).
+    // K_br range: 1e-6 to 5e-6 yr⁻¹ (Stock & Montgomery 1999).
     let mut k_br = vec![0.0_f32; crop_grid.size];
     for i in 0..crop_grid.size {
-        k_br[i] = match bnd_types[i] {
-            1 => 1.0e-6,  // metamorphic/granitic (convergent) — Stock & Montgomery 1999
-            2 => 2.5e-6,  // basaltic (divergent) — Harel et al. 2016
-            _ => 5.0e-6,  // sedimentary (interior) — Harel et al. 2016
-        };
+        let def_total = (crop_conv_def[i] + crop_div_def[i] * 0.5 + crop_trans_def[i] * 0.3)
+            .clamp(0.0, 1.0);
+        // High deformation → hard rock (low K), low deformation → soft rock (high K)
+        k_br[i] = 5.0e-6 - def_total * 4.0e-6;  // range: 1e-6 (hard) to 5e-6 (soft)
     }
 
-    // Tectonic uplift rates from boundary type (Montgomery & Brandon 2002,
-    // Earth Planet. Sci. Lett.; Whipple 2009, Nat. Geosci.):
-    //   convergent margins 0.5–5 mm/yr, divergent 0.1–0.5 mm/yr (rift shoulders),
-    //   stable interior 0.01–0.1 mm/yr (isostatic, Peltier 2004).
+    // Maintenance uplift for crop erosion.  The planet scope already applied
+    // the full tectonic uplift and isostatic equilibration.  Crop-scale SPACE
+    // erosion exists to carve river networks and add sub-resolution detail,
+    // not to re-create the orogen.  Rates here are "maintenance" values that
+    // sustain relief against erosion without double-counting the planet uplift.
+    //
+    // Willett & Brandon (2002, Geology) show that steady-state orogens maintain
+    // rock uplift ≈ erosion rate, typically 0.1–0.5 mm/yr.  We use 10% of
+    // full tectonic rates as maintenance to keep peaks realistic (< 9 km).
+    let speed_factor = cfg.tectonics.plate_speed_cm_per_year.max(0.1) / 5.0;
     let mut uplift = vec![0.0_f32; crop_grid.size];
     for i in 0..crop_grid.size {
-        uplift[i] = match bnd_types[i] {
-            1 => 1.0e-3,   // convergent: 1.0 mm/yr (active orogeny)
-            2 => 0.3e-3,   // divergent: 0.3 mm/yr (rift shoulder, Weissel & Karner 1989)
-            3 => 0.1e-3,   // transform: 0.1 mm/yr (localized transpression)
-            _ => 0.05e-3,  // interior: 0.05 mm/yr (GIA, Peltier 2004)
-        };
+        let u_conv = crop_conv_def[i] * 1.0e-3 * speed_factor;   // 0–1.0 mm/yr
+        let u_div = crop_div_def[i] * 3.0e-4 * speed_factor;     // 0–0.3 mm/yr
+        let u_trans = crop_trans_def[i] * 1.5e-4 * speed_factor;  // 0–0.15 mm/yr
+        let u_bg = 0.02e-3;  // GIA background (Peltier 2004)
+        uplift[i] = u_conv + u_div + u_trans + u_bg;
     }
 
     // Sediment layer starts at zero — bare bedrock.
@@ -5287,9 +5609,35 @@ fn run_crop_pipeline(
 
     // SPACE parameters (Shobe et al. 2017, Table 1):
     let k_sed = 1.0e-5;  // sediment erodibility [yr⁻¹] — ~5× mean K_br (Shobe §3.2)
-    let h_star = 1.0;    // characteristic sediment depth [m] (Shobe §3.1)
-    let v_s = 0.5;       // settling velocity [m/yr] (controls deposition rate)
-    let f_f = 0.25;      // fine fraction — 25% wash load (Shobe §2.3)
+    let h_star = 2.0;    // characteristic sediment depth [m] — Shobe §3.1 recommends 0.5–2m;
+                          // higher value requires thicker cover to shield bedrock, promoting
+                          // channel incision in early stages (bare-rock → shielding ≈ 1.0)
+    let v_s = 0.1;       // settling velocity [m/yr] — Shobe Table 1: 0.01–10 m/yr;
+                          // low value reduces deposition rate in channels, allowing bedrock
+                          // incision to dominate (Whipple 2004, Ann. Rev. Earth Planet. Sci.)
+    let f_f = 0.5;       // fine fraction — 50% wash load.  Higher f_f means more eroded
+                          // material leaves as suspended load rather than depositing locally
+                          // (Sklar & Dietrich 2006, Geomorphology)
+
+    // --- Pre-erosion climate: derive spatially-variable runoff field ---
+    // Run climate on initial (pre-erosion) relief to get precipitation.
+    // Runoff = P × infiltration_coefficient (Roe et al. 2003; Fekete et al. 2002).
+    // Mean infiltration ~0.4 (global land mean: 400 mm runoff / 1000 mm precip).
+    // Clamped to ≥10 mm/yr (arid baseline; Scanlon et al. 2006, Glob. Planet. Change).
+    let pre_erosion_runoff: Vec<f32> = {
+        let (_, pre_precip, _, _, _, _) = compute_climate_unified(
+            &cfg.planet,
+            &relief,
+            &crop_grid,
+            &crop_cell_cache,
+            seed,
+            0.0_f32,
+            progress,
+            progress_base + progress_span * 0.05,
+            0.0,  // zero progress span — fast pass, no bar update
+        );
+        pre_precip.iter().map(|&p_mm| (p_mm * 0.001 * 0.4).max(0.01)).collect()
+    };
 
     // 100 steps × 100 kyr = 10 Myr.  Perron et al. (2008, J. Geophys. Res.)
     // show drainage network equilibrium timescale ~ 1–10 Myr.
@@ -5297,6 +5645,7 @@ fn run_crop_pipeline(
         &mut bedrock,
         &mut sediment_layer,
         &uplift,
+        &pre_erosion_runoff,
         &k_br,
         k_sed,
         h_star,
@@ -5532,6 +5881,9 @@ fn run_simulation_internal(
             &event_relief,
             &plates_layer.plate_field,
             &plates_layer.boundary_types,
+            &relief_raw.conv_def,
+            &relief_raw.div_def,
+            &relief_raw.trans_def,
             &planet_grid,
             &planet_cell_cache,
             detail,
@@ -5557,6 +5909,9 @@ fn run_simulation_internal(
             &event_relief,
             &plates_layer.plate_field,
             &plates_layer.boundary_types,
+            &relief_raw.conv_def,
+            &relief_raw.div_def,
+            &relief_raw.trans_def,
             &planet_grid,
             &planet_cell_cache,
             detail,

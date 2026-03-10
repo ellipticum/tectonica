@@ -100,19 +100,21 @@ export const BIOME_NAMES = [
   "Степь",           // 11 — Steppe
 ];
 
+// Naturalistic palette — Olson/MODIS/Whittaker textbook synthesis,
+// maximising perceptual distance between neighbours on the map.
 export const BIOME_COLORS: Record<number, [number, number, number]> = {
-  0:  [17,  42,  82],   // Ocean — deep blue
-  1:  [204, 213, 238],  // Tundra — icy white-blue
-  2:  [63,  104, 61],   // Boreal/Taiga — dark conifer green
-  3:  [21,  109, 61],   // Temperate Forest — rich green
-  4:  [196, 168, 84],   // Temperate Grassland — golden-green
-  5:  [168, 142, 60],   // Mediterranean — olive gold
-  6:  [1,   87,  50],   // Tropical Rainforest — deep emerald
-  7:  [132, 173, 93],   // Tropical Savanna — warm grass green
-  8:  [219, 179, 94],   // Desert — sandy yellow
-  9:  [34,  139, 87],   // Subtropical Forest — teal green
-  10: [130, 106, 74],   // Alpine — rocky brown
-  11: [178, 162, 108],  // Steppe — dry grass tan
+  0:  [15,  40,  80],   // Ocean — deep indigo
+  1:  [170, 190, 210],  // Tundra — cold grey-blue
+  2:  [40,  80,  50],   // Boreal/Taiga — dark conifer
+  3:  [50,  130, 50],   // Temperate Forest — saturated green
+  4:  [160, 190, 60],   // Temperate Grassland — fresh grass
+  5:  [175, 120, 60],   // Mediterranean — terracotta
+  6:  [0,   70,  35],   // Tropical Rainforest — deep emerald
+  7:  [185, 170, 65],   // Tropical Savanna — dry grass
+  8:  [210, 180, 110],  // Desert — sand
+  9:  [25,  120, 70],   // Subtropical Forest — warm teal
+  10: [145, 135, 150],  // Alpine — cool stone lavender
+  11: [195, 175, 100],  // Steppe — faded yellow
 };
 
 export type WorldDisplayLayer =
