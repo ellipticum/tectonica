@@ -2681,11 +2681,26 @@ fn compute_relief_physics(
             let hills = value_noise3(nx * 50.0 + 2.3, ny * 50.0 - 1.7, nz * 50.0, ocean_noise_seed) * 120.0
                       + value_noise3(nx * 100.0 - 5.1, ny * 100.0 + 3.9, nz * 100.0, ocean_noise_seed ^ 0xAB) * 60.0
                       + value_noise3(nx * 200.0 + 8.7, ny * 200.0 - 6.3, nz * 200.0, ocean_noise_seed ^ 0xCD) * 30.0;
-            // Ridge proximity uplift: divergent boundaries are elevated
-            // (already captured by lower subsidence near ridges).
-            // Add small convergent trench deepening.
-            let trench = conv_def[i] * 800.0; // subduction trenches: 0.5–1 km deeper
-            relief[i] += hills - trench;
+            // Mid-ocean ridge axis (Macdonald 1982, Ann. Rev. Earth Planet. Sci.):
+            // Divergent boundary cells have an elevated axial crest due to
+            // volcanic construction and thermal buoyancy.  Fast ridges (>40 mm/yr
+            // half-rate) have axial highs; slow ridges have axial rift valleys.
+            // We add a peaked ridge crest using div_def, which is maximal at
+            // the boundary and decays over 200 km.
+            // Ridge crest: +500 m at axis, narrowly concentrated.
+            let ridge_crest = div_def[i].powf(3.0) * 500.0;
+
+            // Convergent trench deepening (Stern 2002):
+            // Subduction trenches are 2–4 km deeper than surrounding ocean.
+            // At the boundary crest (conv_def ≈ 1): −1500 m; decays with d³
+            // to concentrate the trench narrowly.
+            let trench = conv_def[i].powf(3.0) * 1500.0;
+
+            // Transform fracture zone scarps: 200–800 m relief at transform
+            // boundaries (Tucholke & Schouten 1988).
+            let fracture = trans_def[i].powf(2.0) * 400.0;
+
+            relief[i] += hills + ridge_crest - trench - fracture;
         }
     }
 
@@ -3429,6 +3444,110 @@ fn compute_relief_physics(
             let flatten_strength = stability * 0.4 * cf; // max 40% compression
             let target_elev = 300.0; // typical cratonic plateau (Fairbridge 1980)
             relief[i] = relief[i] * (1.0 - flatten_strength) + target_elev * flatten_strength;
+        }
+    }
+
+    // --- 5g. Epeirogenic warping (Mitrovica et al. 1989; Bond 1976) ---
+    //
+    // Continents experience long-wavelength tilting due to mantle convection
+    // currents beneath lithospheric plates.  This produces asymmetric
+    // continental profiles: one margin uplifted, the opposite subsiding
+    // (e.g., Africa's eastern highlands vs. western lowlands; Australia's
+    // eastern Great Dividing Range vs. western plains).
+    //
+    // Model: for each continental nucleus, impose a linear tilt field
+    // oriented in a random direction.  Maximum amplitude ±200 m (Bond 1976
+    // estimates Cretaceous epeirogenic movements of 100–300 m).  The tilt
+    // is weighted by continental fraction so it fades at ocean margins.
+    {
+        let epeiro_seed = hash_u32(seed ^ 0xE91_C0DE);
+        let mut epeiro_field = vec![0.0_f32; size];
+
+        for j in 0..n_cont {
+            let nuc_seed = hash_u32(epeiro_seed.wrapping_add(j as u32));
+            // Random tilt direction on the unit sphere
+            let tilt_theta = (hash_u32(nuc_seed) as f32 / 4_294_967_295.0) * std::f32::consts::TAU;
+            let tilt_dir_x = tilt_theta.cos();
+            let tilt_dir_y = tilt_theta.sin();
+            let tilt_dir_z = hash_to_unit(hash_u32(nuc_seed.wrapping_add(1))) * 0.25;
+
+            // Influence radius from nucleus sigma: inv_sig2 = (R/σ)², σ_rad = 1/sqrt(inv_sig2)
+            let sigma_rad = 1.0 / nuc_inv_sig2[j].sqrt();
+            let influence_rad = sigma_rad * 3.0;
+
+            for i in 0..size {
+                let cf = continental_frac[i];
+                if cf < 0.2 { continue; }
+                if relief[i] <= 0.0 { continue; }
+
+                let dx = cell_cache.noise_x[i] - nuc_vx[j];
+                let dy = cell_cache.noise_y[i] - nuc_vy[j];
+                let dz = cell_cache.noise_z[i] - nuc_vz[j];
+                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+
+                if dist > influence_rad { continue; }
+
+                // Dot product of cell-to-nucleus vector with tilt direction
+                // gives signed displacement (positive on one side, negative on other)
+                let dot = dx * tilt_dir_x + dy * tilt_dir_y + dz * tilt_dir_z;
+                let norm_dot = dot / influence_rad; // range ~[-1, 1]
+
+                // Gaussian weight: strongest near nucleus, fading outward
+                let w = (-dist * dist / (2.0 * sigma_rad * sigma_rad)).exp();
+
+                // ±200 m maximum tilt (Bond 1976)
+                epeiro_field[i] += norm_dot * 200.0 * w * cf;
+            }
+        }
+
+        // Smooth to remove nucleus-boundary artifacts
+        smooth_field(&mut epeiro_field, 8, grid);
+
+        for i in 0..size {
+            if relief[i] > 0.0 {
+                relief[i] += epeiro_field[i];
+            }
+        }
+    }
+
+    // --- 5h. Back-arc basins (Karig 1971; Sdrolias & Müller 2006) ---
+    //
+    // Slab rollback creates extensional basins behind volcanic arcs.
+    // The basin forms at ~300–500 km from the trench (behind the arc at
+    // 166 km).  Typical depth: 2000–4000 m below sea level in oceanic
+    // settings (Mariana Trough, Lau Basin); 500–1500 m subsidence in
+    // continental settings (Pannonian Basin, Sea of Japan).
+    //
+    // Model: Gaussian trough at ~350 km from convergent boundary
+    // (behind the arc), σ=80 km.  Ocean back-arcs: -800 m deepening.
+    // Continental back-arcs: -300 m subsidence.
+    {
+        let l_d_conv_km = 250.0_f32;
+
+        for i in 0..size {
+            let cd = conv_def[i];
+            if cd < 0.005 { continue; } // far from convergent boundary
+
+            // Distance from convergent boundary
+            let d_km = -l_d_conv_km * cd.ln();
+
+            // Back-arc basin centered at 350 km behind trench (Sdrolias & Müller 2006)
+            let d_bab_km = 350.0_f32;
+            let sigma_bab_km = 80.0_f32;
+            let bab_gauss = (-((d_km - d_bab_km) / sigma_bab_km).powi(2) / 2.0).exp();
+
+            if bab_gauss < 0.05 { continue; }
+
+            let cf = continental_frac[i];
+            // Oceanic back-arc: deeper subsidence (Mariana Trough ~3500m deep)
+            // Continental back-arc: moderate subsidence (Pannonian ~500m)
+            let bab_depth = if cf < 0.3 {
+                -800.0 // oceanic back-arc deepening
+            } else {
+                -300.0 * (1.0 - cf * 0.5) // continental: reduced by thickness
+            };
+
+            relief[i] += bab_gauss * bab_depth;
         }
     }
 
