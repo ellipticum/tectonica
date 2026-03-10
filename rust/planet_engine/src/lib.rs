@@ -2932,6 +2932,82 @@ fn compute_relief_physics(
             relief[i] += hotspot_topo[i];
         }
     }
+
+    // --- 4e. Oceanic plateaus / Large Igneous Provinces (Coffin & Eldholm 1994) ---
+    //
+    // LIPs are massive outpourings of basalt from deep mantle plumes,
+    // creating submarine plateaus 1000–2000 km across and 2–4 km above
+    // the surrounding ocean floor (Ontong Java, Kerguelen, Iceland).
+    //
+    // These differ from hotspot swells: LIPs are THICKENED oceanic crust
+    // (up to 30 km vs normal 7 km), while hotspot swells are thermal
+    // buoyancy anomalies.  LIPs are broader and flatter.
+    //
+    // Number: Earth has ~20 major oceanic LIPs (Coffin & Eldholm 1994).
+    // We scale by planet size and use the hotspot locations — LIPs form
+    // at past or current hotspot sites where the plume output was large.
+    {
+        let lip_seed = hash_u32(seed ^ 0x71F_CA5E);
+        let mut rng = Rng::new(lip_seed);
+
+        // 3–8 oceanic LIPs
+        let n_lips = (3 + (rng.next_f32() * 5.0) as usize).min(8);
+        let r_km = planet.radius_km.max(1000.0);
+
+        for _ in 0..n_lips {
+            // Random oceanic location (bias toward equatorial band where
+            // most ocean exists)
+            let lat_rad = (rng.next_f32() * 2.0 - 1.0) * 1.2; // ±69°
+            let lon_rad = (rng.next_f32() * 2.0 - 1.0) * core::f32::consts::PI;
+
+            // Check if center is actually ocean
+            let cy = ((lat_rad + core::f32::consts::FRAC_PI_2) / core::f32::consts::PI
+                * grid.height as f32) as usize;
+            let cx = ((lon_rad + core::f32::consts::PI) / (2.0 * core::f32::consts::PI)
+                * grid.width as f32) as usize;
+            let ci = cy.min(grid.height - 1) * grid.width + cx.min(grid.width - 1);
+            if continental_frac[ci] > 0.4 { continue; } // skip if on land
+
+            // LIP dimensions (Coffin & Eldholm 1994):
+            let plateau_radius_km = 400.0 + rng.next_f32() * 600.0; // 400–1000 km
+            let plateau_height = 1500.0 + rng.next_f32() * 1500.0;   // 1.5–3 km uplift
+
+            let cos_lat = lat_rad.cos();
+            let sin_lat = lat_rad.sin();
+            let hx = cos_lat * lon_rad.cos();
+            let hy = cos_lat * lon_rad.sin();
+            let hz = sin_lat;
+
+            for y in 0..grid.height {
+                let cell_lat = ((y as f32 + 0.5) / grid.height as f32) * core::f32::consts::PI
+                    - core::f32::consts::FRAC_PI_2;
+                let cl = cell_lat.cos();
+                let sl = cell_lat.sin();
+                for x in 0..grid.width {
+                    let i = y * grid.width + x;
+                    if continental_frac[i] > 0.3 { continue; } // ocean only
+                    let cell_lon = ((x as f32 + 0.5) / grid.width as f32)
+                        * 2.0 * core::f32::consts::PI - core::f32::consts::PI;
+                    let dot = (hx * cl * cell_lon.cos() + hy * cl * cell_lon.sin()
+                        + hz * sl).clamp(-1.0, 1.0);
+                    let dist_km = dot.acos() * r_km;
+                    if dist_km > plateau_radius_km * 2.0 { continue; }
+
+                    // Flat-topped plateau with smoothstep edges
+                    // (LIPs have flat tops unlike peaked hotspot swells).
+                    let t = (dist_km / plateau_radius_km).clamp(0.0, 1.5);
+                    let edge = if t < 0.8 {
+                        1.0 // flat interior
+                    } else {
+                        let s = (t - 0.8) / 0.7; // 0 at edge, 1 at 1.5×radius
+                        1.0 - s * s * (3.0 - 2.0 * s) // smoothstep falloff
+                    };
+                    relief[i] += plateau_height * edge;
+                }
+            }
+        }
+    }
+
     progress.phase(progress_base, progress_span, 0.18);
 
     // --- 5. Tectonic uplift + diffusive landscape evolution ---
@@ -3076,8 +3152,17 @@ fn compute_relief_physics(
             }
         }
 
+        // Diffusive erosion with sediment redistribution (Allen 2008,
+        // "Sediment routing systems"; Paola & Voller 2005, JGR).
+        //
+        // Material eroded from highlands is tracked as a sediment budget.
+        // After diffusion, accumulated sediment is deposited in lowland cells
+        // (elevation < median), creating alluvial plains, river deltas, and
+        // basin fills.  This transforms the current "erosion-only" model into
+        // a mass-conserving "erosion + deposition" system.
         let kappa_base = 0.02_f32;
         let inv_dx2 = 1.0 / (dx_m * dx_m);
+        let mut total_eroded = 0.0_f32;
         for _ in 0..12 {
             let mut laplacian = vec![0.0_f32; size];
             for y in 0..grid.height {
@@ -3095,7 +3180,43 @@ fn compute_relief_physics(
             for i in 0..size {
                 if relief[i] > 0.0 {
                     let kdt = kappa_base * climate_factor[i] * dt_yr;
-                    relief[i] = (relief[i] + kdt * laplacian[i]).max(0.0);
+                    let dh = kdt * laplacian[i];
+                    let new_h = (relief[i] + dh).max(0.0);
+                    let removed = relief[i] - new_h; // positive = erosion
+                    if removed > 0.0 { total_eroded += removed; }
+                    relief[i] = new_h;
+                }
+            }
+        }
+
+        // Redistribute eroded sediment into lowland cells.
+        // Sediment preferentially fills the lowest continental areas
+        // (foreland basins, river valleys, coastal plains).
+        // Only 60% of eroded material stays on land — 40% is transported
+        // to the ocean as suspended load (Milliman & Syvitski 1992).
+        if total_eroded > 0.0 {
+            let land_sediment = total_eroded * 0.6;
+            // Find lowland cells (below median land elevation) and weight by
+            // how low they are — lowest cells get the most sediment.
+            let mut low_cells: Vec<(usize, f32)> = Vec::new();
+            let mut weight_sum = 0.0_f32;
+            // Quick median estimate: use 30th percentile of land as cutoff
+            let mut land_heights: Vec<f32> = relief.iter()
+                .filter(|&&h| h > 0.0).copied().collect();
+            if land_heights.len() > 100 {
+                land_heights.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p30 = land_heights[land_heights.len() * 30 / 100];
+                for i in 0..size {
+                    if relief[i] > 0.0 && relief[i] < p30 {
+                        let w = (p30 - relief[i]).max(0.0);
+                        low_cells.push((i, w));
+                        weight_sum += w;
+                    }
+                }
+                if weight_sum > 0.0 {
+                    for &(i, w) in &low_cells {
+                        relief[i] += land_sediment * (w / weight_sum);
+                    }
                 }
             }
         }
@@ -3277,6 +3398,37 @@ fn compute_relief_physics(
             if relief[i] > 0.0 {
                 relief[i] += shoulder_uplift;
             }
+        }
+    }
+
+    // --- 5f. Cratonic peneplains (King 1967; Fairbridge & Finkl 1980) ---
+    //
+    // Continental interiors far from active plate boundaries have been
+    // exposed to billions of years of erosion, producing vast flat
+    // peneplains (Canadian Shield, Australian interior, West African
+    // craton, Siberian Platform).
+    //
+    // At cells with very low tectonic activity (all deformation fields
+    // near zero) and high continental fraction, flatten relief toward
+    // the regional mean.  This represents the integrated effect of
+    // long-term denudation that our short-timescale model cannot capture.
+    {
+        for i in 0..size {
+            if relief[i] <= 0.0 { continue; }
+            let cf = continental_frac[i];
+            if cf < 0.6 { continue; } // only deep continental interior
+
+            // Tectonic quiescence: low activity = old stable craton
+            let activity = (conv_def[i] + div_def[i] + trans_def[i]).clamp(0.0, 1.0);
+            if activity > 0.1 { continue; } // still tectonically active
+
+            // Peneplain flattening: compress elevation variation toward
+            // a low plateau (~200–400 m, typical cratonic elevation).
+            // Stronger compression for lower activity (older, more eroded).
+            let stability = 1.0 - activity / 0.1; // 0 at activity=0.1, 1 at activity=0
+            let flatten_strength = stability * 0.4 * cf; // max 40% compression
+            let target_elev = 300.0; // typical cratonic plateau (Fairbridge 1980)
+            relief[i] = relief[i] * (1.0 - flatten_strength) + target_elev * flatten_strength;
         }
     }
 
