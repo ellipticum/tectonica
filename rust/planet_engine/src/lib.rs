@@ -2688,71 +2688,247 @@ fn compute_relief_physics(
             relief[i] += hills - trench;
         }
     }
+
+    // --- 4b¾. Volcanic arcs at subduction zones (Syracuse & Abers 2006) ---
+    //
+    // When oceanic lithosphere subducts, slab dehydration at ~80–120 km depth
+    // triggers partial melting in the mantle wedge.  The resulting volcanic arc
+    // forms at a characteristic distance from the trench:
+    //   d_arc = H_slab / tan(θ)
+    // where H_slab ≈ 100 km (dehydration depth) and θ ≈ 30–60° (slab dip).
+    // Syracuse & Abers (2006, G³) find median arc-trench distance = 166 km
+    // with σ ≈ 40 km across-strike width.
+    //
+    // The arc forms on the OVERRIDING plate (higher continental_frac side).
+    // Continental arcs (Andes, Cascades): 1000–2000 m additional uplift.
+    // Oceanic island arcs (Mariana, Tonga): 500–1500 m above ocean floor.
+    {
+        let l_d_conv_km = 250.0_f32; // must match propagate_deformation L_d
+        let d_arc_km = 166.0_f32;    // Syracuse & Abers 2006 median
+        let sigma_arc_km = 40.0_f32; // across-strike half-width
+
+        // Convert conv_def (= exp(-d/L_d)) back to approximate distance in km,
+        // then apply Gaussian peak centered at d_arc.
+        let arc_seed = hash_u32(seed ^ 0xA8C_F10E);
+        let mut arc_field = vec![0.0_f32; size];
+        for i in 0..size {
+            let cd = conv_def[i];
+            if cd < 0.01 { continue; } // far from any convergent boundary
+
+            // Distance from convergent boundary: d = -L_d × ln(conv_def)
+            let d_km = -l_d_conv_km * cd.ln();
+
+            // Gaussian peak at d_arc with width sigma_arc
+            let arc_gauss = (-((d_km - d_arc_km) / sigma_arc_km).powi(2) / 2.0).exp();
+
+            // Restrict to overriding plate side using continental_frac.
+            // cf > 0.3 = overriding continental plate (Andes, Cascades).
+            // cf < 0.3 = oceanic side — island arcs (smaller amplitude).
+            let cf = continental_frac[i];
+            let arc_amp = if cf > 0.3 {
+                // Continental arc: 800–1200 m additional uplift.
+                // England & Molnar (1990): Andean arc 1000–1500 m above
+                // background continental elevation.
+                1000.0 * cf.min(1.0)
+            } else {
+                // Island arc: 500–1000 m above ocean floor.
+                // Suyehiro et al. (1996): Izu-Bonin arc crest ~1 km above
+                // surrounding ocean floor.
+                600.0
+            };
+
+            // Along-strike variation: volcanic centers are discrete, spaced
+            // ~50–80 km apart (de Bremond d'Ars et al. 1995, JGR).
+            // Use noise to create individual volcanic peaks along the arc.
+            let nx = cell_cache.noise_x[i];
+            let ny = cell_cache.noise_y[i];
+            let nz = cell_cache.noise_z[i];
+            let along_strike = (value_noise3(
+                nx * 30.0, ny * 30.0, nz * 30.0, arc_seed,
+            ) * 0.5 + 0.5).powf(0.7); // bias toward higher values, range ~0.3–1.0
+
+            arc_field[i] = arc_gauss * arc_amp * along_strike;
+        }
+
+        // Light smoothing (3 passes ≈ 30 km) to blend arc into surrounding terrain.
+        smooth_field(&mut arc_field, 3, grid);
+
+        for i in 0..size {
+            relief[i] += arc_field[i];
+        }
+    }
+
     progress.phase(progress_base, progress_span, 0.15);
 
     // --- 4c. Dynamic topography (Hager et al. 1985; Flament et al. 2013) ---
     //
-    // Mantle convection creates long-wavelength (1000–5000 km) topographic
-    // anomalies of ±0.5–1 km.  Downwelling slabs pull the surface down,
-    // mantle plumes push it up.  This breaks the Voronoi plate pattern in
-    // continental interiors and creates interior elevation diversity.
+    // Three physically distinct components:
     //
-    // We approximate this with a multi-octave noise field whose amplitude
-    // is modulated by plate properties: old, thick plates get negative
-    // anomaly (cratonic subsidence), young active boundaries get positive
-    // (dynamic uplift from slab-driven corner flow).
+    // (A) Slab-driven negative anomaly: subducting slabs create viscous
+    //     downwelling that depresses the surface 300–1000 km behind the
+    //     trench (Mitrovica et al. 1989, JGR; Flament et al. 2013).
+    //     Amplitude −300 to −800 m.  Wavelength ~1000–3000 km.
     //
-    // Spectral content: 2 octaves at ~5000 km and ~2500 km wavelength,
-    // matching the observed power spectrum of residual topography
-    // (Hoggard et al. 2016, Nat. Geosci.).
+    // (B) Ridge upwelling: asthenospheric upwelling beneath divergent
+    //     boundaries creates positive topography.  Already partially
+    //     expressed via lower thermal subsidence near ridges, but a
+    //     200–400 m residual affects adjacent continents (Lithgow-Bertelloni
+    //     & Silver 1998, Nature).
+    //
+    // (C) Deep mantle convection: degree 2–6 residual from long-lived
+    //     convection structures (LLSVPs, Garnero et al. 2016).  Stochastic
+    //     at the surface because it reflects deep mantle history, not current
+    //     plate geometry.  Amplitude ±300 m (Hoggard et al. 2016).
     {
+        // (A) Slab-pull: propagate convergent signal at 1000 km decay length.
+        // This is much wider than the 250 km orogenic deformation — it
+        // represents the viscous coupling of the sinking slab to the
+        // overlying plate at lithospheric/asthenospheric scales.
+        let conv_wide = propagate_deformation(&conv_seed, 1000.0, grid);
+
+        // (B) Ridge uplift: propagate divergent signal at 800 km decay.
+        let div_wide = propagate_deformation(&div_seed, 800.0, grid);
+
+        // (C) Deep mantle: spherical noise at very long wavelength
         let dyn_seed = hash_u32(seed ^ 0xDEAD_FACE);
+
         let mut dyn_topo = vec![0.0_f32; size];
-        for y in 0..grid.height {
-            for x in 0..grid.width {
-                let i = y * grid.width + x;
-                // Use spherical_fbm instead of raw value_noise3 to avoid
-                // lattice-aligned diamond artifacts at low frequencies.
-                // spherical_fbm uses domain rotation per octave (Rodrigues),
-                // breaking axis-aligned periodicity that creates visible
-                // diamond shapes at the ~8 lattice cells spanning the sphere.
-                let sx = cell_cache.noise_x[i];
-                let sy = cell_cache.noise_y[i];
-                let sz = cell_cache.noise_z[i];
-
-                // spherical_fbm at scale 0.6 → base freq 2.25×0.6 ≈ 1.35
-                // → ~8 lobes around equator (~5000 km wavelength).
-                // 5 octaves with persistence 0.52 naturally produce the
-                // multi-scale structure without visible lattice artifacts.
-                // Amplitude 600 m ≈ ±1 km peak (Hoggard et al. 2016).
-                let dyn_phase = dyn_seed as f32 * 0.0001;
-                let raw = spherical_fbm(sx * 0.6, sy * 0.6, sz * 0.6, dyn_phase) * 600.0;
-
-                // Modulate by tectonic activity: amplify near active boundaries,
-                // attenuate in stable interiors (where dynamic topography is weak
-                // due to thick cratonic lithosphere — Jordan 1975, Artemieva 2009).
-                let activity = (conv_def[i] + div_def[i] * 0.7 + trans_def[i] * 0.3)
-                    .clamp(0.0, 1.0);
-                // Interior cells (low activity) get 40% of raw amplitude;
-                // active boundary cells get 100%.  This creates the observed
-                // pattern where dynamic topography is strongest near subduction
-                // zones and weakest in cratonic shields.
-                let scale = 0.4 + 0.6 * activity;
-                dyn_topo[i] = raw * scale;
-            }
-        }
-        // Smooth to ensure only long-wavelength features survive
-        // (20 passes ≈ 200 km smoothing length, removes sub-500 km features)
-        smooth_field(&mut dyn_topo, 20, grid);
-
-        // Apply only to land cells (ocean dynamic topography is expressed
-        // as geoid anomalies, not bathymetric changes at this resolution)
         for i in 0..size {
-            if relief[i] > 0.0 {
-                relief[i] += dyn_topo[i];
-            }
+            let sx = cell_cache.noise_x[i];
+            let sy = cell_cache.noise_y[i];
+            let sz = cell_cache.noise_z[i];
+
+            // (A) Slab pull: negative anomaly behind subduction zones.
+            // Maximum at ~300–800 km from convergent boundary where the
+            // slab reaches 200–400 km depth (Mitrovica et al. 1989).
+            // conv_wide at 500 km = exp(-500/1000) = 0.607 → moderate effect.
+            // Exclude the boundary crest itself (that's orogenic uplift, not
+            // slab pull) by ramping from conv_def.
+            // The "behind" effect: strongest where conv_wide is moderate
+            // (far from boundary) but conv_def is low (not at the boundary).
+            let behind_factor = conv_wide[i] * (1.0 - conv_def[i].min(1.0));
+            let slab_pull = -600.0 * behind_factor; // −600 m max
+
+            // (B) Ridge upwelling: positive anomaly near divergent boundaries.
+            // Affects continents near passive margins and ocean-continent
+            // boundaries where hot asthenosphere flows laterally.
+            let ridge_uplift = 300.0 * div_wide[i]; // +300 m max
+
+            // (C) Deep mantle noise: degree 2–6 stochastic field.
+            let dyn_phase = dyn_seed as f32 * 0.0001;
+            let deep_noise = spherical_fbm(sx * 0.6, sy * 0.6, sz * 0.6, dyn_phase) * 300.0;
+
+            // Cratonic attenuation: thick Archean lithosphere (>200 km)
+            // resists dynamic topography (Jordan 1975; Artemieva 2009).
+            // Use low activity as a proxy for cratonic roots.
+            let activity = (conv_def[i] + div_def[i] * 0.7 + trans_def[i] * 0.3)
+                .clamp(0.0, 1.0);
+            let craton_shield = 0.5 + 0.5 * activity; // 50% base, 100% at boundaries
+
+            dyn_topo[i] = (slab_pull + ridge_uplift + deep_noise) * craton_shield;
+        }
+
+        // Heavy smoothing: only long-wavelength (>500 km) features survive.
+        // 30 passes ≈ σ ~280 km → 3σ ~840 km cutoff.
+        smooth_field(&mut dyn_topo, 30, grid);
+
+        // Apply to all cells (both land and ocean — dynamic topography
+        // affects bathymetry too; Flament et al. 2013 Fig. 3).
+        for i in 0..size {
+            relief[i] += dyn_topo[i];
         }
     }
+
+    // --- 4d. Hotspot volcanism (Morgan 1971; Sleep 1990) ---
+    //
+    // Deep mantle plumes create topographic swells ~1000–1500 km diameter
+    // with 1–2 km peak elevation (Crough 1983, Ann. Rev. Earth Planet. Sci.).
+    // On oceanic lithosphere: volcanic islands (Hawaii, Iceland type).
+    // On continental lithosphere: flood basalt provinces, elevated plateaus
+    // (Yellowstone, Afar type).
+    //
+    // Number of hotspots: Courtillot et al. (2003) identify ~30–50 hotspots
+    // on Earth, of which ~10 are "primary" (deep mantle plume origin).
+    // We scale by planet radius and plate count.
+    {
+        let hs_seed = hash_u32(seed ^ 0xF107_5907);
+        let mut rng = Rng::new(hs_seed);
+
+        // Number of hotspots: 5–15, scaled by plate count.
+        let n_hotspots = ((n_plates as f32 * 0.8) as usize + (rng.next_f32() * 4.0) as usize)
+            .clamp(5, 15);
+
+        let mut hotspot_topo = vec![0.0_f32; size];
+
+        for h in 0..n_hotspots {
+            // Place hotspot at random location using golden-angle spiral
+            // with jitter (Saff & Kuijlaars 1997) for quasi-uniform coverage.
+            let t = (h as f32 + rng.next_f32()) / n_hotspots as f32;
+            let lat_rad = (1.0 - 2.0 * t).acos() - core::f32::consts::FRAC_PI_2;
+            let golden_angle = 2.399963; // π(3−√5)
+            let lon_rad = (h as f32 * golden_angle + rng.next_f32() * 1.5)
+                % (2.0 * core::f32::consts::PI) - core::f32::consts::PI;
+
+            // Hotspot swell parameters (Crough 1983):
+            //   radius: 500–800 km
+            //   peak:   800–1500 m (oceanic), 400–800 m (continental, resisted by thick litho)
+            let swell_radius_km = 500.0 + rng.next_f32() * 300.0;
+            let swell_peak = 800.0 + rng.next_f32() * 700.0;
+
+            // Compute great-circle distance from hotspot center to each cell.
+            let hs_cos_lat = lat_rad.cos();
+            let hs_sin_lat = lat_rad.sin();
+            let hs_cos_lon = lon_rad.cos();
+            let hs_sin_lon = lon_rad.sin();
+            // Unit vector for hotspot
+            let hx = hs_cos_lat * hs_cos_lon;
+            let hy = hs_cos_lat * hs_sin_lon;
+            let hz = hs_sin_lat;
+
+            let r_km = planet.radius_km.max(1000.0);
+
+            for y in 0..grid.height {
+                let cell_lat = ((y as f32 + 0.5) / grid.height as f32) * core::f32::consts::PI
+                    - core::f32::consts::FRAC_PI_2;
+                let cl = cell_lat.cos();
+                let sl = cell_lat.sin();
+                for x in 0..grid.width {
+                    let i = y * grid.width + x;
+                    let cell_lon = ((x as f32 + 0.5) / grid.width as f32)
+                        * 2.0 * core::f32::consts::PI - core::f32::consts::PI;
+                    // Dot product for great-circle angular distance
+                    let cx = cl * cell_lon.cos();
+                    let cy = cl * cell_lon.sin();
+                    let cz = sl;
+                    let dot = (hx * cx + hy * cy + hz * cz).clamp(-1.0, 1.0);
+                    let dist_km = dot.acos() * r_km;
+
+                    if dist_km > swell_radius_km * 2.5 { continue; }
+
+                    // Gaussian swell profile (Sleep 1990, JGR):
+                    // h(r) = h_peak × exp(−r²/(2σ²)), σ ≈ swell_radius/2
+                    let sigma = swell_radius_km * 0.5;
+                    let swell = swell_peak * (-(dist_km * dist_km) / (2.0 * sigma * sigma)).exp();
+
+                    // Continental lithosphere resists plume uplift
+                    // (Jordan 1975 — thick tectospheric root deflects plume):
+                    // reduce amplitude to ~50% on thick continental litho.
+                    let cf = continental_frac[i];
+                    let resist = 1.0 - 0.5 * cf;
+
+                    hotspot_topo[i] += swell * resist;
+                }
+            }
+        }
+
+        // Smooth to blend into surroundings (5 passes ≈ 50 km)
+        smooth_field(&mut hotspot_topo, 5, grid);
+
+        for i in 0..size {
+            relief[i] += hotspot_topo[i];
+        }
+    }
+    progress.phase(progress_base, progress_span, 0.18);
 
     // --- 5. Tectonic uplift + diffusive landscape evolution ---
     //
