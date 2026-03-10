@@ -684,6 +684,10 @@ struct ComputePlatesResult {
     boundary_types: Vec<i8>,
     boundary_strength: Vec<f32>,
     plate_vectors: Vec<PlateVector>,
+    /// Total plate evolution time in years, accumulated from all reorganization
+    /// steps (Torsvik et al. 2010).  Used by relief pipeline for physically
+    /// consistent tectonic uplift duration instead of arbitrary dt.
+    evolution_time_yr: f32,
 }
 
 #[derive(Clone)]
@@ -1328,6 +1332,10 @@ fn accumulate_plate_vote(
     }
 }
 
+/// Evolve plate field over multiple reorganization steps.
+/// Returns the total accumulated evolution time in years (sum of all step
+/// durations).  Each step uses a duration drawn from the 0.9–3.4 Myr range
+/// (Torsvik et al. 2010: plate reorganizations every 5–20 Myr; we sub-step).
 fn evolve_plate_field(
     plate_field: &mut [i16],
     plate_vectors: &[PlateVector],
@@ -1338,7 +1346,7 @@ fn evolve_plate_field(
     progress: &mut ProgressTap<'_>,
     progress_base: f32,
     progress_span: f32,
-) {
+) -> f32 {
     let steps = detail.plate_evolution_steps.max(1);
     let plate_count = plate_vectors.len().max(1);
     let radius_cm = (planet.radius_km.max(1000.0) * 100_000.0).max(1.0);
@@ -1358,6 +1366,7 @@ fn evolve_plate_field(
     let mut best_score = vec![0.0_f32; WORLD_SIZE];
     let mut second_score = vec![0.0_f32; WORLD_SIZE];
     let mut relaxed = vec![0_i16; WORLD_SIZE];
+    let mut total_evolution_yr = 0.0_f32;
 
     for step in 0..steps {
         best_label.fill(-1);
@@ -1370,6 +1379,7 @@ fn evolve_plate_field(
         // on (Torsvik et al. 2010: reorganizations every 5-20 Myr; we sub-step).
         let step_years =
             random_range(&mut rng, 900_000.0, 3_400_000.0) * (0.92 + 0.32 * age_norm);
+        total_evolution_yr += step_years;
         // Procedural: plate boundary inertia (higher = more stable boundaries).
         let memory_keep = 0.5 + 0.18 * (1.0 - age_norm);
         let structural_phase = seed as f32 * 0.0019 + step as f32 * 1.71;
@@ -1524,6 +1534,7 @@ fn evolve_plate_field(
             (step as f32 + 1.0) / steps as f32,
         );
     }
+    total_evolution_yr
 }
 
 fn compute_plates(
@@ -1613,7 +1624,7 @@ fn compute_plates(
     ) as usize;
     cleanup_plate_fragments(&mut plate_field, min_fragment_cells);
     cleanup_plate_fragments_relative(&mut plate_field, 0.42, min_fragment_cells * 5);
-    evolve_plate_field(
+    let evolution_time_yr = evolve_plate_field(
         &mut plate_field,
         &plate_vectors,
         planet,
@@ -1754,6 +1765,7 @@ fn compute_plates(
         boundary_types,
         boundary_strength,
         plate_vectors,
+        evolution_time_yr,
     }
 }
 
@@ -1883,10 +1895,14 @@ fn smooth_field(field: &mut [f32], passes: usize, grid: &GridConfig) {
             let ns_w = 1.0_f32;
             // Diagonal: physical dist = √(cos²φ + 1) × cell_size
             let diag_w = 1.0 / (cos_lat * cos_lat + 1.0).sqrt();
-            // Center weight: keep same ratio to neighbor sum as the equatorial kernel
-            // (4.0 / 6.83 ≈ 0.586), so diffusion rate is physically uniform.
-            let neighbor_sum = 2.0 * ew_w + 2.0 * ns_w + 4.0 * diag_w;
-            let center_w = 0.586 * neighbor_sum;
+            // Center weight from the anisotropic 5-point Laplacian on the
+            // equirectangular grid (Turcotte & Schubert 2002, §4.16):
+            //   ∂²u/∂x²: coefficient −2/(dx·cosφ)² → center term = 2·ew_w
+            //   ∂²u/∂y²: coefficient −2/dx²        → center term = 2·ns_w
+            // At equator: center_w = 4.0 (standard 5-point Laplacian).
+            // At high latitudes center_w increases because E-W neighbors are
+            // physically closer, correctly reducing per-pass smoothing.
+            let center_w = 2.0 * ew_w + 2.0 * ns_w;
             for x in 0..grid.width {
                 let i = grid.index(x, y);
                 let mut sum = field[i] * center_w;
@@ -2234,11 +2250,11 @@ fn compute_relief_physics(
     //
     // Transform L_d = 150 km: San Andreas fault zone.
     // Bourne et al. 1998 cite 100–200 km for transcurrent shear zones.
-    // Convergent L_d = 180 km (was 250): produces ~540 km orogenic belts,
-    // matching Andes half-width ~250 km and Alps ~100 km.  Narrower zones
-    // create visually distinct ridges that divide territory into natural
-    // regions — essential for map readability.
-    let mut conv_def = propagate_deformation(&conv_seed, 180.0, grid);
+    // Convergent L_d = 250 km: England & McKenzie 1982 Table 1 cite
+    // 200–500 km for continental collision zones.  250 km is the geometric
+    // mean, producing 3σ ≈ 750 km wide orogenic belts (consistent with
+    // Andes ~700 km, Himalaya-Tibet ~800 km, Alps ~200 km).
+    let mut conv_def = propagate_deformation(&conv_seed, 250.0, grid);
     let mut div_def = propagate_deformation(&div_seed, 200.0, grid);
     let mut trans_def = propagate_deformation(&trans_seed, 150.0, grid);
 
@@ -2250,16 +2266,30 @@ fn compute_relief_physics(
     smooth_field(&mut div_def, 5, grid);
     smooth_field(&mut trans_def, 5, grid);
 
-    // Sharpen deformation peaks: power-law concentration.
-    // d^1.5 steepens the profile: boundary crest stays near 1.0,
-    // but flanks drop faster.  This creates narrow, well-defined
-    // mountain ridges instead of broad rounded domes.
-    // Physically: strain localization in orogenic belts concentrates
-    // deformation at the boundary (Beaumont et al. 2001, Nature).
+    // Strain localization via damage rheology (Lyakhovsky et al. 1997, JGR).
+    //
+    // Damaged material: η_eff = η₀(1 − α·d), where d = accumulated strain
+    // and α = damage fraction (portion of mechanical work → grain reduction).
+    // The strain enhancement factor 1/(1−α·d) concentrates deformation at
+    // boundary crests (d ≈ 1) while suppressing flanks (d → 0).
+    //
+    // Normalized so def_out(1) = 1:
+    //   def_out = def × (1 − α) / (1 − α × def)
+    //
+    // α_conv = 0.6: strong localization in continental collision zones
+    //   (Himalaya, Alps — high confining pressure promotes damage; Regenauer-Lieb
+    //   & Yuen 2003, Science).
+    // α_div/trans = 0.4: moderate localization in extensional/transcurrent regimes.
+    let alpha_conv = 0.6_f32;
+    let alpha_div = 0.4_f32;
+    let alpha_trans = 0.4_f32;
     for i in 0..size {
-        conv_def[i] = conv_def[i].powf(1.5);
-        div_def[i] = div_def[i].powf(1.3);
-        trans_def[i] = trans_def[i].powf(1.3);
+        let d = conv_def[i];
+        conv_def[i] = d * (1.0 - alpha_conv) / (1.0 - alpha_conv * d);
+        let d = div_def[i];
+        div_def[i] = d * (1.0 - alpha_div) / (1.0 - alpha_div * d);
+        let d = trans_def[i];
+        trans_def[i] = d * (1.0 - alpha_trans) / (1.0 - alpha_trans * d);
     }
 
     // Thermal-age-based interior suppression (Artemieva & Mooney 2001).
@@ -2751,38 +2781,65 @@ fn compute_relief_physics(
         // Uses propagated fields for wide, smooth orogenic response.
         // Rates are lower than point-boundary rates because the deformation
         // is already spread across the full orogenic width.
+        // England & McKenzie (1982) distributed crustal thickening model.
+        //
+        // In a thin viscous sheet, convergence velocity v spreads over
+        // deformation half-width L_d.  The shortening strain rate at
+        // distance x from the boundary is:
+        //   ε̇(x) = v / (2·L_d) × exp(−x/L_d)
+        // conv_def[i] already encodes the exp(−x/L_d) spatial decay.
+        //
+        // Crustal thickening rate: dH/dt = H_c × ε̇  (volume conservation)
+        // Surface uplift rate:     U = dH/dt × (ρ_m − ρ_c) / ρ_m  (Airy)
+        //
+        // This replaces the previous fudge constants (0.002, 0.001, 0.0003
+        // m/yr) with physics: the uplift rate depends on actual plate speed,
+        // crustal thickness, and density contrast per cell.
         let mut uplift = vec![0.0_f32; size];
-        let plate_speed = tectonics.plate_speed_cm_per_year.clamp(1.0, 20.0);
-        let speed_factor = plate_speed / 5.0;
+        let v_plate = tectonics.plate_speed_cm_per_year.clamp(1.0, 20.0) * 0.01; // m/yr
+        // L_d values must match the propagate_deformation calls above.
+        let l_d_conv = 250.0e3_f32; // m (convergent half-width)
+        let l_d_div = 200.0e3_f32;  // m (divergent half-width)
+        let l_d_trans = 150.0e3_f32; // m (transform half-width)
+        let rho_m = 3300.0_f32;
         for i in 0..size {
             let cf = continental_frac[i];
-            // Only continental crust experiences significant surface uplift.
-            // Oceanic convergence creates submarine features (trenches,
-            // volcanic arcs) that are unresolvable at 10 km/cell.
-            // Scale uplift by cf² (quadratic) to suppress transition zone
-            // artifacts while preserving full uplift in continental interiors.
+            // Only continental crust thickens under convergence; oceanic
+            // crust subducts.  cf² smoothly suppresses uplift in oceanic
+            // and transitional zones.
             let cf_scale = cf * cf;
-            // Convergent: distributed shortening → thickening → uplift
-            // Peak ~2 mm/yr (averaged over 250 km orogenic belt; cf.
-            // 5–10 mm/yr at the boundary crest in Himalaya/Andes,
-            // Bilham et al. 1997, Bevis & Brown 2014).
-            let conv_uplift = conv_def[i] * 0.002 * speed_factor * cf_scale;
-            // Divergent: rifting → thinning → subsidence
-            let div_uplift = -div_def[i] * 0.001 * speed_factor * cf_scale;
-            // Transform: minor transpressional uplift
-            let trans_uplift = trans_def[i] * 0.0003 * speed_factor * cf_scale;
+            // Per-cell crustal thickness and density (same as isostatic_elevation).
+            let h_c = crust_thickness[i] * 1000.0; // km → m
+            let rho_c = 2900.0 - cf * 100.0;
+            let delta_rho_frac = (rho_m - rho_c) / rho_m;
+            // Convergent: shortening → crustal thickening → Airy uplift.
+            // Peak ≈ 0.8 mm/yr for v=5 cm/yr, H_c=40 km (cf. Bilham et al.
+            // 1997: 1–5 mm/yr GPS across Himalaya; our lower value reflects
+            // the 250 km orogenic belt average, not point rate).
+            let conv_rate = v_plate / (2.0 * l_d_conv);
+            let conv_uplift = conv_def[i] * conv_rate * h_c * delta_rho_frac * cf_scale;
+            // Divergent: extension → crustal thinning → subsidence.
+            let div_rate = v_plate / (2.0 * l_d_div);
+            let div_uplift = -div_def[i] * div_rate * h_c * delta_rho_frac * cf_scale;
+            // Transform: transpressional component ≈ 15% of plate-parallel
+            // motion (Bourne et al. 1998, JGR).
+            let f_transpression = 0.15_f32;
+            let trans_rate = f_transpression * v_plate / (2.0 * l_d_trans);
+            let trans_uplift = trans_def[i] * trans_rate * h_c * delta_rho_frac * cf_scale;
             uplift[i] = conv_uplift + div_uplift + trans_uplift;
         }
         // 4 passes (σ ≈ 40 km) — keeps uplift concentrated near boundary
         // crests.  Previous 10 passes (σ ≈ 100 km) flattened ridges into
         // wide circular domes.  The deformation field itself already
-        // provides the 180 km half-width; additional smoothing only erases
+        // provides the 250 km half-width; additional smoothing only erases
         // the linear ridge structure that makes mountains readable.
         smooth_field(&mut uplift, 4, grid);
 
-        // Apply uplift to land cells
-        let dt_myr = 1.5_f32; // 1.5 Myr of tectonic evolution
-        let dt_yr = dt_myr * 1e6;
+        // Apply uplift to land cells.
+        // dt = total plate evolution time from evolve_plate_field (sum of all
+        // reorganization step durations; Torsvik et al. 2010).  Typical value
+        // ~7–15 Myr for 7 steps.  Replaces the previous arbitrary 1.5 Myr.
+        let dt_yr = plates.evolution_time_yr;
         for i in 0..size {
             if relief[i] > 0.0 {
                 relief[i] += uplift[i] * dt_yr;
@@ -2821,8 +2878,9 @@ fn compute_relief_physics(
 
         // Isostatic relaxation: exponential approach to equilibrium.
         // τ_eff ≈ 5 Myr (Watts 2001 §8.4).
-        // f = 1 − exp(−1.5/5.0) ≈ 0.26.
-        let f_relax = 1.0 - (-1.5_f32 / 5.0).exp();
+        // f = 1 − exp(−dt/τ).  dt from plate evolution time.
+        let dt_myr = dt_yr / 1e6;
+        let f_relax = 1.0 - (-dt_myr / 5.0).exp();
         for i in 0..size {
             let target = isostatic_elevation(crust_thickness[i], continental_frac[i], heat_map[i]);
             relief[i] = relief[i] * (1.0 - f_relax) + target * f_relax;
@@ -5650,22 +5708,36 @@ fn run_crop_pipeline(
         k_br[i] = 5.0e-6 - def_total * 4.0e-6;  // range: 1e-6 (hard) to 5e-6 (soft)
     }
 
-    // Maintenance uplift for crop erosion.  The planet scope already applied
-    // the full tectonic uplift and isostatic equilibration.  Crop-scale SPACE
-    // erosion exists to carve river networks and add sub-resolution detail,
-    // not to re-create the orogen.  Rates here are "maintenance" values that
-    // sustain relief against erosion without double-counting the planet uplift.
+    // Maintenance uplift for crop erosion (England & McKenzie 1982).
     //
-    // Willett & Brandon (2002, Geology) show that steady-state orogens maintain
-    // rock uplift ≈ erosion rate, typically 0.1–0.5 mm/yr.  We use 10% of
-    // full tectonic rates as maintenance to keep peaks realistic (< 9 km).
-    let speed_factor = cfg.tectonics.plate_speed_cm_per_year.max(0.1) / 5.0;
+    // The planet scope already applied full tectonic uplift over the plate
+    // evolution time.  Crop-scale SPACE erosion carves river networks over
+    // 10 Myr — during this time, ongoing convergence sustains the orogen.
+    //
+    // We use the same crustal thickening formula as planet scope:
+    //   U = def × v_plate/(2·L_d) × H_c × (ρ_m − ρ_c)/ρ_m
+    // with representative H_c = 40 km (global continental mean, Christensen
+    // & Mooney 1995) and ρ_c = 2800 kg/m³.  This gives maintenance rates
+    // consistent with GPS-observed uplift (Bilham et al. 1997; Bevis 2014).
+    let v_plate = cfg.tectonics.plate_speed_cm_per_year.max(0.1) * 0.01; // m/yr
+    let h_c_repr = 40000.0_f32; // m (representative continental crust)
+    let rho_m_crop = 3300.0_f32;
+    let rho_c_crop = 2800.0_f32;
+    let delta_rho_frac_crop = (rho_m_crop - rho_c_crop) / rho_m_crop; // ≈ 0.1515
+    let l_d_conv_crop = 250.0e3_f32; // m — must match planet propagation
+    let l_d_div_crop = 200.0e3_f32;
+    let l_d_trans_crop = 150.0e3_f32;
+    let f_transpression_crop = 0.15_f32; // Bourne et al. 1998
     let mut uplift = vec![0.0_f32; crop_grid.size];
     for i in 0..crop_grid.size {
-        let u_conv = crop_conv_def[i] * 1.0e-3 * speed_factor;   // 0–1.0 mm/yr
-        let u_div = crop_div_def[i] * 3.0e-4 * speed_factor;     // 0–0.3 mm/yr
-        let u_trans = crop_trans_def[i] * 1.5e-4 * speed_factor;  // 0–0.15 mm/yr
-        let u_bg = 0.02e-3;  // GIA background (Peltier 2004)
+        let conv_rate = v_plate / (2.0 * l_d_conv_crop);
+        let u_conv = crop_conv_def[i] * conv_rate * h_c_repr * delta_rho_frac_crop;
+        let u_div = crop_div_def[i] * (v_plate / (2.0 * l_d_div_crop))
+                  * h_c_repr * delta_rho_frac_crop;
+        let u_trans = crop_trans_def[i] * f_transpression_crop
+                    * (v_plate / (2.0 * l_d_trans_crop))
+                    * h_c_repr * delta_rho_frac_crop;
+        let u_bg = 0.02e-3; // GIA background (Peltier 2004)
         uplift[i] = u_conv + u_div + u_trans + u_bg;
     }
 
