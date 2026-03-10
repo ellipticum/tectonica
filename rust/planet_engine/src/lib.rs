@@ -2832,10 +2832,14 @@ fn compute_relief_physics(
         // 30 passes ≈ σ ~280 km → 3σ ~840 km cutoff.
         smooth_field(&mut dyn_topo, 30, grid);
 
-        // Apply to all cells (both land and ocean — dynamic topography
-        // affects bathymetry too; Flament et al. 2013 Fig. 3).
+        // Apply to land cells only.  Ocean bathymetry is already controlled
+        // by thermal subsidence (Parsons & Sclater 1977) — applying dynamic
+        // topography to ocean cells would double-count the slab/ridge effects
+        // that are already expressed through age-dependent depth.
         for i in 0..size {
-            relief[i] += dyn_topo[i];
+            if relief[i] > 0.0 {
+                relief[i] += dyn_topo[i];
+            }
         }
     }
 
@@ -3068,6 +3072,169 @@ fn compute_relief_physics(
     // Its artifact-suppression role is now handled by the extended diffusion in §5:
     // 20 passes × κ×dt/dx² gives σ ≈ 35 km, sufficient to smooth sub-grid noise
     // while preserving physically-generated terrain structure.)
+
+    // --- 5c. Foreland basins (DeCelles & Giles 1996; Beaumont 1981) ---
+    //
+    // Orogenic loads flex the lithosphere, creating a foredeep basin on the
+    // cratonic side of the mountain belt.  This is the origin of major
+    // sedimentary lowlands: Indo-Gangetic Plain, Po Valley, Mesopotamia,
+    // Western Interior Seaway (Cretaceous).
+    //
+    // Basin geometry (Watts 2001, §3.8):
+    //   - Foredeep: 100–300 km wide, 2–5 km deep (subsurface)
+    //   - Surface expression: 50–200 m below surrounding terrain
+    //   - Forebulge: subtle rise ~50 m at distance ~300–500 km from orogen
+    //
+    // We compute the basin by looking at the GRADIENT of convergent uplift:
+    // the basin forms where uplift drops from high (orogen) to low (craton),
+    // i.e., where the loading contrast is maximum.
+    {
+        // Foreland depression: convergent deformation creates orogen;
+        // the adjacent low-deformation continental interior subsides due to
+        // flexural loading.  Basin depth ∝ load × distance function.
+        //
+        // Use a wide propagation of convergent signal to identify the foreland.
+        // Basin forms where conv_wide is moderate (200–800 km from boundary)
+        // AND continental_frac is high (interior craton, not ocean).
+        // The basin is NEGATIVE topography relative to surroundings.
+        let mut basin_field = vec![0.0_f32; size];
+        let l_d_conv_km = 250.0;
+        for i in 0..size {
+            let cd = conv_def[i];
+            if cd < 0.005 || cd > 0.7 { continue; } // only in foreland zone
+
+            let cf = continental_frac[i];
+            if cf < 0.4 { continue; } // only continental interior
+
+            // Distance from convergent boundary
+            let d_km = -l_d_conv_km * cd.ln();
+
+            // Foredeep: Gaussian trough centered at ~200 km from orogen edge,
+            // width σ = 80 km (Beaumont 1981: foredeep 100–300 km wide).
+            let foredeep = (-((d_km - 200.0) / 80.0).powi(2) / 2.0).exp();
+
+            // Forebulge: subtle rise at ~400 km (Watts 2001 Fig 3.17).
+            let forebulge = (-((d_km - 400.0) / 60.0).powi(2) / 2.0).exp();
+
+            // Surface expression: foredeep −150 m, forebulge +30 m.
+            // These are SURFACE effects — the subsurface basin is km-deep
+            // but filled with sediment to near sea level.
+            // The surface expression is the underfilled portion.
+            let basin_depth = -150.0 * foredeep + 30.0 * forebulge;
+
+            basin_field[i] = basin_depth * cf; // fade at continent edges
+        }
+
+        // Heavy smoothing: basin is a long-wavelength feature
+        smooth_field(&mut basin_field, 15, grid);
+
+        for i in 0..size {
+            if relief[i] > 0.0 {
+                relief[i] += basin_field[i];
+                // Don't let basin push land below sea level
+                if relief[i] < 0.0 { relief[i] = 1.0; }
+            }
+        }
+    }
+
+    // --- 5d. Glacial erosion at high latitude/elevation (Hallet et al. 1996) ---
+    //
+    // Glacial processes truncate peaks above the equilibrium line altitude (ELA)
+    // and widen valleys.  At 10 km/cell, individual cirques and U-valleys are
+    // unresolvable; the effect manifests as:
+    //   (a) Elevation reduction above ELA ("glacial buzzsaw", Brozović et al. 1997)
+    //   (b) Broadened, flattened high plateaus
+    //
+    // ELA depends on latitude (Ohmura et al. 1992):
+    //   - Equator: ~5000 m
+    //   - 30°: ~4000 m
+    //   - 60°: ~1500 m
+    //   - 75°+: ~500 m (polar)
+    //
+    // Glacial intensity depends on latitude:
+    //   - Low latitudes (<30°): minimal glaciation (only highest peaks, dry)
+    //   - Mid latitudes (30–60°): mountain glaciers, moderate buzzsaw
+    //   - High latitudes (>60°): continental glaciation, strong buzzsaw
+    // This prevents unrealistic suppression of tropical/subtropical mountains
+    // (Andes, East Africa) where aridity limits glacial erosion.
+    {
+        for i in 0..size {
+            if relief[i] <= 0.0 { continue; }
+
+            let y = i / grid.width;
+            let lat_deg = ((y as f32 + 0.5) / grid.height as f32 * 180.0 - 90.0).abs();
+
+            // ELA from latitude (Ohmura et al. 1992, J. Glaciol.):
+            // Linear approximation: ELA ≈ 5200 − 62 × |lat|
+            // Clamp to 500 m minimum at polar latitudes.
+            let ela = (5200.0 - 62.0 * lat_deg).max(500.0);
+
+            let h = relief[i];
+            if h > ela {
+                // Glacial intensity: ramps from 0.15 at equator to 1.0 at poles.
+                // Low-latitude mountains (Andes, East Africa) have limited
+                // glaciation due to aridity and seasonal insolation.
+                let glacial_intensity = if lat_deg < 30.0 {
+                    0.15
+                } else if lat_deg < 60.0 {
+                    0.15 + 0.65 * (lat_deg - 30.0) / 30.0
+                } else {
+                    0.80 + 0.20 * ((lat_deg - 60.0) / 30.0).min(1.0)
+                };
+
+                // "Glacial buzzsaw" (Brozović et al. 1997, Science):
+                // peaks rarely exceed 2000 m above ELA.
+                // Max excess is larger at low glacial intensity.
+                let max_excess = 2500.0 - 1000.0 * glacial_intensity; // 1500–2500 m
+                let excess = h - ela;
+                // Tanh compression, modulated by glacial intensity
+                let compressed_excess = max_excess * (excess / max_excess).tanh();
+                let buzzsaw_h = ela + compressed_excess;
+                // Blend between original and buzzsawed based on intensity
+                relief[i] = h * (1.0 - glacial_intensity) + buzzsaw_h * glacial_intensity;
+            }
+        }
+    }
+
+    // --- 5e. Continental rift valleys (Buck 1991; Corti 2009) ---
+    //
+    // At divergent boundaries within continental lithosphere, extension
+    // creates rift valleys (grabens) 30–80 km wide, 1–3 km deep
+    // (East African Rift, Rhine Graben, Rio Grande Rift).
+    //
+    // The current model captures divergent SUBSIDENCE via crustal thinning
+    // (div_def reduces crust_thickness by up to 20 km).  But rift valleys
+    // have a distinctive shape: narrow trough flanked by uplifted rift
+    // shoulders (Weissel & Karner 1989, JGR).
+    //
+    // We add the rift SHOULDER uplift (flexural response to necking),
+    // which creates the characteristic double-peaked rift margin profile.
+    {
+        let l_d_div_km = 200.0; // must match propagation
+        for i in 0..size {
+            let dd = div_def[i];
+            if dd < 0.05 { continue; }
+
+            let cf = continental_frac[i];
+            if cf < 0.3 { continue; } // only continental rifts
+
+            // Distance from divergent boundary
+            let d_km = -l_d_div_km * dd.ln();
+
+            // Rift shoulder: uplifted flanks 50–150 km from rift axis
+            // (Weissel & Karner 1989: rift flank uplift 0.5–2 km).
+            // Gaussian peak at ~100 km from rift, width 40 km.
+            let shoulder = (-((d_km - 100.0) / 40.0).powi(2) / 2.0).exp();
+
+            // Shoulder amplitude: 400 m (modest — large rifts like EAR
+            // have 1–2 km but those are partially from hotspot interaction).
+            let shoulder_uplift = 400.0 * shoulder * cf * dd.min(1.0);
+
+            if relief[i] > 0.0 {
+                relief[i] += shoulder_uplift;
+            }
+        }
+    }
 
     progress.phase(progress_base, progress_span, 0.85);
 
