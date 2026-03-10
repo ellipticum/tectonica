@@ -2178,10 +2178,12 @@ fn compute_relief_physics(
     }
 
     // Smooth continental fraction to create gradual continent-ocean transition.
-    // 20 passes with 8-neighbor kernel ≈ σ ~4 cells ~80 km → 3σ ~240 km.
-    // Matches realistic passive margin width: shelf ~100 km + slope ~100 km
-    // (Bond et al. 1995; Watts 2001).
-    smooth_field(&mut continental_frac, 20, grid);
+    // 10 passes ≈ σ ~3 cells ~55 km → 3σ ~165 km shelf+slope.
+    // Bond et al. 1995 cite shelf widths 50–200 km; 10 passes sits at the
+    // median.  Previous 20 passes (σ ~80 km, 3σ ~240 km) over-smoothed
+    // continental outlines into featureless blobs — the extra width was
+    // redundant given the 34-pass flexural isostasy applied later.
+    smooth_field(&mut continental_frac, 10, grid);
 
     // Fine-scale noise in the smoothed transition zone.
     // Creates 50–200 km coastal irregularity (small bays, capes, islands).
@@ -2194,9 +2196,10 @@ fn compute_relief_physics(
                 let nx = cell_cache.noise_x[i];
                 let ny = cell_cache.noise_y[i];
                 let nz = cell_cache.noise_z[i];
-                let n = value_noise3(nx * 16.0 + 7.3, ny * 16.0 - 5.1, nz * 16.0, fine_seed) * 0.08
-                      + value_noise3(nx * 32.0 - 11.7, ny * 32.0 + 9.2, nz * 32.0, fine_seed.wrapping_add(1)) * 0.05
-                      + value_noise3(nx * 64.0 + 17.1, ny * 64.0 - 13.9, nz * 64.0, fine_seed.wrapping_add(2)) * 0.03;
+                let n = value_noise3(nx * 16.0 + 7.3, ny * 16.0 - 5.1, nz * 16.0, fine_seed) * 0.15
+                      + value_noise3(nx * 32.0 - 11.7, ny * 32.0 + 9.2, nz * 32.0, fine_seed.wrapping_add(1)) * 0.10
+                      + value_noise3(nx * 64.0 + 17.1, ny * 64.0 - 13.9, nz * 64.0, fine_seed.wrapping_add(2)) * 0.06
+                      + value_noise3(nx * 128.0 + 5.3, ny * 128.0 - 8.7, nz * 128.0, fine_seed.wrapping_add(3)) * 0.03;
                 continental_frac[i] = (cf + n * margin_factor).clamp(0.0, 1.0);
             }
         }
@@ -2231,18 +2234,33 @@ fn compute_relief_physics(
     //
     // Transform L_d = 150 km: San Andreas fault zone.
     // Bourne et al. 1998 cite 100–200 km for transcurrent shear zones.
-    let mut conv_def = propagate_deformation(&conv_seed, 250.0, grid);
+    // Convergent L_d = 180 km (was 250): produces ~540 km orogenic belts,
+    // matching Andes half-width ~250 km and Alps ~100 km.  Narrower zones
+    // create visually distinct ridges that divide territory into natural
+    // regions — essential for map readability.
+    let mut conv_def = propagate_deformation(&conv_seed, 180.0, grid);
     let mut div_def = propagate_deformation(&div_seed, 200.0, grid);
     let mut trans_def = propagate_deformation(&trans_seed, 150.0, grid);
 
     // Smooth propagated fields to diffuse angular Voronoi boundary structure.
-    // 8 passes ≈ σ ≈ 90 km — eliminates the 120°/60° angular wedges that
-    // max-dilation propagation inherits from Voronoi plate boundaries.
-    // Previous 3 passes (σ ≈ 35 km) left angular sector patterns visible
-    // because Voronoi cell features are 100–500 km scale.
-    smooth_field(&mut conv_def, 8, grid);
-    smooth_field(&mut div_def, 8, grid);
-    smooth_field(&mut trans_def, 8, grid);
+    // 5 passes ≈ σ ≈ 55 km — smooths the sharpest angular artifacts while
+    // preserving the linear ridge structure.  Previous 8 passes (σ ≈ 90 km)
+    // over-smoothed ridges into circular blobs.
+    smooth_field(&mut conv_def, 5, grid);
+    smooth_field(&mut div_def, 5, grid);
+    smooth_field(&mut trans_def, 5, grid);
+
+    // Sharpen deformation peaks: power-law concentration.
+    // d^1.5 steepens the profile: boundary crest stays near 1.0,
+    // but flanks drop faster.  This creates narrow, well-defined
+    // mountain ridges instead of broad rounded domes.
+    // Physically: strain localization in orogenic belts concentrates
+    // deformation at the boundary (Beaumont et al. 2001, Nature).
+    for i in 0..size {
+        conv_def[i] = conv_def[i].powf(1.5);
+        div_def[i] = div_def[i].powf(1.3);
+        trans_def[i] = trans_def[i].powf(1.3);
+    }
 
     // Thermal-age-based interior suppression (Artemieva & Mooney 2001).
     //
@@ -2614,6 +2632,31 @@ fn compute_relief_physics(
         for i in 0..size {
             relief[i] -= subsidence_field[i];
         }
+
+        // --- 4b½. Ocean floor texture ---
+        //
+        // Real ocean bathymetry has: (a) mid-ocean ridge crests (div boundaries
+        // are elevated ~2500 m above abyssal plain), (b) abyssal hills with
+        // 50–300 m relief at 5–50 km wavelength (Goff & Jordan 1988), and
+        // (c) fracture zone scarps.  Without this, the ocean is a featureless
+        // blue gradient that looks unrealistic.
+        let ocean_noise_seed = hash_u32(seed ^ 0x0CEA_4F10);
+        for i in 0..size {
+            if relief[i] >= 0.0 { continue; } // land: skip
+            let nx = cell_cache.noise_x[i];
+            let ny = cell_cache.noise_y[i];
+            let nz = cell_cache.noise_z[i];
+            // Abyssal hills: 3 octaves at 20–80 km wavelength
+            // RMS ≈ 100 m (Goff & Jordan 1988, J. Geophys. Res.)
+            let hills = value_noise3(nx * 50.0 + 2.3, ny * 50.0 - 1.7, nz * 50.0, ocean_noise_seed) * 120.0
+                      + value_noise3(nx * 100.0 - 5.1, ny * 100.0 + 3.9, nz * 100.0, ocean_noise_seed ^ 0xAB) * 60.0
+                      + value_noise3(nx * 200.0 + 8.7, ny * 200.0 - 6.3, nz * 200.0, ocean_noise_seed ^ 0xCD) * 30.0;
+            // Ridge proximity uplift: divergent boundaries are elevated
+            // (already captured by lower subsidence near ridges).
+            // Add small convergent trench deepening.
+            let trench = conv_def[i] * 800.0; // subduction trenches: 0.5–1 km deeper
+            relief[i] += hills - trench;
+        }
     }
     progress.phase(progress_base, progress_span, 0.15);
 
@@ -2638,23 +2681,22 @@ fn compute_relief_physics(
         for y in 0..grid.height {
             for x in 0..grid.width {
                 let i = y * grid.width + x;
-                // Use spherical 3D coordinates (from cell_cache) to avoid
-                // lattice-aligned diamond artifacts that flat UV noise produces
-                // at low frequencies — especially visible near poles where
-                // equirectangular projection compresses the X axis.
-                let sx = cell_cache.x_by_cell[i];
-                let sy = cell_cache.y_by_cell[i];
-                let sz = cell_cache.z_by_cell[i];
+                // Use spherical_fbm instead of raw value_noise3 to avoid
+                // lattice-aligned diamond artifacts at low frequencies.
+                // spherical_fbm uses domain rotation per octave (Rodrigues),
+                // breaking axis-aligned periodicity that creates visible
+                // diamond shapes at the ~8 lattice cells spanning the sphere.
+                let sx = cell_cache.noise_x[i];
+                let sy = cell_cache.noise_y[i];
+                let sz = cell_cache.noise_z[i];
 
-                // Two octaves of coherent noise at planetary scale
-                // Octave 1: ~5000 km wavelength (freq ≈ 8 cycles around equator)
-                // Scale 1.3 on unit sphere ≈ 8 lobes around equator
-                let f1 = value_noise3(sx * 1.3, sy * 1.3, sz * 1.3, dyn_seed) * 400.0;
-                // Octave 2: ~2500 km wavelength (freq ≈ 16)
-                let f2 = value_noise3(sx * 2.6 + 3.7, sy * 2.6 - 2.1, sz * 2.6 + 1.9, dyn_seed ^ 0x1234) * 200.0;
-                // Total: ±600 m amplitude, consistent with Hoggard et al. (2016)
-                // who find ±1 km residual topography globally.
-                let raw = f1 + f2;
+                // spherical_fbm at scale 0.6 → base freq 2.25×0.6 ≈ 1.35
+                // → ~8 lobes around equator (~5000 km wavelength).
+                // 5 octaves with persistence 0.52 naturally produce the
+                // multi-scale structure without visible lattice artifacts.
+                // Amplitude 600 m ≈ ±1 km peak (Hoggard et al. 2016).
+                let dyn_phase = dyn_seed as f32 * 0.0001;
+                let raw = spherical_fbm(sx * 0.6, sy * 0.6, sz * 0.6, dyn_phase) * 600.0;
 
                 // Modulate by tectonic activity: amplify near active boundaries,
                 // attenuate in stable interiors (where dynamic topography is weak
@@ -2731,9 +2773,12 @@ fn compute_relief_physics(
             let trans_uplift = trans_def[i] * 0.0003 * speed_factor * cf_scale;
             uplift[i] = conv_uplift + div_uplift + trans_uplift;
         }
-        // 10 passes (σ ≈ 100 km) — matches the ~200 km half-width of
-        // orogenic deformation zones (England & McKenzie 1982 Table 1).
-        smooth_field(&mut uplift, 10, grid);
+        // 4 passes (σ ≈ 40 km) — keeps uplift concentrated near boundary
+        // crests.  Previous 10 passes (σ ≈ 100 km) flattened ridges into
+        // wide circular domes.  The deformation field itself already
+        // provides the 180 km half-width; additional smoothing only erases
+        // the linear ridge structure that makes mountains readable.
+        smooth_field(&mut uplift, 4, grid);
 
         // Apply uplift to land cells
         let dt_myr = 1.5_f32; // 1.5 Myr of tectonic evolution
@@ -2744,16 +2789,16 @@ fn compute_relief_physics(
             }
         }
 
-        // Diffusive erosion: 20 passes of isotropic landscape smoothing.
+        // Diffusive erosion: 12 passes of isotropic landscape smoothing.
         // kappa_eff ≈ 0.02 m²/yr (Fernandes & Dietrich 1997),
         // dt = 1.5 Myr → kappa×dt/dx² ≈ 0.00031 per pass (CFL-safe).
-        // 20 passes = effective σ ≈ 35 km, representing ~30 Myr of
-        // integrated landscape diffusion.  Extended from 10 to eliminate
-        // sub-grid artifacts from noise and discretization without requiring
-        // a separate post-hoc smoothing pass (which was a non-physical hack).
+        // 12 passes = effective σ ≈ 27 km — sufficient to smooth sub-grid
+        // noise while preserving the ridge/valley contrast that makes
+        // terrain readable.  Previous 20 passes (σ ≈ 35 km) erased the
+        // elevation contrast between mountain crests and adjacent lowlands.
         let kdt = 0.02_f32 * dt_yr; // kappa × dt
         let inv_dx2 = 1.0 / (dx_m * dx_m);
-        for _ in 0..20 {
+        for _ in 0..12 {
             let mut laplacian = vec![0.0_f32; size];
             for y in 0..grid.height {
                 for x in 0..grid.width {
@@ -2893,7 +2938,10 @@ fn compute_relief_physics(
                         s,
                     ) * amp;
                 }
-                let elev_factor = (relief[i] / 5000.0).clamp(0.0, 1.0).sqrt();
+                // Elevation-dependent scaling: mountains get full amplitude,
+                // lowlands get 30% minimum (was 0% → coastal plains had no
+                // texture at all, making them look like flat blobs).
+                let elev_factor = (relief[i] / 5000.0).clamp(0.0, 1.0).sqrt().max(0.30);
                 relief[i] = (relief[i] + n * elev_factor).max(0.5);
             }
         }
@@ -2926,22 +2974,24 @@ fn compute_relief_physics(
     // (Wessel & Smith 1996, J. Geophys. Res.).
     {
         let coast_seed = hash_u32(seed ^ 0xC0A5_7111);
-        // Pass 1: large-scale coastal reshaping
-        let sigma1 = 1200.0_f32;
+        // Pass 1: large-scale coastal reshaping (200–1000 km embayments)
+        // σ = 2000 m: affects cells within ~±4000 m of sea level → wide
+        // reshaping zone for inland seas, major gulfs, and large peninsulas.
+        let sigma1 = 2000.0_f32;
         let inv_2sig2_1 = 1.0 / (2.0 * sigma1 * sigma1);
         for i in 0..size {
             let h = relief[i];
             let weight = (-h * h * inv_2sig2_1).exp();
-            if weight < 0.01 { continue; } // skip cells far from coast
+            if weight < 0.01 { continue; }
             let nx = cell_cache.noise_x[i];
             let ny = cell_cache.noise_y[i];
             let nz = cell_cache.noise_z[i];
-            let n1 = value_noise3(nx * 8.0, ny * 4.0, nz * 4.0, coast_seed) * 1000.0;
-            let n2 = value_noise3(nx * 16.0 + 3.7, ny * 8.0 - 1.3, nz * 8.0, coast_seed ^ 0x1111) * 500.0;
+            let n1 = value_noise3(nx * 3.0, ny * 3.0, nz * 3.0, coast_seed) * 1500.0;
+            let n2 = value_noise3(nx * 6.0 + 3.7, ny * 6.0 - 1.3, nz * 6.0, coast_seed ^ 0x1111) * 800.0;
             relief[i] += (n1 + n2) * weight;
         }
-        // Pass 2: medium-scale coastal detail
-        let sigma2 = 600.0_f32;
+        // Pass 2: medium-scale coastal detail (50–200 km bays, capes)
+        let sigma2 = 1000.0_f32;
         let inv_2sig2_2 = 1.0 / (2.0 * sigma2 * sigma2);
         let coast_seed2 = hash_u32(seed ^ 0xC0A5_7222);
         for i in 0..size {
@@ -2951,8 +3001,25 @@ fn compute_relief_physics(
             let nx = cell_cache.noise_x[i];
             let ny = cell_cache.noise_y[i];
             let nz = cell_cache.noise_z[i];
-            let n1 = value_noise3(nx * 32.0 + 5.1, ny * 16.0 - 2.7, nz * 16.0, coast_seed2) * 300.0;
-            let n2 = value_noise3(nx * 64.0 - 1.9, ny * 32.0 + 3.3, nz * 32.0, coast_seed2 ^ 0x2222) * 150.0;
+            let n1 = value_noise3(nx * 12.0 + 5.1, ny * 12.0 - 2.7, nz * 12.0, coast_seed2) * 500.0;
+            let n2 = value_noise3(nx * 24.0 - 1.9, ny * 24.0 + 3.3, nz * 24.0, coast_seed2 ^ 0x2222) * 250.0;
+            relief[i] += (n1 + n2) * weight;
+        }
+        // Pass 3: fine-scale fractal detail (10–50 km fjords, small islands)
+        // High-frequency noise creates the jagged, fractal coastline texture
+        // that makes maps look realistic (Richardson 1961, D ≈ 1.25).
+        let sigma3 = 500.0_f32;
+        let inv_2sig2_3 = 1.0 / (2.0 * sigma3 * sigma3);
+        let coast_seed3 = hash_u32(seed ^ 0xC0A5_7333);
+        for i in 0..size {
+            let h = relief[i];
+            let weight = (-h * h * inv_2sig2_3).exp();
+            if weight < 0.01 { continue; }
+            let nx = cell_cache.noise_x[i];
+            let ny = cell_cache.noise_y[i];
+            let nz = cell_cache.noise_z[i];
+            let n1 = value_noise3(nx * 48.0 + 9.3, ny * 48.0 - 4.1, nz * 48.0, coast_seed3) * 200.0;
+            let n2 = value_noise3(nx * 96.0 - 7.5, ny * 96.0 + 6.2, nz * 96.0, coast_seed3 ^ 0x3333) * 100.0;
             relief[i] += (n1 + n2) * weight;
         }
     }
