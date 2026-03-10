@@ -1,7 +1,7 @@
-# Tectonica — Blueprint (март 2026, аудит v2)
+# Tectonica — Blueprint (март 2026, аудит v3)
 
 Процедурная генерация планет на основе геофизики.
-Движок: `rust/planet_engine/src/lib.rs` (Rust → WASM, ~5800 строк).
+Движок: `rust/planet_engine/src/lib.rs` (Rust → WASM, ~6500+ строк).
 
 ---
 
@@ -17,10 +17,23 @@
 | Тепловая субсидия | d = 350√t / GDH1 плиточная модель | Parsons & Sclater 1977; Stein & Stein 1992 |
 | Флексуральная изостазия | N = α²/(2dx²) = 34 прохода из Te=25 км | Watts 2001 |
 | Тип породы → K_eff | Деформация → метаморфическая ступень | Harel et al. 2016; Bucher & Grapes 2011 |
-| Uplift (planet) | conv×2e-3 + div×(−1e-3) + trans×3e-4 [m/yr] | England & McKenzie 1982 |
-| Диффузия рельефа | κ = 0.02 m²/yr, 10 шагов | Fernandes & Dietrich 1997 |
+| Uplift (planet) | England & McKenzie 1982 crustal thickening | England & McKenzie 1982 |
+| Деформация | Lyakhovsky et al. 1997 damage rheology + strain localization | Lyakhovsky et al. 1997 |
+| Диффузия рельефа | κ = climate-dependent (Hadley cell), 10 шагов | Fernandes & Dietrich 1997; Roe 2003 |
 | Изостатическая релаксация | τ_eff = 5 Myr → f_relax = 0.26 | Watts 2001 §8.4 |
-| Динамическая топография | 2 октавы ±600м, λ=5000/2500 км | Hager 1985; Hoggard 2016 |
+| Динамическая топография | Slab-pull −600м + ridge upwelling +300м + mantle ±300м | Hager 1985; Flament 2013 |
+| Вулканические дуги | 166 км от тренча, σ=40 км, конт. 1000м / ост. 600м | Syracuse & Abers 2006 |
+| Хотспоты | 5-15 вулканических свеллов, R=500-800 км, 800-1500 м | Morgan 1971; Crough 1983 |
+| Форландовые бассейны | Foredeep −150м на 200 км, forebulge +30м на 400 км | DeCelles & Giles 1996 |
+| Гляциальная пила | ELA = 5200 − 62×|lat|, широтно-зависимая интенсивность | Brozović et al. 1997 |
+| Рифтовые плечи | Гауссовый пик на 100 км от рифта, 400м × cf | Weissel & Karner 1989 |
+| Срединно-океанические хребты | Осевой гребень, тренч, трансформ. разломы | Macdonald 1982; Stern 2002 |
+| Эпейрогенический варпинг | ±200 м тилтинг континентов от мантийной конвекции | Mitrovica 1989; Bond 1976 |
+| Задуговые бассейны | −800м (океан) / −300м (конт.) на 350 км от тренча | Karig 1971; Sdrolias & Müller 2006 |
+| Кратонные пенеплены | Выравнивание к 300м при activity<0.1, cf>0.6 | King 1967; Fairbridge 1980 |
+| Океанические плато (LIPs) | 3-8 плато, R=400-1000 км, H=1500-3000м | Coffin & Eldholm 1994 |
+| Профиль шельфа | Shelf break −130м, BFS от берега, 15 ячеек | Kennett 1982; Emery & Uchupi 1984 |
+| Перераспределение осадков | 60% на суше (Milliman & Syvitski 1992) | Allen 2008; Paola & Voller 2005 |
 | Спектральный шум рельефа | β=2.0, 4 октавы | Huang & Turcotte 1989 |
 | Гауссова пертурбация берегов | σ=1200/600м, два прохода | Wessel & Smith 1996 |
 | Температура | Полином 4-й степени + лапс-рейт + парник | Peixoto & Oort 1992; Pierrehumbert 2010 |
@@ -95,12 +108,12 @@ structural_field = clamp(0.5 + 0.5 × (0.62×low + 0.38×mid))
 scale = 0.4 + 0.6 × activity
 ```
 
-40% в стабильных кратонах, 100% у активных границ. Artemieva (2009)
-подтверждает качественную тенденцию но не конкретные числа.
+40% в стабильных кратонах, 100% у активных границ.
 
-**Статус**: 🟡 Разумное приближение. Улучшение: модулировать амплитуду
-литосферным возрастом (толстая кратонная литосфера реально подавляет
-динамическую топографию на 50-80%).
+**Статус**: ✅ **Устранено** (март 2026). Заменено структурной динамической
+топографией: slab-pull (−600м, conv_wide 1000km decay), ridge upwelling
+(+300м, div_wide 800km), deep mantle noise (±300м). Кратонная аттенюация
+сохранена как физически обоснованная (Artemieva 2009).
 
 ---
 
@@ -229,20 +242,13 @@ let eff_dist = (land_dist + pn).max(0.0);
 ---
 
 ### H13: Равномерный сток (runoff = 0.4 м/год)
-**Файл**: строка 4621
 
-```
-let runoff = 0.4_f32; // м/год — глобальное среднее (Fekete et al. 2002)
-```
-
-Применяется равномерно ко всем ячейкам. Реально: Сахара <5 мм/год,
-Амазония >3000 мм/год. Ошибка × 600.
-
-**Статус**: 🔴 Значимое упрощение. SPACE эрозия использует сток для
-вычисления концентрации взвеси (D_s = V_s × Q_s / Q). С постоянным Q
-вся пространственная изменчивость депонирования потеряна.
-
-**Целевое исправление (Phase 2.3)**: `runoff[i] = precipitation[i] × infiltration_factor`
+**Статус**: ✅ **Устранено** (март 2026).
+- Planet scope: климато-зависимый κ через модель ячеек Хэдли (Roe 2003).
+  ITCZ ×1.5, субтропики ×0.3, умеренные ×1.0, полярные ×0.4.
+  Континентальная аридность: 1.0 − 0.4×cf.
+- Crop scope (SPACE): runoff[i] = precipitation[i] × 0.001 × 0.4
+  (pre-SPACE climate call → пространственно-переменный сток).
 
 ---
 
@@ -276,19 +282,14 @@ score = mix_score × coast_norm × elev_norm × boundary_norm + noise×0.3
 ---
 
 ### H16: Maintenance uplift не учитывает изостатический rebounds
-**Файл**: строки 5461–5469 (текущая реализация)
 
-Maintenance uplift = const × deformation_field. Не учитывает тот факт что
-SPACE эрозия должна запускать изостатическую разгрузку:
-`U_isostasy = erosion_rate × ρ_c/(ρ_m − ρ_c) ≈ erosion_rate × 2.8`
-
-Без этой обратной связи глубоко врезанные реки не вызывают uplift горных
-хребтов — одна из важнейших обратных связей в геоморфологии
-(Molnar & England 1990, Nature).
-
-**Статус**: 🔴 Важная отсутствующая физика. Без изостатической разгрузки
-crop-scope горы эродируются быстрее чем поднимаются, и долины не углубляются
-пропорционально.
+**Статус**: ✅ **Устранено** (март 2026). Изостатическая разгрузка
+интегрирована в B&W solver:
+```
+iso_factor = factor × (ρ_m − ρ_c) / ρ_m
+z_new = (z_old + U×dt + iso_factor × z_recv) / (1 + iso_factor)
+```
+Molnar & England 1990 feedback теперь корректно работает.
 
 ---
 
@@ -322,15 +323,15 @@ let center_w = 0.586 * neighbor_sum;
 
 ## Отсутствующая физика (пробелы модели)
 
-| # | Процесс | Последствие пропуска | Приоритет |
-|---|---------|---------------------|----------|
-| G1 | Осадочная нагрузка | Шельфы слишком крутые | Низкий |
-| G2 | Климат-эрозия связь | Постоянный сток, нет asymmetric valleys | **Высокий** (Phase 2.3) |
-| G3 | Изостатическая разгрузка от эрозии | Crop горы без rebound | **Высокий** (Phase H16) |
-| G4 | Возраст литосферы → K_eff | Старые породы не твёрже | Средний |
-| G5 | Вулканические острова (hotspot) | Нет гавайского типа | Низкий |
-| G6 | Эвстазия | Нет изменений уровня моря | Низкий |
-| G7 | Sub-grid channel width correction | K_eff не масштабируется с dx | Средний (Phase G7) |
+| # | Процесс | Последствие пропуска | Приоритет | Статус |
+|---|---------|---------------------|----------|--------|
+| G1 | Осадочная нагрузка | Шельфы слишком крутые | Низкий | ✅ Частично: профиль шельфа + перераспр. осадков |
+| G2 | Климат-эрозия связь | Постоянный сток, нет asymmetric valleys | **Высокий** | ✅ Hadley cell κ + climate runoff в SPACE |
+| G3 | Изостатическая разгрузка от эрозии | Crop горы без rebound | **Высокий** | ✅ B&W iso_factor в SPACE |
+| G4 | Возраст литосферы → K_eff | Старые породы не твёрже | Средний | ❌ Открыто |
+| G5 | Вулканические острова (hotspot) | Нет гавайского типа | Низкий | ✅ 5-15 hotspot swells |
+| G6 | Эвстазия | Нет изменений уровня моря | Низкий | ❌ Открыто |
+| G7 | Sub-grid channel width correction | K_eff не масштабируется с dx | Средний | ❌ Открыто |
 
 ---
 
@@ -348,77 +349,75 @@ let center_w = 0.586 * neighbor_sum;
 | Фев 2026 | Stale receiver в SPACE | Обновлённый приёмник (Braun & Willett 2013) |
 | Мар 2026 | V_s=0.5, F_f=0.25 → заполнение каналов | V_s=0.1, F_f=0.5, H*=2.0 |
 | Мар 2026 | Uplift crop = полные тектонические скорости | 33% maintenance (Willett & Brandon 2002) |
+| Мар 2026 | Произвольные uplift коэффициенты | England & McKenzie 1982 crustal thickening |
+| Мар 2026 | Линейная пропагация деформации | Lyakhovsky 1997 damage rheology (strain localization) |
+| Мар 2026 | Шумовая динамическая топография | Slab-pull + ridge upwelling (Hager 1985; Flament 2013) |
+| Мар 2026 | Нет вулканических дуг | Syracuse & Abers 2006: arc at 166km from trench |
+| Мар 2026 | Нет хотспотов | Morgan 1971 / Crough 1983: 5-15 swells |
+| Мар 2026 | Нет форландовых бассейнов | DeCelles & Giles 1996: foredeep + forebulge |
+| Мар 2026 | Нет гляциальной эрозии | Brozović 1997: latitude-dependent ELA buzzsaw |
+| Мар 2026 | Нет рифтовых плеч | Weissel & Karner 1989: uplift at 100km from rift |
+| Мар 2026 | Равномерный κ | Roe 2003: Hadley cell climate-dependent κ |
+| Мар 2026 | Плоский шельф | Kennett 1982: shelf break at −130m, BFS profile |
+| Мар 2026 | Нет перераспределения осадков | Milliman & Syvitski 1992: 60% на суше |
+| Мар 2026 | Нет кратонных пенепленов | King 1967: выравнивание при low activity |
+| Мар 2026 | Нет океанических плато | Coffin & Eldholm 1994: 3-8 LIPs |
+| Мар 2026 | Плоское океаническое дно у хребтов | Macdonald 1982: ridge/trench/fracture topography |
+| Мар 2026 | Нет эпейрогенического варпинга | Mitrovica 1989; Bond 1976: ±200m continental tilt |
+| Мар 2026 | Нет задуговых бассейнов | Karig 1971; Sdrolias & Müller 2006: back-arc extension |
 
 ---
 
 ## Приоритеты улучшений
 
-### 🔴 Высокий приоритет (значимая физика, достижимо)
+### ✅ Завершённые фазы (март 2026)
 
-#### Phase H16: Изостатическая разгрузка от эрозии (crop pipeline)
-**Проблема**: SPACE эрозия удаляет материал, но нет изостатического
-подъёма в ответ. Реально: Molnar & England (1990) показали что
-эрозия → isostatic rebound → дополнительный uplift.
-
-**Решение**: После каждого SPACE шага:
-```
-erosion_thickness = (z_old - z_new) / rho_c * rho_m  // по столбцу
-uplift_isostatic = erosion_thickness * rho_c / (rho_m - rho_c)
-                 ≈ erosion × 2.8  (для rho_c=2750, rho_m=3300)
-```
-Применять как дополнительный uplift в следующем шаге.
-
-**Научное основание**: Molnar & England 1990, Nature; Isacks 1992;
-Tomkin & Roe 2007, Geophys. Res. Lett.
-
----
-
-#### Phase 2.3: Климат-эрозия связь (Roe et al. 2003)
-**Проблема**: SPACE runoff = 0.4 м/год везде. Нет связи precipitation → Q.
-
-**Решение**:
-```
-runoff[i] = precipitation[i] * infiltration(biome)
-K_eff_climate[i] = K_br[i] * (runoff[i] / runoff_mean)^alpha  // alpha=1.0
-```
-
-**Результат**: Windward slopes erode faster → asymmetric valleys;
-leeward → rain shadow plains.
-
-**Научное основание**: Roe et al. 2003, J. Geophys. Res.; Whipple 2009.
+| Фаза | Описание | Источник |
+|------|----------|---------|
+| Level 0 | Замена fudge factors на физику (E&M uplift, Lyakhovsky deformation) | England & McKenzie 1982; Lyakhovsky 1997 |
+| Level 1.1 | Вулканические дуги на субдукционных зонах | Syracuse & Abers 2006 |
+| Level 1.2 | Структурная динамическая топография (slab-pull, ridge, mantle) | Hager 1985; Flament 2013 |
+| Level 1.3 | Хотспотовый вулканизм (5-15 свеллов) | Morgan 1971; Crough 1983 |
+| Level 2.1 | Форландовые бассейны (foredeep + forebulge) | DeCelles & Giles 1996 |
+| Level 2.2 | Гляциальная пила (ELA-зависимая) | Brozović et al. 1997 |
+| Level 2.3 | Рифтовые плечи | Weissel & Karner 1989 |
+| Level 3.1 | Климато-зависимая эрозия (Hadley cell κ) | Roe et al. 2003 |
+| Level 3.2 | Профиль континентального шельфа | Kennett 1982 |
+| Level 4.1 | Перераспределение осадков | Milliman & Syvitski 1992 |
+| Level 4.2 | Кратонные пенеплены | King 1967 |
+| Level 4.3 | Океанические плато / LIPs | Coffin & Eldholm 1994 |
+| Level 5.1 | Срединно-океанические хребты, тренчи, трансформные разломы | Macdonald 1982; Stern 2002 |
+| Level 5.2 | Эпейрогенический варпинг (±200м тилт континентов) | Mitrovica 1989; Bond 1976 |
+| Level 5.3 | Задуговые бассейны | Karig 1971; Sdrolias & Müller 2006 |
+| Phase H13 | Climate-coupled runoff в SPACE | Roe 2003 |
+| Phase H16 | Изостатическая разгрузка от эрозии в B&W solver | Molnar & England 1990 |
 
 ---
 
-### 🟡 Средний приоритет
+### 🟡 Средний приоритет (оставшиеся задачи)
 
 #### Phase 1.2: Единый crop scope (убрать island blob)
 **Проблема**: `fade_land_edges=true` уничтожает форму острова.
 Blob shape вместо реальных очертаний.
 
 **Решение**: Найти регион где планетная суша УЖЕ окружена океаном
-на 3+ сторонах → не нужен edge fade. Изменить `find_interesting_region`
-для поиска "enclosed land mass" вместо "mixed land/ocean window".
-
-```
-score += enclosed_bonus * (4 - land_sides)  // prefer fewer land borders
-```
+на 3+ сторонах → не нужен edge fade.
 
 **Статус**: Архитектурный рефакторинг, не физика. Но важно визуально.
+
+---
+
+#### Phase G4: Возраст литосферы → K_eff
+**Проблема**: Старые кратонные породы не твёрже молодых.
+**Решение**: Модулировать K_eff по тектонической активности/возрасту.
 
 ---
 
 #### Phase G7: Sub-grid channel width correction
 **Проблема**: K_eff не масштабируется с шириной канала.
 Pelletier (2010): `K_eff_corrected = K_eff × W_ch / dx`
-где W_ch = channel width ∝ A^0.4 (Leopold & Maddock 1953).
 
-**Решение**:
-```
-w_ch = k_w * area[i].powf(0.4)  // Leopold & Maddock scaling
-k_eff_corrected = k_br[i] * (w_ch / dx_m).clamp(0.01, 1.0)
-```
-
-**Научное основание**: Pelletier 2010, Geomorphology; Leopold & Maddock 1953.
+**Научное основание**: Pelletier 2010; Leopold & Maddock 1953.
 
 ---
 
@@ -428,6 +427,7 @@ k_eff_corrected = k_br[i] * (w_ch / dx_m).clamp(0.01, 1.0)
 - **H9**: Hypsometric trigger — редко срабатывает
 - **H10, H11**: Coastal/biome cleanup — неустранимо при данном разрешении
 - **H18**: Center weight 0.586 — незначимо
+- **G6**: Эвстазия — нет изменений уровня моря (низкий приоритет)
 
 ---
 
