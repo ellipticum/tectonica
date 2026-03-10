@@ -3026,14 +3026,57 @@ fn compute_relief_physics(
             }
         }
 
-        // Diffusive erosion: 12 passes of isotropic landscape smoothing.
-        // kappa_eff ≈ 0.02 m²/yr (Fernandes & Dietrich 1997),
-        // dt = 1.5 Myr → kappa×dt/dx² ≈ 0.00031 per pass (CFL-safe).
-        // 12 passes = effective σ ≈ 27 km — sufficient to smooth sub-grid
-        // noise while preserving the ridge/valley contrast that makes
-        // terrain readable.  Previous 20 passes (σ ≈ 35 km) erased the
-        // elevation contrast between mountain crests and adjacent lowlands.
-        let kdt = 0.02_f32 * dt_yr; // kappa × dt
+        // Climate-dependent diffusive erosion (Roe et al. 2003; Whipple 2009).
+        //
+        // Erosion rate depends on precipitation (runoff drives incision and
+        // mass wasting).  At 10 km/cell, κ_eff integrates all surface
+        // processes: hillslope creep, mass wasting, sheet wash, weathering.
+        //
+        // Base: κ₀ = 0.02 m²/yr (Fernandes & Dietrich 1997).
+        // Climate modulation: κ_eff = κ₀ × f_climate
+        //   f_climate from latitude-based Hadley precipitation pattern:
+        //   - ITCZ (0–15°): f = 1.5 (wet tropics, high weathering)
+        //   - Subtropical deserts (15–30°): f = 0.3 (arid, minimal erosion)
+        //   - Temperate (30–60°): f = 1.0 (moderate, reference value)
+        //   - Polar (60–90°): f = 0.4 (cold, slow chemical weathering)
+        //
+        // Continental aridity: interior cells (far from coast) get reduced κ
+        // (Scanlon et al. 2006: continental interior receives 30–60% of
+        // coastal precipitation).
+        //
+        // 12 passes, CFL-safe with per-cell κ.
+
+        // Pre-compute climate factor per cell.
+        let mut climate_factor = vec![1.0_f32; size];
+        for y in 0..grid.height {
+            let lat_deg = ((y as f32 + 0.5) / grid.height as f32 * 180.0 - 90.0).abs();
+
+            // Hadley-cell precipitation pattern (Hartmann 1994):
+            let f_lat = if lat_deg < 15.0 {
+                // ITCZ: high precipitation, intense chemical weathering
+                1.5 - 0.5 * (lat_deg / 15.0) // 1.5 at equator → 1.0 at 15°
+            } else if lat_deg < 30.0 {
+                // Subtropical subsidence → desert
+                1.0 - 0.7 * ((lat_deg - 15.0) / 15.0) // 1.0 at 15° → 0.3 at 30°
+            } else if lat_deg < 60.0 {
+                // Temperate: Ferrel cell brings moisture
+                0.3 + 0.7 * ((lat_deg - 30.0) / 30.0) // 0.3 at 30° → 1.0 at 60°
+            } else {
+                // Polar: cold, low precipitation, slow weathering
+                1.0 - 0.6 * ((lat_deg - 60.0) / 30.0).min(1.0) // 1.0 at 60° → 0.4 at 90°
+            };
+
+            for x in 0..grid.width {
+                let i = y * grid.width + x;
+                // Continental aridity: reduce erosion far from coasts
+                // e-folding distance ~1000 km (Galewsky 2009)
+                let cf = continental_frac[i];
+                let cont_dry = 1.0 - 0.4 * cf; // 60% at deep interior
+                climate_factor[i] = (f_lat * cont_dry).clamp(0.2, 2.0);
+            }
+        }
+
+        let kappa_base = 0.02_f32;
         let inv_dx2 = 1.0 / (dx_m * dx_m);
         for _ in 0..12 {
             let mut laplacian = vec![0.0_f32; size];
@@ -3051,6 +3094,7 @@ fn compute_relief_physics(
             }
             for i in 0..size {
                 if relief[i] > 0.0 {
+                    let kdt = kappa_base * climate_factor[i] * dt_yr;
                     relief[i] = (relief[i] + kdt * laplacian[i]).max(0.0);
                 }
             }
@@ -3297,6 +3341,88 @@ fn compute_relief_physics(
     let sea_level = sorted[cut_idx];
     for v in relief.iter_mut() {
         *v -= sea_level;
+    }
+
+    // --- 7b. Continental shelf profile (Kennett 1982; Emery & Uchupi 1984) ---
+    //
+    // Real continental margins have a distinctive profile:
+    //   - Shelf: 0 to −130 m, width 50–200 km, slope <0.1°
+    //   - Shelf break: abrupt steepening at ~130 m depth
+    //   - Continental slope: 3°–8° grade, 130–3000 m depth
+    //   - Continental rise: gradual flattening below ~3000 m
+    //
+    // The isostatic model produces a SMOOTH continent-ocean transition.
+    // We reshape underwater cells near the coast to create the shelf break.
+    // Method: identify cells between 0 and −200 m, flatten them toward
+    // the shelf depth (~80 m average), creating a flat shelf with an
+    // abrupt transition to the slope.
+    {
+        // BFS distance from the coastline (land/ocean boundary) in cells.
+        let mut shelf_dist = vec![u32::MAX; size];
+        let mut shelf_queue: VecDeque<usize> = VecDeque::with_capacity(size / 50);
+        for y in 0..grid.height {
+            for x in 0..grid.width {
+                let i = grid.index(x, y);
+                if relief[i] > 0.0 { continue; } // ocean cell
+                // Check if any neighbor is land → this is a coastal ocean cell
+                let mut near_land = false;
+                for (dx2, dy2) in [(-1_i32, 0), (1, 0), (0, -1_i32), (0, 1)] {
+                    let j = grid.neighbor(x as i32 + dx2, y as i32 + dy2);
+                    if relief[j] > 0.0 { near_land = true; break; }
+                }
+                if near_land {
+                    shelf_dist[i] = 0;
+                    shelf_queue.push_back(i);
+                }
+            }
+        }
+        // BFS propagation (ocean cells only)
+        while let Some(ci) = shelf_queue.pop_front() {
+            let cd = shelf_dist[ci];
+            if cd > 25 { continue; } // max ~250 km shelf width
+            let cx = ci % grid.width;
+            let cy = ci / grid.width;
+            for (dx2, dy2) in [(-1_i32, 0), (1, 0), (0, -1_i32), (0, 1)] {
+                let j = grid.neighbor(cx as i32 + dx2, cy as i32 + dy2);
+                if relief[j] >= 0.0 { continue; } // skip land
+                let nd = cd + 1;
+                if nd < shelf_dist[j] {
+                    shelf_dist[j] = nd;
+                    shelf_queue.push_back(j);
+                }
+            }
+        }
+
+        // Reshape near-coast ocean cells to shelf profile.
+        let shelf_break_depth = -130.0_f32; // Kennett 1982: 100–200 m
+        let shelf_width_cells = 15_u32; // ~150 km (Earth mean ~75 km, range 30–400 km)
+        for i in 0..size {
+            let d = shelf_dist[i];
+            if d == u32::MAX || relief[i] >= 0.0 { continue; }
+
+            if d < shelf_width_cells {
+                // On the shelf: flatten toward gradual shelf depth.
+                // Shelf deepens gently from coast: ~8 m/cell ≈ 0.08°
+                let shelf_target = -(d as f32 * 8.0 + 10.0); // -10 to -130 m
+                let shelf_target = shelf_target.max(shelf_break_depth);
+
+                // Blend between current depth and shelf target.
+                // Stronger blending for shallower cells (more confident
+                // they should be shelf), weaker for deeper cells.
+                let current = relief[i];
+                let blend = if current > shelf_break_depth {
+                    0.7 // shallow: strongly reshape to shelf
+                } else {
+                    0.3 // near shelf break: moderate reshaping
+                };
+                relief[i] = current * (1.0 - blend) + shelf_target * blend;
+            } else if d < shelf_width_cells + 5 {
+                // Shelf break transition: steepen the gradient.
+                // This is the 5-cell zone where shelf meets slope.
+                // Don't modify — let the natural isostatic gradient create
+                // the continental slope.
+            }
+        }
     }
 
     // --- 8. ETOPO1-calibrated terrain detail noise ---
