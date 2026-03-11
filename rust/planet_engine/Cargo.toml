@@ -6,8 +6,19 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "planet_cli"
+path = "src/bin/planet_cli.rs"
+required-features = ["cli"]
+
+[features]
+default = []
+cli = ["serde_json", "image"]
+
 [dependencies]
-wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
+wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
+serde_json = { version = "1", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "bmp"] }

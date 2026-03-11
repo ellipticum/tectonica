@@ -187,6 +187,179 @@ function biomeColor(id) {
   }
 }
 
+// --- Satellite / natural-color palette ---
+// Landsat-like base colors per biome (R, G, B).
+// These mimic what Landsat true-color composites show for each biome.
+const SAT_BIOME = [
+  [15,  45,  90],   // 0  Ocean (deep dark blue)
+  [215, 220, 228],  // 1  Tundra/Ice (pale gray-white)
+  [45,  72,  42],   // 2  Boreal/Taiga (dark olive)
+  [32,  88,  38],   // 3  Temperate Forest (medium green)
+  [145, 148, 72],   // 4  Temperate Grassland (olive yellow-green)
+  [128, 118, 62],   // 5  Mediterranean (dry olive-tan)
+  [12,  62,  28],   // 6  Tropical Rainforest (deep dark green)
+  [95,  120, 55],   // 7  Tropical Savanna (olive green)
+  [195, 170, 125],  // 8  Desert (sandy tan)
+  [28,  95,  48],   // 9  Subtropical Forest (green)
+  [115, 100, 82],   // 10 Alpine (gray-brown rock)
+  [162, 155, 95],   // 11 Steppe (dry yellow)
+];
+
+// Ocean gradient for satellite view (shallow → deep)
+const SAT_OCEAN_STOPS = [
+  { t: 0,    color: [110, 160, 190] }, // very shallow (turquoise-ish)
+  { t: 0.08, color: [55,  105, 155] }, // shelf
+  { t: 0.25, color: [30,  72,  130] }, // mid-depth
+  { t: 0.50, color: [18,  52,  108] }, // deep
+  { t: 0.80, color: [10,  35,  82]  }, // abyss
+  { t: 1.0,  color: [8,   25,  65]  }, // trench
+];
+
+function satelliteColor(i, x, y, heightMap, biomeMap, temperatureMap, precipitationMap,
+                        riverMap, lakeMap, slopeMap, width, height, minH, maxH, wrapX) {
+  const h = heightMap[i];
+
+  // --- Ocean ---
+  if (h < 0) {
+    const depthT = Math.pow(clamp(-h / Math.max(1, -minH), 0, 1), 0.55);
+    const base = sampleStops(SAT_OCEAN_STOPS, depthT);
+    // Shallow water near coast: turquoise tint
+    if (depthT < 0.08) {
+      const shallowMix = 1.0 - depthT / 0.08;
+      base[0] = Math.round(base[0] + (80 - base[0]) * shallowMix * 0.35);
+      base[1] = Math.round(base[1] + (155 - base[1]) * shallowMix * 0.35);
+      base[2] = Math.round(base[2] + (150 - base[2]) * shallowMix * 0.2);
+    }
+    // Ocean hillshade for underwater terrain
+    const oShade = landHillshade(heightMap, width, height, x, y, wrapX);
+    const oFactor = clamp(0.92 + (oShade - 0.82) * 0.6, 0.88, 1.06);
+    return [
+      Math.round(clamp(base[0] * oFactor, 0, 255)),
+      Math.round(clamp(base[1] * oFactor, 0, 255)),
+      Math.round(clamp(base[2] * oFactor, 0, 255)),
+    ];
+  }
+
+  // --- Land: continuous color from climate + elevation ---
+  const precip = precipitationMap[i];
+  const temp = temperatureMap[i];
+  const biome = biomeMap[i];
+
+  // NDVI proxy: vegetation density from temperature and precipitation.
+  // Plants need warmth + water.  Miami model NPP simplified.
+  const vegT = clamp((temp - (-5)) / 30, 0, 1);     // 0 at -5°C, 1 at 25°C
+  const vegP = clamp(precip / 900, 0, 1);             // 0 at 0mm, 1 at 900mm (temperate forests)
+  const ndvi = Math.pow(vegT * vegP, 0.65);           // 0=barren, 1=lush; concave to boost mid-range
+
+  // Base terrain palette: interpolate between dry ground and lush vegetation.
+  // Dry ground (NDVI≈0): warm tan
+  const dryR = 168, dryG = 152, dryB = 118;
+  // Lush vegetation (NDVI≈1): rich green
+  const lushR = 15, lushG = 85, lushB = 25;
+
+  // Smooth NDVI curve (avoid sharp cutoffs)
+  const v = Math.pow(ndvi, 0.7);
+  let r = dryR + (lushR - dryR) * v;
+  let g = dryG + (lushG - dryG) * v;
+  let b = dryB + (lushB - dryB) * v;
+
+  // Desert biome override: force sandy even if precip has some moisture
+  if (biome === 8) {
+    const desertMix = 0.6;
+    r = r + (195 - r) * desertMix;
+    g = g + (172 - g) * desertMix;
+    b = b + (130 - b) * desertMix;
+  }
+
+  // Tropical rainforest: extra deep green
+  if (biome === 6 && ndvi > 0.4) {
+    const deepMix = 0.3;
+    r = r + (8 - r) * deepMix;
+    g = g + (55 - g) * deepMix;
+    b = b + (22 - b) * deepMix;
+  }
+
+  // --- Elevation: higher → exposed rock ---
+  // Gradual transition to rock color at high elevation.
+  const rockStart = 1200;
+  const rockFull = 4500;
+  const rockT = clamp((h - rockStart) / (rockFull - rockStart), 0, 1);
+  if (rockT > 0) {
+    // Rock color varies with slope (steeper = darker)
+    const slope = slopeMap[i];
+    const steepness = clamp(slope / 0.8, 0, 1);
+    const rockR = 140 - steepness * 35;
+    const rockG = 125 - steepness * 30;
+    const rockB = 105 - steepness * 25;
+    // Mix: vegetation thins out before full rock
+    const treeline = clamp(rockT * 1.5, 0, 1); // treeline fades early
+    const vegRemaining = (1.0 - treeline) * ndvi;
+    const rockMix = rockT * (1.0 - vegRemaining * 0.5);
+    r = r + (rockR - r) * rockMix;
+    g = g + (rockG - g) * rockMix;
+    b = b + (rockB - b) * rockMix;
+  }
+
+  // --- Snow/ice ---
+  const latDeg = 90 - (y + 0.5) * (180 / height);
+  const absLat = Math.abs(latDeg);
+  const snowline = 5200 - 62 * absLat;
+  // Snow above ELA: gradual onset over 1200 m
+  const snowElev = clamp((h - snowline) / 1200, 0, 1);
+  // Polar/tundra snow at ground level
+  const polarSnow = (biome === 1) ? clamp((absLat - 60) / 20, 0, 0.7) : 0;
+  // Cold high peaks
+  const coldPeak = clamp((-temp - 10) / 20, 0, 0.4) * clamp(h / 2000, 0, 1);
+  const snowAmount = clamp(Math.max(snowElev, polarSnow, coldPeak), 0, 0.95);
+  if (snowAmount > 0) {
+    // Snow: slightly blue-white (varies with amount)
+    const sr = 235 + snowAmount * 10;
+    const sg = 238 + snowAmount * 8;
+    const sb = 245 + snowAmount * 5;
+    r = r + (sr - r) * snowAmount;
+    g = g + (sg - g) * snowAmount;
+    b = b + (sb - b) * snowAmount;
+  }
+
+  // --- Hillshade (dramatic for satellite) ---
+  const shade = landHillshade(heightMap, width, height, x, y, wrapX);
+  // Strong contrast: shadows dark, lit slopes bright
+  const satShade = clamp(0.62 + (shade - 0.82) * 2.0, 0.55, 1.15);
+  r = clamp(r * satShade, 0, 255);
+  g = clamp(g * satShade, 0, 255);
+  b = clamp(b * satShade, 0, 255);
+
+  // --- Rivers & lakes (drawn AFTER hillshade for visibility) ---
+  const river = riverMap[i];
+  const lake = lakeMap[i];
+  if (lake > 0) {
+    // Lakes: solid water color, slightly darker for endorheic (lake==2)
+    const lakeR = lake === 2 ? 50 : 35;
+    const lakeG = lake === 2 ? 75 : 65;
+    const lakeB = lake === 2 ? 95 : 120;
+    r = r * 0.15 + lakeR * 0.85;
+    g = g * 0.15 + lakeG * 0.85;
+    b = b * 0.15 + lakeB * 0.85;
+  } else if (river > 0.08) {
+    // Rivers: bright blue, strength from log-discharge
+    const riverStr = clamp((river - 0.08) / 0.45, 0, 0.95);
+    // Brighter, more saturated blue than surrounding terrain
+    r = r + (25 - r) * riverStr;
+    g = g + (65 - g) * riverStr;
+    b = b + (140 - b) * riverStr;
+  }
+
+  // --- Atmospheric scattering (subtle blue haze at distance / high latitude) ---
+  const hazeFactor = clamp((absLat - 60) / 25, 0, 0.08);
+  if (hazeFactor > 0) {
+    r = r + (195 - r) * hazeFactor;
+    g = g + (205 - g) * hazeFactor;
+    b = b + (225 - b) * hazeFactor;
+  }
+
+  return [Math.round(r), Math.round(g), Math.round(b)];
+}
+
 function plateColor(plateId) {
   const id = Math.max(0, plateId | 0);
   const hue = ((id * 37) % 360) * (Math.PI / 180);
@@ -262,22 +435,38 @@ function run() {
   const islandScaleKm = Number(process.env.ISLAND_SCALE_KM || 400);
   const continentScaleKm = Number(process.env.CONTINENT_SCALE_KM || 3000);
 
+  // Planet parameters (all overridable via env)
+  const radiusKm = Number(process.env.RADIUS_KM || 6371);
+  const oceanPercent = Number(process.env.OCEAN_PERCENT || 67);
+  const gravity = Number(process.env.GRAVITY || 9.81);
+  const rotationHours = Number(process.env.ROTATION_HOURS || 24);
+  const axialTiltDeg = Number(process.env.AXIAL_TILT || 23.5);
+  const plateCount = Number(process.env.PLATE_COUNT || 11);
+  const plateSpeed = Number(process.env.PLATE_SPEED || 5);
+  const mantleHeat = Number(process.env.MANTLE_HEAT || 55);
+
+  // Resolution: RESOLUTION=8192 → 8192x4096, RESOLUTION=2048 → 2048x1024
+  const planetWidth = Number(process.env.RESOLUTION || 4096);
+  const planetHeight = Math.round(planetWidth / 2);
+
   const config = {
     seed,
+    planetWidth,
+    planetHeight,
     planet: {
-      radiusKm: 6371,
-      gravity: 9.81,
+      radiusKm,
+      gravity,
       density: 5510,
-      rotationHours: 24,
-      axialTiltDeg: 23.5,
+      rotationHours,
+      axialTiltDeg,
       eccentricity: 0.016,
       atmosphereBar: 1,
-      oceanPercent: 67,
+      oceanPercent,
     },
     tectonics: {
-      plateCount: 11,
-      plateSpeedCmPerYear: 5,
-      mantleHeat: 55,
+      plateCount,
+      plateSpeedCmPerYear: plateSpeed,
+      mantleHeat,
     },
     events: [],
     generationPreset,
@@ -408,6 +597,14 @@ function run() {
 
   writeBmp(path.join(runDir, 'biomes_preview.bmp'), width, height, (i) => biomeColor(biomeMap[i]));
   writeJpg(path.join(runDir, 'biomes_preview.jpg'), width, height, (i) => biomeColor(biomeMap[i]));
+
+  // Satellite / natural-color view (Landsat-style)
+  const satPixel = (i, x, y) => satelliteColor(
+    i, x, y, heightMap, biomeMap, temperatureMap, precipitationMap,
+    riverMap, lakeMap, slopeMap, width, height, minH, maxH, wrapXForHillshade
+  );
+  writeBmp(path.join(runDir, 'satellite_preview.bmp'), width, height, satPixel);
+  writeJpg(path.join(runDir, 'satellite_preview.jpg'), width, height, satPixel);
 
   result.free();
 
