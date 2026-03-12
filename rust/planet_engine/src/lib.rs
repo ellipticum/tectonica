@@ -5966,20 +5966,23 @@ fn compute_mfd_area(
     area
 }
 
-/// MFD explicit stream power erosion step (goSPL approach, Salles et al. 2023).
+/// Semi-implicit MFD stream power erosion step (Braun & Willett 2013;
+/// Salles et al. 2023, goSPL).
 ///
-/// Unlike the implicit D8 solver (`stream_power_step`), this distributes
-/// drainage area via MFD (Freeman 1991) and applies erosion independently
-/// per cell.  There is no single-receiver tree, so no radial spoke artifacts
-/// form on square grids at coarse resolution (≥10 km/cell).
+/// Drainage area is computed via MFD (Freeman 1991) to avoid D8 spoke
+/// artifacts at coarse resolution (≥10 km/cell).  Incision uses the implicit
+/// Braun & Willett (2013) scheme with the steepest-descent receiver:
 ///
-/// Erosion rate: E = K_eff × A^m × S_max^n
-/// Stability: erosion capped at 30% of cell height per step (unconditionally
-/// stable regardless of CFL number — appropriate for coarse landscape models
-/// where exact convergence to steady state is not required).
+///   h_new = (h_old + U·dt + factor·h_recv_new) / (1 + factor)
+///   factor = K_eff · A^m · dt / dx^n
 ///
-/// Used for planet scope (dx ≈ 10 km).  Island scope (dx ≈ 1 km) uses the
-/// implicit D8 solver where grid artifacts are below visual threshold.
+/// Cells are processed in ascending elevation order (downstream → upstream),
+/// so h_recv_new is always already updated.  This is unconditionally stable
+/// for any dt (no CFL restriction, no erosion cap needed).
+///
+/// For n ≠ 1, the slope term is linearised around the current slope
+/// (Newton step), which converges for typical geological parameters
+/// (Braun & Willett 2013, §2.2).
 fn stream_power_step_mfd(
     height: &mut [f32],
     uplift: &[f32],
@@ -5994,45 +5997,64 @@ fn stream_power_step_mfd(
 ) {
     let size = grid.size;
 
-    // 1. Topological sort (high → low)
+    // 1. Topological sort (high → low) for MFD area accumulation
     let order = topological_sort_descending(height);
 
     // 2. MFD drainage area (smooth, no spoke artifacts)
     let area = compute_mfd_area(height, &order, dx_m, mfd_p, grid);
 
-    // 3. Per-cell erosion rate (independent — no receiver dependency)
-    let mut erosion = vec![0.0_f32; size];
+    // 3. Find steepest-descent receiver per cell (for implicit incision)
+    let mut receiver = vec![0_usize; size];
+    let mut recv_dx = vec![dx_m; size];
     for i in 0..size {
-        if height[i] <= 0.0 { continue; }
-
+        if height[i] <= 0.0 { receiver[i] = i; continue; }
         let y = i / grid.width;
         let x = i % grid.width;
         let hi = height[i];
-
-        // Maximum downslope gradient (standard for SPL: channel slope)
-        let mut s_max = 0.0_f32;
+        let mut best_slope = 0.0_f32;
+        let mut best_j = i;
+        let mut best_d = dx_m;
         for oy in -1_i32..=1 {
             for ox in -1_i32..=1 {
                 if ox == 0 && oy == 0 { continue; }
                 let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
                 let dist = if ox == 0 || oy == 0 { dx_m }
                            else { dx_m * std::f32::consts::SQRT_2 };
-                let slope = (hi - height[j].max(0.0)) / dist;
-                if slope > s_max { s_max = slope; }
+                let slope = (hi - height[j]) / dist;
+                if slope > best_slope {
+                    best_slope = slope;
+                    best_j = j;
+                    best_d = dist;
+                }
             }
         }
-
-        // E = K × A^m × S^n
-        let e_rate = k_eff[i] * area[i].powf(m) * s_max.powf(n);
-        // Stability cap: max 30% of height per step
-        erosion[i] = (e_rate * dt_yr).min(hi * 0.3);
+        receiver[i] = best_j;
+        recv_dx[i] = best_d;
     }
 
-    // 4. Apply erosion + uplift
-    for i in 0..size {
-        if height[i] > 0.0 {
-            height[i] = (height[i] - erosion[i] + uplift[i] * dt_yr).max(0.0);
-        }
+    // 4. Implicit B&W update, processed low → high (ascending order)
+    //    h_new = (h_old + U*dt + factor * h_recv_new) / (1 + factor)
+    //    For n=1: factor = K*A^m*dt/dx
+    //    For n≠1: linearise S^n around current slope (single Newton step)
+    for &i in order.iter().rev() {
+        if height[i] <= 0.0 { continue; }
+        let j = receiver[i];
+        if j == i { continue; } // pit or flat — skip
+        let h_recv = height[j].max(0.0);
+        let dx_ij = recv_dx[i];
+        let a_term = k_eff[i] * area[i].powf(m) * dt_yr;
+        if n.abs() < 1e-6 { continue; }
+        let factor = if (n - 1.0).abs() < 0.01 {
+            // n ≈ 1: exact implicit (linear slope)
+            a_term / dx_ij
+        } else {
+            // n ≠ 1: linearise S^n ≈ S_old^(n-1) × S
+            let s_old = ((height[i] - h_recv) / dx_ij).max(1e-8);
+            a_term * s_old.powf(n - 1.0) / dx_ij
+        };
+        let h_new = (height[i] + uplift[i] * dt_yr + factor * h_recv)
+                    / (1.0 + factor);
+        height[i] = h_new.max(0.0);
     }
 
     // 5. Hillslope diffusion (explicit, stable for kappa*dt/dx² < 0.25)
