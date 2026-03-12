@@ -2094,7 +2094,7 @@ fn compute_relief_physics(
         let n1 = value_noise3(nx * 22.0 + 5.3, ny * 22.0 - 4.1, nz * 22.0, arch_seed);
         let n2 = value_noise3(nx * 44.0 - 9.7, ny * 44.0 + 7.3, nz * 44.0,
                               arch_seed.wrapping_add(1));
-        let arch = (n1 * 0.20 + n2 * 0.10).max(0.0); // only peaks, not troughs
+        let arch = (n1 * 0.08 + n2 * 0.04).max(0.0); // only peaks, not troughs
         cf_raw[i] += arch;
     }
 
@@ -2990,7 +2990,7 @@ fn compute_relief_physics(
             let lon_rad = (rng.next_f32() * 2.0 - 1.0) * core::f32::consts::PI;
 
             // Check if center is actually ocean
-            let cy = ((lat_rad + core::f32::consts::FRAC_PI_2) / core::f32::consts::PI
+            let cy = ((core::f32::consts::FRAC_PI_2 - lat_rad) / core::f32::consts::PI
                 * grid.height as f32) as usize;
             let cx = ((lon_rad + core::f32::consts::PI) / (2.0 * core::f32::consts::PI)
                 * grid.width as f32) as usize;
@@ -5243,6 +5243,7 @@ fn compute_hydrology_grid(
     height: usize,
     km_per_cell: f32,
     detail: DetailProfile,
+    seed: u32,
     progress: &mut ProgressTap<'_>,
     progress_base: f32,
     progress_span: f32,
@@ -5259,14 +5260,28 @@ fn compute_hydrology_grid(
     progress.phase(progress_base, progress_span, 0.25);
 
     // ═══════════════════════════════════════════════════════════════════
-    // Phase 2: D8 flow direction on filled DEM
+    // Phase 2: Stochastic D8 flow direction (Pelletier 2008)
     // ═══════════════════════════════════════════════════════════════════
+    // Add micro-jitter to the filled DEM to break grid-aligned rivers.
+    // Amplitude ~ 0.3% of local elevation — enough to deflect flow on
+    // flat surfaces but not enough to reverse real gradients.
+    let jitter_seed = hash_u32(seed ^ 0xF10D_D8B1);
+    let mut jittered_dem = filled_dem.clone();
+    for i in 0..size {
+        if filled_dem[i] <= 0.0 { continue; }
+        let noise = (hash_u32(jitter_seed.wrapping_add(i as u32)) as f32 / u32::MAX as f32 - 0.5) * 2.0;
+        // Scale jitter by elevation: higher terrain gets more absolute jitter
+        // but the relative fraction stays ~0.3% — preserves valley structure.
+        let amp = filled_dem[i].abs().max(1.0) * 0.003;
+        jittered_dem[i] += noise * amp;
+    }
+
     let mut flow_direction = vec![-1_i32; size];
     for y in 0..height {
         for x in 0..width {
             let i = y * width + x;
             if filled_dem[i] <= 0.0 { continue; }
-            let h = filled_dem[i];
+            let h = jittered_dem[i];
             let mut best_gradient = 0.0_f32;
             let mut best_index = None;
 
@@ -5280,7 +5295,7 @@ fn compute_hydrology_grid(
                     }
                     let j = ny as usize * width + nx as usize;
                     let dist = if ox == 0 || oy == 0 { 1.0_f32 } else { std::f32::consts::SQRT_2 };
-                    let gradient = (h - filled_dem[j]).max(0.0) / dist;
+                    let gradient = (h - jittered_dem[j]).max(0.0) / dist;
                     if gradient > best_gradient {
                         best_gradient = gradient;
                         best_index = Some(j);
@@ -7380,7 +7395,7 @@ fn run_crop_pipeline(
         &relief, &slope_map, &precipitation_map, &temperature_map,
         &crop_lat_per_row,
         crop_w, crop_h, crop_grid.km_per_cell_x,
-        detail, progress,
+        detail, cfg.seed, progress,
         progress_base + progress_span * 0.68, progress_span * 0.10,
     );
 
@@ -7602,6 +7617,7 @@ fn run_simulation_core(
             planet_grid.height,
             planet_grid.km_per_cell_x,
             detail,
+            cfg.seed,
             progress,
             92.0,
             5.0,
