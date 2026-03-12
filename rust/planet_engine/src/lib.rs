@@ -7251,8 +7251,11 @@ fn run_crop_pipeline(
     for i in 0..crop_grid.size {
         let def_total = (crop_conv_def[i] + crop_div_def[i] * 0.5 + crop_trans_def[i] * 0.3)
             .clamp(0.0, 1.0);
-        // High deformation → hard rock (low K), low deformation → soft rock (high K)
-        k_br[i] = 5.0e-6 - def_total * 4.0e-6;  // range: 1e-6 (hard) to 5e-6 (soft)
+        // High deformation → hard rock (low K), low deformation → soft rock (high K).
+        // Power-law dependence (Whipple 2004): K ∝ (1-def)^n, n=2 gives
+        // sharp transition at mountain fronts.  Range: 1e-6 (hard) to 5e-6 (soft).
+        let soft = (1.0 - def_total).powi(2); // 0 at boundary, 1 at interior
+        k_br[i] = 1.0e-6 + soft * 4.0e-6;
     }
 
     // Maintenance uplift for crop erosion (England & McKenzie 1982).
