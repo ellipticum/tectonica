@@ -3713,21 +3713,34 @@ fn compute_relief_physics(
         }
 
         // Reshape near-coast ocean cells to shelf profile.
+        //
+        // Shelf width varies with margin type (Emery & Uchupi 1984;
+        // Kennett 1982, "Marine Geology"):
+        //   Passive margins: 150–400 km (sediment-prograded, wide)
+        //   Active margins:  30–80 km  (subduction-limited, narrow)
+        //
+        // Depth profile: exponential approach to shelf break depth
+        // (Watts 2001, §10.2): z(x) = z_break × (1 − exp(−x/λ))
+        // where λ ∝ shelf_width gives the natural concave-up shape
+        // observed in bathymetric profiles.
         let shelf_break_depth = -130.0_f32; // Kennett 1982: 100–200 m
-        let shelf_width_cells = 15_u32; // ~150 km (Earth mean ~75 km, range 30–400 km)
         for i in 0..size {
             let d = shelf_dist[i];
             if d == u32::MAX || relief[i] >= 0.0 { continue; }
 
-            if d < shelf_width_cells {
-                // On the shelf: flatten toward gradual shelf depth.
-                // Shelf deepens gently from coast: ~8 m/cell ≈ 0.08°
-                let shelf_target = -(d as f32 * 8.0 + 10.0); // -10 to -130 m
-                let shelf_target = shelf_target.max(shelf_break_depth);
+            // Per-cell shelf width from margin type: conv_def → active margin
+            let activity = conv_def[i].clamp(0.0, 0.8) / 0.8;
+            // Active: 5 cells (~50 km), passive: 20 cells (~200 km)
+            let shelf_w = 5.0 + 15.0 * (1.0 - activity);
+            let shelf_w_cells = shelf_w as u32;
 
-                // Blend between current depth and shelf target.
-                // Stronger blending for shallower cells (more confident
-                // they should be shelf), weaker for deeper cells.
+            if (d as f32) < shelf_w {
+                // Exponential depth profile: z = z_break × (1 − exp(−d/λ))
+                // λ = shelf_w / 3 gives ~95% of break depth at shelf edge
+                let lambda = shelf_w / 3.0;
+                let frac = 1.0 - (-(d as f32) / lambda).exp();
+                let shelf_target = (shelf_break_depth * frac - 5.0).max(shelf_break_depth);
+
                 let current = relief[i];
                 let blend = if current > shelf_break_depth {
                     0.7 // shallow: strongly reshape to shelf
@@ -3735,11 +3748,9 @@ fn compute_relief_physics(
                     0.3 // near shelf break: moderate reshaping
                 };
                 relief[i] = current * (1.0 - blend) + shelf_target * blend;
-            } else if d < shelf_width_cells + 5 {
-                // Shelf break transition: steepen the gradient.
-                // This is the 5-cell zone where shelf meets slope.
-                // Don't modify — let the natural isostatic gradient create
-                // the continental slope.
+            } else if d < shelf_w_cells + 5 {
+                // Shelf break transition zone: natural isostatic gradient
+                // creates the continental slope — no modification needed.
             }
         }
     }
