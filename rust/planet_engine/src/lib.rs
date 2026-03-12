@@ -4480,13 +4480,23 @@ fn compute_climate_unified(
             let delta_t = 255.0 * ((1.0 + 0.75 * tau).powf(0.25) - 1.0);
             let atm = delta_t - 33.0;
 
-            // Continentality: inland areas have more extreme annual temperatures.
-            // At high latitudes, colder winters dominate the annual mean.
-            // Moscow (55°N, ~600 km inland): annual mean 5.8°C vs London (51°N, coast): 11.3°C
-            // Empirical: ΔT ≈ −0.008 °C/km × dist × sin(lat)
-            // (Terjung & Louie 1972; Conrad continentality index)
+            // Continentality: inland areas deviate from maritime mean temperature
+            // (Terjung & Louie 1972; Hartmann 1994 §2.5; Conrad 1946).
+            //
+            // Mid-to-high latitude cooling: stronger winter cooling than summer
+            // warming → net annual-mean depression.  Peaks at 45–60°.
+            //   Moscow (55°N, 600 km): ~3.5°C continentality cooling
+            //   Yakutsk (62°N, 2000+ km): ~15°C continentality cooling
+            //
+            // Rate: 0.010 °C/km × sin²(φ), saturating at 2000 km.
+            // sin² gives correct latitudinal shape: weak in tropics (observed:
+            // <1°C/1000km), strong at high latitudes (Siberia, Canada).
+            // Saturation at 2000 km reflects finite continent size and
+            // air-mass modification time scale.
             let cont_cooling = if elev > 0.0 {
-                coast_dist[i] * 0.008 * (abs_lat * RADIANS).sin()
+                let sin2 = (abs_lat * RADIANS).sin().powi(2);
+                let d_eff = coast_dist[i].min(2000.0);
+                0.010 * sin2 * d_eff
             } else {
                 0.0
             };
