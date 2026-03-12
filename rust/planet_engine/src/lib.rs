@@ -3381,9 +3381,12 @@ fn compute_relief_physics(
                 };
 
                 // "Glacial buzzsaw" (Brozović et al. 1997, Science):
-                // peaks rarely exceed 2000 m above ELA.
-                // Max excess is larger at low glacial intensity.
-                let max_excess = 2500.0 - 1000.0 * glacial_intensity; // 1500–2500 m
+                // Peaks cluster 200–800 m above ELA (Mitchell & Montgomery
+                // 2006, Cascade Range).  Egholm et al. 2009 show max ~1500 m
+                // at low glacial intensity, ~600 m at full glaciation.
+                // max_excess = ELA_headwall + erosion_margin:
+                //   ~600 m at full intensity (polar), ~1500 m at minimal (tropical)
+                let max_excess = 600.0 + 900.0 * (1.0 - glacial_intensity); // 600–1500 m
                 let excess = h - ela;
                 // Tanh compression, modulated by glacial intensity
                 let compressed_excess = max_excess * (excess / max_excess).tanh();
