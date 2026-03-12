@@ -1444,11 +1444,7 @@ fn evolve_plate_field(
                 let sxj = cache.x_by_cell[j];
                 let syj = cache.y_by_cell[j];
                 let szj = cache.z_by_cell[j];
-                let structural = 0.5
-                    + 0.5
-                        * ((sxj * 4.6 + syj * 3.8 + szj * 2.9 + structural_phase).sin() * 0.6
-                            + (syj * 5.1 - szj * 3.6 + sxj * 2.4 - structural_phase * 1.3).cos()
-                                * 0.4);
+                let structural = 0.5 + 0.5 * spherical_fbm(sxj, syj, szj, structural_phase);
                 s *= clampf(0.82 + 0.4 * structural, 0.62, 1.28);
                 accumulate_plate_vote(
                     pid,
