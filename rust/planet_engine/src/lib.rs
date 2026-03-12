@@ -3255,11 +3255,25 @@ fn compute_relief_physics(
         }
 
         // Isostatic relaxation: exponential approach to equilibrium.
-        // τ_eff ≈ 5 Myr (Watts 2001 §8.4).
-        // f = 1 − exp(−dt/τ).  dt from plate evolution time.
+        // τ = 2π μ / (ρ_m g α) where α = flexural wavelength ∝ Te^(3/4)
+        // (Watts 2001 §8.4; Turcotte & Schubert 2002 §6.10).
+        // Te proxy: continental crust → Te ≈ 15–50 km (thick crust = old,
+        // strong lithosphere); oceanic → Te ≈ 5–15 km.
+        // τ ∝ Te^(3/4) × (μ/ρ_m g): ranges from ~1 Myr (Te=5 km, young
+        // ocean) to ~10 Myr (Te=50 km, old craton).
+        // Normalization: Te=25 km → τ=5 Myr (canonical global mean).
         let dt_myr = dt_yr / 1e6;
-        let f_relax = 1.0 - (-dt_myr / 5.0).exp();
+        let tau_ref = 5.0_f32; // Myr at Te_ref=25 km
+        let te_ref = 25.0_f32; // km
         for i in 0..size {
+            // Te proxy from crust thickness: continental 30-50 km crust →
+            // Te 20-50 km; oceanic 7 km crust → Te 5-15 km.
+            let cf = continental_frac[i];
+            let te_km = cf * (10.0 + crust_thickness[i] * 0.8) + (1.0 - cf) * 8.0;
+            let te_km = te_km.clamp(5.0, 50.0);
+            // τ ∝ Te^(3/4): thick lithosphere relaxes slower
+            let tau = tau_ref * (te_km / te_ref).powf(0.75);
+            let f_relax = 1.0 - (-dt_myr / tau).exp();
             let target = isostatic_elevation(crust_thickness[i], continental_frac[i], heat_map[i]);
             relief[i] = relief[i] * (1.0 - f_relax) + target * f_relax;
         }
