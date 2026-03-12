@@ -4455,12 +4455,19 @@ fn compute_climate_unified(
                 fx * 7.0 + 4.0, fy * 7.0 - 6.0,
                 seed as f32 * 0.000_21, temp_seed,
             );
-            // Greenhouse warming: gray atmosphere model (Pierrehumbert 2010 §4.3).
-            // τ ∝ atmospheric mass; ΔT = T_e × [(1 + 3τ/4)^(1/4) − 1].
-            // Calibrated: Earth (1 bar) = +33°C; Mars (0.006) ≈ +5°C.
-            // Simplified fit: ΔT ≈ 33 × (p^0.3 − 1) → 0°C delta at 1 bar
-            // (base t_sea already includes Earth's greenhouse).
-            let atm = 33.0 * (planet.atmosphere_bar.max(0.006).powf(0.3) - 1.0);
+            // Greenhouse warming: two-stream Schwarzschild equation
+            // (Pierrehumbert 2010 §4.3, eq. 4.12).
+            //
+            // T_s = T_eff × (1 + ¾τ)^(1/4)  where τ = IR optical depth.
+            // τ = τ_earth × (p/1 bar)^α, α ≈ 0.7 (pressure broadening,
+            // Pierrehumbert 2010 §4.4).
+            // τ_earth ≈ 0.84 calibrated so (1+0.75×0.84)^0.25 ≈ 1.130 →
+            // ΔT = 255 × 0.130 = 33°C (observed Earth greenhouse).
+            //
+            // Base t_sea already includes Earth's +33°C, so we subtract it.
+            let tau = 0.84 * planet.atmosphere_bar.max(0.001).powf(0.7);
+            let delta_t = 255.0 * ((1.0 + 0.75 * tau).powf(0.25) - 1.0);
+            let atm = delta_t - 33.0;
 
             // Continentality: inland areas have more extreme annual temperatures.
             // At high latitudes, colder winters dominate the annual mean.
