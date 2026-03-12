@@ -6670,8 +6670,8 @@ impl WasmSimulationResult {
         self.ocean_percent
     }
 
-    pub fn recomputed_layers_list(&self) -> &[String] {
-        &self.recomputed_layers
+    pub fn recomputed_layers_list(&self) -> Vec<String> {
+        self.recomputed_layers.clone()
     }
 
     pub fn plates(&self) -> Vec<i16> {
