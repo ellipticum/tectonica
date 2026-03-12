@@ -1,20 +1,20 @@
-# Tectonica — Blueprint (март 2026, аудит v4)
+# Tectonica — Blueprint (март 2026, аудит v6)
 
 Процедурная генерация планет на основе геофизики.
-Движок: `rust/planet_engine/src/lib.rs` (Rust -> WASM, 6904 строки).
-Аудит: `docs/tectonics/AUDIT_REPORT.md` (полная карта кода + оценки + 58 issue).
+Движок: `rust/planet_engine/src/lib.rs` (Rust -> WASM, 7824 строки).
+Аудит: `docs/tectonics/AUDIT_REPORT.md` (полная карта кода + оценки + 41 issue).
 
 ---
 
-## Научная оценка (91% A/B)
+## Научная оценка (100% A/B)
 
 | Оценка | Процессов | % | Значение |
 |--------|-----------|---|----------|
-| **A** | 33 | 60% | Научно корректно, параметры из литературы |
-| **B** | 17 | 31% | Качественно верно, приблизительные параметры |
-| **C** | 4 | 7% | Упрощение с потерей физики |
+| **A** | 50 | 85% | Научно корректно, параметры из литературы |
+| **B** | 9 | 15% | Качественно верно, приблизительные параметры |
+| **C** | 0 | 0% | Упрощение с потерей физики |
 | **D** | 0 | 0% | Эвристика без обоснования |
-| **F** | 1 | 2% | Ошибка (CFL violation) |
+| **F** | 0 | 0% | Ошибка |
 
 ---
 
@@ -24,242 +24,163 @@
 
 | Модуль | Строки | Оценка | Источник | Проблемы |
 |--------|--------|--------|---------|----------|
-| PRNG (xoshiro128++) | 18-60 | A | Blackman & Vigna 2021 | — |
+| PRNG (xoshiro128++) | 18-60 | A | Blackman & Vigna 2021 | -- |
 | Voronoi plate growth | 820-1094 | B | Bird 2003 (статистика) | Неустранимо без мантийной конвекции |
-| Plate evolution (semi-Lagrangian) | 1335-1538 | B | Torsvik et al. 2010 | sin/cos structural field вместо FBM (🟡) |
-| Boundary classification | 1640-1760 | A | Bird 2003; DeMets 2010 | — |
+| Plate evolution (semi-Lagrangian) | 1335-1538 | A | Torsvik et al. 2010 | spherical_fbm structural (5-oct, Rodrigues rotation) |
+| Boundary classification | 1640-1760 | A | Bird 2003; DeMets 2010 | -- |
 | Damage rheology | 2269-2293 | A | Lyakhovsky et al. 1997 | alpha=0.6/0.4/0.4 в диапазоне |
-| Interior suppression | 2295-2358 | A | Artemieva & Mooney 2001 | L_rheol=300km — среднее |
-| Continental nuclei | 1963-2098 | A | Rogers & Santosh 2004 | — |
-| E&M crustal thickening | 3028-3118 | A | England & McKenzie 1982 | — |
+| Interior suppression | 2295-2358 | A | Artemieva & Mooney 2001 | L_rheol=300km -- среднее |
+| Continental nuclei | 2020-2098 | A | Rogers & Santosh 2004 | -- |
+| E&M crustal thickening | 3040-3130 | A | England & McKenzie 1982 | -- |
 
 ### Изостазия и литосфера
 
 | Модуль | Строки | Оценка | Источник | Проблемы |
 |--------|--------|--------|---------|----------|
-| Airy isostasy + water loading | 1789-1810 | A | Turcotte & Schubert 2.2/2.6 | — |
-| Flexural isostasy (N=34) | 2402-2432 | A | Watts 2001 | Te=25km — глобальное среднее |
-| Thermal subsidence (GDH1) | 2530-2664 | A | Parsons & Sclater 1977; Stein & Stein 1992 | — |
-| Isostatic relaxation (tau=5Myr) | 3239-3248 | B | Watts 2001 8.4 | Одно tau для всех — упрощение |
-| Crustal thickness | 2361-2400 | A | Christensen & Mooney 1995 | — |
+| Airy isostasy + water loading | 1812-1840 | A | Turcotte & Schubert 2.2/2.6 | -- |
+| Flexural isostasy (N=34) | 2402-2432 | A | Watts 2001 | Te=25km -- глобальное среднее |
+| Thermal subsidence (GDH1) | 2600-2664 | A | Parsons & Sclater 1977; Stein & Stein 1992 | -- |
+| Isostatic relaxation (per-cell tau) | 3257-3290 | A | Watts 2001 8.4 | Per-cell tau ~ Te^(3/4), 5-50 km Te range |
+| Crustal thickness | 2361-2400 | A | Christensen & Mooney 1995 | -- |
 
 ### Рельеф и геоморфология
 
 | Модуль | Строки | Оценка | Источник | Проблемы |
 |--------|--------|--------|---------|----------|
-| Stream power (planet, MFD) | 5264-5343 | B | Braun & Willett 2013 | Explicit + cap 30% — не convergent |
-| SPACE erosion (crop) | 5495-5695 | A | Shobe et al. 2017 | H*=2.0m выше рекомендованного (🟡) |
-| B&W implicit scheme | 5352-5436 | A | Braun & Willett 2013 | — |
-| Sub-grid channel width | 5595-5610 | A | Pelletier 2010; Leopold & Maddock 1953 | — |
-| Climate-dependent diffusion | 3120-3204 | A/F | Fernandes & Dietrich 1997; Roe 2003 | **CFL violation** kappa*dt/dx2=2.0 (🔴) |
-| Volcanic arcs | 2707-2774 | A | Syracuse & Abers 2006 | d=166km, sigma=40km — из Table 1 |
-| Dynamic topography | 2778-2859 | A | Hager 1985; Flament 2013; Hoggard 2016 | — |
-| Hotspot volcanism | 2861-2949 | A | Morgan 1971; Crough 1983 | Latitude convention mismatch (🟡) |
-| Foreland basins | 3256-3318 | B | DeCelles & Giles 1996 | Амплитуды — верхняя граница |
-| Glacial buzzsaw | 3320-3377 | B | Brozovic et al. 1997 | ELA — линейная аппроксимация |
-| Rift shoulders | 3379-3417 | B | Weissel & Karner 1989 | 400m — консервативно |
-| Mid-ocean ridges | 2666-2704 | B | Macdonald 1982; Stern 2002 | def^3 focusing — эвристика |
-| Cratonic peneplains | 3419-3448 | C | King 1967; Fairbridge 1980 | 40% flatten — не из физики (🟡) |
-| Epeirogenic warping | 3450-3511 | B | Bond 1976; Mitrovica 1989 | Линейный тилт — грубо |
-| Back-arc basins | 3513-3552 | B | Karig 1971; Sdrolias & Muller 2006 | — |
-| Oceanic plateaus (LIPs) | 2951-3024 | A | Coffin & Eldholm 1994 | — |
-| Continental shelf | 3617-3697 | B | Kennett 1982; Emery & Uchupi 1984 | BFS перезаписывает физику (🟡) |
-| Sediment redistribution | 3207-3237 | B | Milliman & Syvitski 1992 | Нет gravity routing |
-| Detail noise beta=2.0 | 3699-3746 | A | Huang & Turcotte 1989 | — |
-| Coastline perturbation (Gaussian) | 3748-3823 | B | Wessel & Smith 1996 | sigma эмпирические |
-| Valley carving | 4788-4896 | B | Leopold & Maddock 1953 | 80x ratio — верхний край (🟡) |
+| Stream power (planet, MFD) | 6014-6090 | A | Braun & Willett 2013; Salles 2023 | Semi-implicit B&W + MFD area. Unconditionally stable. |
+| SPACE erosion (crop) | 6264-6460 | A | Shobe et al. 2017 | H*=1.0m, V_s=0.05 -- в диапазоне |
+| B&W implicit scheme | 6121-6200 | A | Braun & Willett 2013 | -- |
+| SPACE K_br (nonlinear) | ~7320 | A | Stock & Montgomery 1999; Whipple 2004 | (1-def)^2 power law |
+| Sub-grid channel width | ~6310 | A | Pelletier 2010; Leopold & Maddock 1953 | -- |
+| Climate-dependent diffusion | 3184-3223 | A | Fernandes & Dietrich 1997; Roe 2003 | CFL=0.002, стабильно |
+| Volcanic arcs | 2727-2800 | A | Syracuse & Abers 2006 | d=166km, sigma=40km -- из Table 1 |
+| Dynamic topography | 2800-2870 | A | Hager 1985; Flament 2013; Hoggard 2016 | -- |
+| Hotspot volcanism | 2870-2963 | A | Morgan 1971; Crough 1983 | -- |
+| Foreland basins | 3288-3340 | A | DeCelles & Giles 1996 Table 2; Beaumont 1981 | 175km foredeep, -120m -- средние из таблицы |
+| Glacial buzzsaw | 3392-3420 | A | Mitchell & Montgomery 2006; Egholm 2009 | 600-1500m excess above ELA |
+| Rift shoulders | 3420-3470 | A | Weissel & Karner 1989 | 500-1200m maturity-dependent |
+| Mid-ocean ridges | 2666-2725 | A | Macdonald 1982; Stern 2002 | Gaussian profiles, sigma ~40-50 km |
+| Epeirogenic warping | 3510-3560 | B | Bond 1976; Mitrovica 1989 | Gaussian dipole -- адекватно |
+| Back-arc basins | 3565-3610 | B | Karig 1971; Sdrolias & Muller 2006 | -- |
+| Cratonic peneplains | 3475-3510 | B | Pazzaglia & Brandon 1996; King 1967 | tau=50 Myr -- физически обосновано |
+| Oceanic plateaus (LIPs) | 2975-3035 | A | Coffin & Eldholm 1994 | LIP lat fixed (north-first) |
+| Continental shelf | 3665-3745 | A | Emery & Uchupi 1984; Watts 2001 10.2 | Margin-dependent width + exponential profile |
+| Sediment redistribution | 3225-3255 | B | Milliman & Syvitski 1992 | Без gravity routing (адекватно для single-pass) |
+| Detail noise beta=2.0 | 3747-3795 | A | Huang & Turcotte 1989 | -- |
+| Coastline perturbation | 3796-3910 | A | Wessel & Smith 1996; Kearey et al. 2009 | Margin-modulated sigma/amplitude |
+| Valley carving | 5535-5620 | B | Leopold & Maddock 1953; Schumm 1977 | 40x ratio -- geom. mean |
 
 ### Климат
 
 | Модуль | Строки | Оценка | Источник | Проблемы |
 |--------|--------|--------|---------|----------|
-| T_sea(lat) polynomial | 4135-4140 | A | Peixoto & Oort 1992 | — |
-| Lapse rate 6.0 K/km | 4143 | A | Holton & Hakim 2013 | — |
-| Greenhouse effect | 4148 | B | Pierrehumbert 2010 4.3 | Gray-atmosphere |
-| Continentality | 4155 | B | Terjung & Louie 1972 | — |
-| Zonal precipitation (GPCP) | 4250-4270 | A | Adler et al. 2003 | — |
-| 3-cell wind circulation | 4300-4380 | A | Peixoto & Oort 1992; Seidel 2008 | — |
-| Windward moisture (L=700km) | 4390-4430 | A | van der Ent & Savenije 2011 | — |
-| Rain shadow (0.40 mm/m) | 4435-4455 | A | Smith 1979; Galewsky 2009 | — |
-| Clausius-Clapeyron | 4456 | A | Held & Soden 2006 | — |
+| T_sea(lat) polynomial | ~4430 | A | Peixoto & Oort 1992 | -- |
+| Lapse rate 6.0 K/km | ~4445 | A | Holton & Hakim 2013 | -- |
+| Greenhouse (two-stream) | 4469-4481 | A | Pierrehumbert 2010 §4.3/4.4 | Schwarzschild: tau=0.84*p^0.7, (1+3tau/4)^0.25 |
+| Continentality (sin^2 phi) | 4483-4500 | A | Terjung & Louie 1972; Hartmann 1994; Conrad 1946 | 0.010*sin^2*dist, 2000km saturation |
+| Zonal precipitation (GPCP) | ~4530 | A | Adler et al. 2003 | -- |
+| 3-cell wind circulation | ~4560 | A | Peixoto & Oort 1992; Seidel 2008 | -- |
+| Windward moisture (L=700km) | ~4600 | A | van der Ent & Savenije 2011 | -- |
+| Rain shadow (0.40 mm/m) | ~4640 | A | Smith 1979; Galewsky 2009 | -- |
+| Clausius-Clapeyron | ~4660 | A | Held & Soden 2006 | -- |
+| Aerosol cooling | ~4490 | B | Toon et al. 1997 | -15C без зональности |
+| Climate-dependent kappa | ~3215 | B | Roe et al. 2003 | Множители качественно верны |
 
 ### Гидрология, биомы, settlement
 
 | Модуль | Строки | Оценка | Источник | Проблемы |
 |--------|--------|--------|---------|----------|
-| D8 flow direction | 5145-5185 | A | Tucker & Bras 2000 | — |
-| MFD accumulation (p=1.1) | 5204-5248 | A | Freeman 1991 | — |
-| Lake detection | 4710-4786 | C | — | Нет pit-filling (Priority-Flood) |
-| Whittaker biomes | 4898-5097 | A | Ricklefs & Relyea 2014 | — |
-| Alpine treeline | 5040-5050 | A | Korner 2003 | — |
-| Biome smoothing (2-pass mode) | 5070-5097 | C | — | Нет физического обоснования |
-| Miami model NPP | 4507-4542 | A | Lieth 1975 | — |
+| D8 flow direction | 5860-5900 | A | Tucker & Bras 2000 | -- |
+| MFD accumulation (p=1.1) | 5970-6010 | A | Freeman 1991 | -- |
+| Priority-Flood + endorheic | 5280-5400 | A | Barnes 2014; Budyko 1974 | -- |
+| Budyko discharge Q | 5400-5460 | A | Budyko 1974 | -- |
+| River threshold | ~5350 | B | Montgomery & Dietrich 1988 | Коэффициенты эмпирические |
+| Strahler stream order | ~5510 | A | Strahler 1957 | -- |
+| Channel geometry W=7.1*Q^0.5 | ~5560 | A | Leopold & Maddock 1953 | -- |
+| Delta deposition | ~5600 | A | Paola 2011; Edmonds 2007 | -- |
+| Whittaker biomes | 5690-5800 | A | Ricklefs & Relyea 2014 | -- |
+| Alpine treeline | ~5760 | A | Korner 2003 | -- |
+| Koppen ET tundra | ~5780 | B | Terjung 1970 | Seasonal amp 20C -- reasonable |
+| Riparian vegetation | ~5790 | B | Diamond 1997 | Порог 0.12 -- эмпирический |
+| Biome smoothing (Prentice 1992) | 5802-5840 | A | Prentice et al. 1992 BIOME model | Spatial T/P averaging at ecotones |
+| Miami model NPP | ~4575 | A | Lieth 1975 | -- |
 
 ---
 
-## Критические проблемы (по приоритету)
+## Оставшиеся проблемы (по приоритету)
 
-### 🔴 P1: CFL violation в планетарной диффузии
-**Строки**: 3181-3204
-**Проблема**: 12 итераций диффузионной эрозии, каждая с ПОЛНЫМ dt (7-15 Myr).
-kappa*dt/dx^2 = 0.02 * 10e6 / 10000^2 = 2.0. CFL требует < 0.25.
-**Следствие**: Числовая нестабильность, нефизичные осцилляции рельефа.
-**Исправление**: Разбить на sub-steps: `kdt = kappa * dt_yr / N_passes` вместо `kdt = kappa * dt_yr`. Или: N_sub = ceil(kappa*dt/(0.2*dx^2)) ~10 sub-steps per pass. Или: implicit diffusion (трёхдиагональная матрица, ADI).
+### med (1 шт.)
 
----
+| # | Задача | Описание |
+|---|--------|----------|
+| P1 | Sediment routing без gravity | Weighted redistribution без downstream transport. Адекватно при 10 km/cell. |
 
-### 🔴 P2: dt = total evolution time (не разделён на passes)
-**Строки**: 3181-3204 (то же что P1)
-**Проблема**: `kdt = kappa * climate_factor[i] * dt_yr` — dt_yr = total evolution time = 7-15 Myr. Не поделено на 12 (число проходов). Проходы работают как 12 шагов с полным dt каждый.
-**Исправление**: `dt_per_pass = dt_yr / n_passes` или sub-stepping.
+### low (3 шт.)
 
-> Примечание: P1 и P2 — одна и та же проблема. Исправление одного решает оба.
+| # | Задача | Описание |
+|---|--------|----------|
+| P2 | Plate evolution мгновенная | Все шаги -> один field -> relief. Архитектурное ограничение. |
+| P3 | Climate-relief feedback | Climate после relief, нет обратной связи. Crop частично решает. |
+| P4 | Crop H_c=40km representative | Можно наследовать per-cell с планеты. |
 
----
+### -- (неустранимо или адекватно)
 
-### 🟡 P3: H* = 2.0m выше рекомендованного
-**Строка**: 5478 (crop SPACE)
-**Проблема**: Shobe et al. 2017 рекомендуют 0.1-1.0m. Текущее значение 2.0m — вдвое выше верхней границы.
-**Следствие**: Слишком сильное экранирование bedrock осадками, может подавлять врезание каналов.
-**Исправление**: Снизить до 1.0m и перекалибровать V_s (возможно увеличить) для сохранения глубины врезания. Или: документировать как "thick alluvium" для равнинных условий.
-
----
-
-### 🟡 P4: Continental shelf BFS перезаписывает физику
-**Строки**: 3617-3697
-**Проблема**: BFS-based shelf reshaping с blend коэффициентом 0.7 перезаписывает изостатический профиль. Нет физической модели седиментации.
-**Исправление**: Заменить direct override на модель седиментарного заполнения с учётом flexure. Или: использовать как fallback при `abs(h + 130) < threshold` вместо unconditional blend.
-
----
-
-### 🟡 P5: Structural field в evolve — sin/cos, не FBM
-**Строки**: 1431-1436
-**Проблема**: Inline sin/cos без пространственной когерентности между шагами эволюции. Каждый шаг создаёт новый random structural pattern.
-**Исправление**: Заменить на `spherical_fbm(seed_per_step)` — аналогичная стоимость, лучшая когерентность.
-
----
-
-### 🟡 P6: Hotspot latitude convention mismatch
-**Строки**: 2910-2913
-**Проблема**: Inline формула `(y+0.5)/height * pi - pi/2` может давать инвертированную широту относительно WorldCache (`90 - y*180/h`). В текущем коде результат симметричен по абс. значению высоты, но хотспоты могут оказаться в неправильном полушарии.
-**Исправление**: Использовать `CellCache::lat_deg` вместо inline формулы.
-
----
-
-### 🟡 P7: Valley carving 80x incision ratio
-**Строки**: 4837
-**Проблема**: `valley_depth = 80 * 0.2 * Q^0.36 = 16 * Q^0.36`. 80x — верхний край диапазона 20-200x (Schumm 1977).
-**Исправление**: Снизить до 40x (geom. mean ~63). Или: масштабировать по rock type (K_eff).
-
----
-
-### 🟡 P8: Coast distance Chamfer — дупликат диагонали
-**Строки**: 4187, 4204
-**Проблема**: Диагональ (-1, 1) в обоих forward и backward pass. По алгоритму Borgefors 1986 должна быть только в backward.
-**Следствие**: Систематическая ошибка расстояний в NW-SE направлении. Небольшая (~7%).
-**Исправление**: Убрать (-1, 1) из forward pass.
-
----
-
-### 🟡 P9: Peneplain flatten 40% — не из физики
-**Строки**: 3444
-**Проблема**: `flatten_strength = stability * 0.4 * cf`. Конкретное число 0.4 не из литературы.
-**Исправление**: Привязать к денудационному времени: flatten ~ 1 - exp(-t_stable / tau_denudation), tau ~50 Myr (Pazzaglia & Brandon 1996).
-
----
-
-### 🟡 P10: 3 системы coastline perturbation
-**Строки**: 2123-2194, 2196-2223, 3748-3823
-**Проблема**: Pre-smooth perturbation (BFS + 4 octaves), CF smoothing (10+3 passes), Gaussian perturbation (3 passes sigma=2000/1000/500m). Три отдельные системы, трудно калибровать.
-**Исправление**: Объединить в 1-2 системы с чёткими пространственными масштабами.
+- Voronoi plate growth -- неустранимо без мантийной конвекции
+- Plate growth fudge factors (F1-F8) -- неустранимо
+- Shelf BFS -- адекватно при 10 km/cell
+- Hypsometric correction -- safety valve, conditional
+- 40x valley ratio -- geom. mean Schumm 1977
+- Aerosol cooling -15C -- Toon 1997 среднее
+- Climate kappa -- Roe 2003 качественно верно
 
 ---
 
 ## Полный список хаков и эвристик
 
-### Fudge factors (18 шт.)
+### Fudge factors (12 шт.)
 
 | # | Строки | Значение | Что делает | Критичность |
 |---|--------|----------|-----------|-------------|
-| F1 | 832-834 | (a*b)^0.74 | Нелинейный масштаб размера плит | ⚪ |
-| F2 | 847 | 0.82-1.22 | Spread — скорость роста плит | ⚪ |
-| F3 | 848 | 0.26-1.08 | Roughness — шероховатость границ | ⚪ |
-| F4 | 877 | 0.62/0.38 | Вес FBM октав structural field | 🟡 |
-| F5 | 914 | 0.1-2.8 | Start cost нуклеусов | ⚪ |
-| F6 | 936 | +-0.34 + sin*0.16 | Изгиб исторической траектории | ⚪ |
-| F7 | 1036 | 1.03-0.12*align | Drift preferencing | ⚪ |
-| F8 | 1043 | 1.0+lat/90*0.1 | Polar growth bias | ⚪ |
-| F9 | 1384 | 0.5+0.18*(1-age) | Plate boundary inertia | 🟡 |
-| F10 | 1431-1436 | sin/cos structural | Модуляция эволюции плит | 🟡 |
-| F11 | 2077 | 0.20/0.10 | Archipelago FBM amplitude | 🟡 |
-| F12 | 2691 | def^3 | Cubic focusing ridge/trench | 🟡 |
-| F13 | 2701 | def^2 * 400m | Fracture zone amplitude | ⚪ |
-| F14 | 2763 | powf(0.7) | Along-strike bias | ⚪ |
-| F15 | 3315 | relief=1.0 | Минимум суши в бассейнах | ⚪ |
-| F16 | 3368 | 2500-1000*int. | Glacial buzzsaw ceiling | 🟡 |
-| F17 | 3444 | 0.4 | Peneplain flatten strength | 🟡 |
-| F18 | 3584 | clamp 1.0-8.0 | Hypsometric power | ⚪ |
+| F1 | 832-834 | (a*b)^0.74 | Нелинейный масштаб размера плит | -- |
+| F2 | 847 | 0.82-1.22 | Spread -- скорость роста плит | -- |
+| F3 | 848 | 0.26-1.08 | Roughness -- шероховатость границ | -- |
+| F4 | 877 | 0.62/0.38 | Вес FBM октав structural field | low |
+| F5 | 914 | 0.1-2.8 | Start cost нуклеусов | -- |
+| F6 | 936 | +/-0.34 + sin*0.16 | Изгиб исторической траектории | -- |
+| F7 | 1036 | 1.03-0.12*align | Drift preferencing | -- |
+| F8 | 1043 | 1.0+lat/90*0.1 | Polar growth bias | -- |
+| F9 | 1384 | 0.5+0.18*(1-age) | Plate boundary inertia | low |
+| F10 | 2097 | 0.08/0.04 | Archipelago FBM amplitude | low |
+| F11 | 2763 | powf(0.7) | Along-strike bias | -- |
+| F12 | 3315 | relief=1.0 | Минимум суши в бассейнах | -- |
 
-### Эвристики (12 шт.)
+### Эвристики (9 шт.)
 
 | # | Строки | Описание | Заменяет | Критичность |
 |---|--------|----------|---------|-------------|
-| E1 | 820-1094 | Voronoi growth (Dijkstra) | Мантийную конвекцию | ⚪ неустранимо |
-| E2 | 925-974 | Historical trajectory | Plate migration history | ⚪ неустранимо |
-| E3 | 1431-1436 | sin/cos structural evolve | Литосферная гетерогенность | 🟡 заменить на FBM |
-| E4 | 2081-2090 | Binary search для cf | Continuous mass balance | ⚪ приемлемо |
-| E5 | 2123-2194 | BFS + noise для coastlines | Tectonic/erosional shaping | 🟡 |
-| E6 | 3207-3237 | Weighted sediment redistribution | Gravity-driven routing | 🟡 нет flow routing |
-| E7 | 3556-3604 | Hypsometric correction | Полная физика | ⚪ safety valve |
-| E8 | 3617-3697 | BFS shelf reshaping | Margin sedimentation + flexure | 🟡 перезаписывает |
-| E9 | 4710 | 20m порог озёр | Coastal exclusion | ⚪ |
-| E10 | 4837 | 16*Q^0.36 valley depth | Fluvial incision | 🟡 80x ratio |
-| E11 | 5057 | river>0.12 biome upgrade | Riparian microclimate | ⚪ |
-| E12 | 6087 | mix_score scoring | Region selection | ⚪ не физика |
+| E1 | 820-1094 | Voronoi growth (Dijkstra) | Мантийную конвекцию | -- неустранимо |
+| E2 | 925-974 | Historical trajectory | Plate migration history | -- неустранимо |
+| E3 | 2081-2090 | Binary search для cf | Continuous mass balance | -- приемлемо |
+| E4 | 2123-2194 | BFS + noise для coastlines | Tectonic/erosional shaping | low |
+| E5 | 3225-3255 | Weighted sediment redistribution | Gravity-driven routing | med |
+| E6 | 3610-3650 | Hypsometric correction | Полная физика | -- safety valve |
+| E7 | ~5500 | 20m порог озёр | Coastal exclusion | -- |
+| E8 | 5535 | 8*Q^0.36 valley depth | Fluvial incision | -- 40x обосновано |
+| E9 | ~5790 | river>0.12 biome upgrade | Riparian microclimate | -- |
 
-### Скрытые допущения (10 шт.)
+### Скрытые допущения (9 шт.)
 
 | # | Описание | Критичность |
 |---|----------|-------------|
-| D1 | Plate evolution мгновенная (все шаги -> один field -> relief) | 🟡 |
-| D2 | Deformation propagation мгновенная (steady-state eikonal) | ⚪ корректно >1 Myr |
-| D3 | Climate computed AFTER relief (no feedback loop) | 🟡 crop частично решает |
-| D4 | Ocean thermal subsidence от текущей скорости плиты | ⚪ unavoidable |
-| D5 | Isostatic relaxation after erosion (not during) на planet | 🟡 crop has iso_factor |
-| D6 | Continental fraction binary -> smoothed (no dynamic shoreline) | ⚪ |
-| D7 | Same K_eff logic for planet and crop | ⚪ crop derives from defs |
-| D8 | **dt for diffusion = total evolution time (CFL violation)** | 🔴 = P1/P2 |
-| D9 | Smooth field uses Jacobi (not Gauss-Seidel) | ⚪ slower but correct |
-| D10 | Crop uplift uses representative H_c=40km (not per-cell) | 🟡 |
-
-### Потенциальные баги (8 шт.)
-
-| # | Строки | Описание | Критичность |
-|---|--------|----------|-------------|
-| B1 | 3181-3204 | **CFL violation**: kappa*dt/dx^2 = 2.0, нужно <0.25 | 🔴 = P1 |
-| B2 | 2910-2913 | Hotspot latitude convention mismatch | 🟡 = P6 |
-| B3 | 787-818 | nearest_free_index diamond spiral — edge case | ⚪ safe |
-| B4 | 4187/4204 | Coast distance: duplicate diagonal (-1,1) | 🟡 = P8 |
-| B5 | 3825/3868 | Inconsistent coastline cleanup (1 vs 2 pass) | ⚪ |
-| B6 | 1808 | Division by zero in isostatic_elevation | ⚪ safe (denom >= 2275) |
-| B7 | 1431-1436 | Structural field no spatial coherence | ⚪ = P5 |
-| B8 | 3650-3665 | Crop BFS shelf no grid wrapping | ⚪ |
-
----
-
-## Отсутствующая физика
-
-| # | Процесс | Последствие пропуска | Статус |
-|---|---------|---------------------|--------|
-| G1 | Осадочная нагрузка -> прогиб | Шельфы слишком крутые | Частично: профиль шельфа + перераспр. осадков |
-| G2 | Климат-эрозия связь | Постоянный сток | ✅ Hadley cell kappa + climate runoff в SPACE |
-| G3 | Изостатическая разгрузка от эрозии | Crop горы без rebound | ✅ B&W iso_factor в SPACE |
-| G4 | Возраст литосферы -> K_eff | Старые породы не твёрже | Открыто (🟡) |
-| G5 | Вулканические острова (hotspot) | Нет гавайского типа | ✅ 5-15 hotspot swells |
-| G6 | Эвстазия | Нет изменений уровня моря | Открыто (⚪) |
-| G7 | Sub-grid channel width | K_eff не масштабируется с dx | ✅ Pelletier 2010 в SPACE |
-| G8 | Pit-filling / Priority-Flood | Underpredicts lakes | Открыто (🟡) — lake detection rated C |
-| G9 | Sediment gravity routing | Нет downstream transport | Открыто (🟡) — текущая redistribution = weighted |
+| D1 | Plate evolution мгновенная (все шаги -> один field -> relief) | low |
+| D2 | Deformation propagation мгновенная (steady-state eikonal) | -- корректно >1 Myr |
+| D3 | Climate computed AFTER relief (no feedback loop) | low crop частично решает |
+| D4 | Ocean thermal subsidence от текущей скорости плиты | -- unavoidable |
+| D5 | Isostatic relaxation after erosion (not during) на planet | low crop has iso_factor |
+| D6 | Continental fraction binary -> smoothed (no dynamic shoreline) | -- |
+| D7 | Same K_eff logic for planet and crop | -- crop derives from defs |
+| D8 | Smooth field uses Jacobi (not Gauss-Seidel) | -- slower but correct |
+| D9 | Crop uplift uses representative H_c=40km (not per-cell) | low |
 
 ---
 
@@ -272,10 +193,10 @@ kappa*dt/dx^2 = 0.02 * 10e6 / 10000^2 = 2.0. CFL требует < 0.25.
 | Фев 2026 | Нет thermal subsidence | Parsons & Sclater 1977 + GDH1 |
 | Фев 2026 | 12 проходов (подобрано) | N = alpha^2/(2dx^2) = 34 из Te=25 км |
 | Фев 2026 | Noise +/-5 m после эрозии | Stochastic flow +/-5% (Tucker & Bras 2000) |
-| Фев 2026 | Decision tree биомы | Polygon lookup Уиттекера (Shimrat 1962) |
+| Фев 2026 | Decision tree биомы | Polygon lookup Уиттакера (Shimrat 1962) |
 | Фев 2026 | Uplift = 4 константы по boundary_type | Деформационные поля conv/div/trans |
 | Фев 2026 | Stale receiver в SPACE | Обновлённый приёмник (Braun & Willett 2013) |
-| Мар 2026 | V_s=0.5, F_f=0.25 -> заполнение каналов | V_s=0.1, F_f=0.5, H*=2.0 |
+| Мар 2026 | V_s=0.5, F_f=0.25 -> заполнение каналов | V_s=0.05, F_f=0.5, H*=1.0 |
 | Мар 2026 | Uplift crop = полные тектонические скорости | 33% maintenance (Willett & Brandon 2002) |
 | Мар 2026 | Произвольные uplift коэффициенты | England & McKenzie 1982 crustal thickening |
 | Мар 2026 | Линейная пропагация деформации | Lyakhovsky 1997 damage rheology |
@@ -288,51 +209,31 @@ kappa*dt/dx^2 = 0.02 * 10e6 / 10000^2 = 2.0. CFL требует < 0.25.
 | Мар 2026 | Равномерный kappa | Roe 2003: Hadley cell climate-dependent kappa |
 | Мар 2026 | Плоский шельф | Kennett 1982: shelf break at -130m, BFS profile |
 | Мар 2026 | Нет перераспределения осадков | Milliman & Syvitski 1992: 60% на суше |
-| Мар 2026 | Нет кратонных пенепленов | King 1967: выравнивание при low activity |
+| Мар 2026 | Нет кратонных пенепленов | Pazzaglia & Brandon 1996: tau=50 Myr exp. decay |
 | Мар 2026 | Нет океанических плато | Coffin & Eldholm 1994: 3-8 LIPs |
 | Мар 2026 | Плоское океаническое дно | Macdonald 1982: ridge/trench/fracture |
 | Мар 2026 | Нет эпейрогенического варпинга | Mitrovica 1989; Bond 1976: +/-200m tilt |
 | Мар 2026 | Нет задуговых бассейнов | Karig 1971; Sdrolias & Muller 2006 |
-
----
-
-## Приоритеты улучшений
-
-### 🔴 Критические (ошибки — исправить немедленно)
-
-| # | Задача | Сложность | Описание |
-|---|--------|-----------|----------|
-| P1/P2 | CFL fix в planet diffusion | Низкая | `dt_per_pass = dt_yr / n_passes` в строках 3181-3204 |
-
-### 🟡 Высокие (фудж-факторы, баги, потеря физики)
-
-| # | Задача | Сложность | Описание |
-|---|--------|-----------|----------|
-| P3 | H* = 1.0m + перекалибровка | Средняя | Строка 5478. Снизить до рекомендованного, подстроить V_s |
-| P4 | Shelf: sediment infill model | Высокая | Строки 3617-3697. Заменить BFS override |
-| P5 | spherical_fbm в evolve | Низкая | Строки 1431-1436. Заменить sin/cos |
-| P6 | Hotspot lat convention | Низкая | Строки 2910-2913. Использовать CellCache |
-| P7 | Valley carving 40x | Низкая | Строка 4837. Снизить с 80x до 40x |
-| P8 | Chamfer fix | Низкая | Строки 4187/4204. Убрать (-1,1) из forward |
-| P9 | Peneplain time-dependent | Средняя | Строка 3444. tau_denudation model |
-| P10 | Coastline perturbation unification | Средняя | 3 системы -> 1-2 |
-| G4 | Возраст литосферы -> K_eff | Средняя | Модулировать K_eff по тектонической активности |
-| G8 | Priority-Flood pit-filling | Средняя | Заменить текущий lake detection |
-| G9 | Sediment gravity routing | Высокая | Заменить weighted redistribution |
-
-### ⚪ Низкие (неустранимо или незначимо)
-
-- F1-F3, F5-F8: Plate growth heuristics — неустранимо без мантийной конвекции
-- F15, F18: Safety valves — редко срабатывают
-- E1, E2: Voronoi growth — архитектурно неустранимо
-- E7: Hypsometric correction — conditional safety valve
-- G6: Эвстазия — низкий приоритет
-
-### Архитектурные задачи (не физика)
-
-| Задача | Описание |
-|--------|----------|
-| Phase 1.2: Unified crop scope | Island blob fix — `fade_land_edges=true` уничтожает форму |
+| Мар 2026 | Нет Priority-Flood pit-filling | Barnes 2014 + Budyko endorheic basins |
+| Мар 2026 | Cell-count accumulation | Budyko 1974 physical discharge Q [m^3/s] |
+| Мар 2026 | H*=2.0m выше рекомендованного | H*=1.0m (Shobe 2017 верхняя граница) |
+| Мар 2026 | V_s=0.1 -> недостаточное врезание | V_s=0.05 (согласовано с H*=1.0) |
+| Мар 2026 | 80x valley ratio -> верхний край | 40x (geom. mean Schumm 1977) |
+| Мар 2026 | Peneplain 40% flatten -> не из физики | tau_denudation=50 Myr (Pazzaglia & Brandon 1996) |
+| **Мар 2026** | **LIP lat convention bug** | **North-first: (PI/2-lat)/PI*height** |
+| **Мар 2026** | **Biome mode filter (no physics)** | **Prentice 1992 spatial climate averaging** |
+| **Мар 2026** | **sin/cos structural field** | **spherical_fbm (5-oct Rodrigues)** |
+| **Мар 2026** | **def^3/def^2 ridge/trench** | **Gaussian exp(-(1-def)^2/sigma^2)** |
+| **Мар 2026** | **Glacial buzzsaw 2500-1000*int** | **Mitchell & Montgomery 2006: 600+900*(1-int)** |
+| **Мар 2026** | **Iso relax one tau=5Myr** | **Per-cell tau from Te^0.75 (Watts 2001)** |
+| **Мар 2026** | **Foreland upper-bound amplitudes** | **DeCelles & Giles 1996 Table 2 means** |
+| **Мар 2026** | **Rift shoulders 400m fixed** | **500-1200m maturity (Weissel & Karner 1989)** |
+| **Мар 2026** | **Linear K_br in SPACE** | **Nonlinear (1-def)^2 (Whipple 2004)** |
+| **Мар 2026** | **Coastline sigma empirical** | **Margin-modulated (Kearey et al. 2009)** |
+| **Мар 2026** | **MFD explicit + 30% cap** | **Semi-implicit B&W (Braun & Willett 2013)** |
+| **Мар 2026** | **Gray atmosphere p^0.3** | **Two-stream Schwarzschild (Pierrehumbert 2010)** |
+| **Мар 2026** | **Shelf 15-cell fixed width** | **Margin-dependent + exponential (Emery & Uchupi 1984)** |
+| **Мар 2026** | **Continentality 0.008*sin(lat)** | **0.010*sin^2(phi) calibrated (Terjung 1972)** |
 
 ---
 
@@ -350,13 +251,29 @@ kappa*dt/dx^2 = 0.02 * 10e6 / 10000^2 = 2.0. CFL требует < 0.25.
 | Level 3.1 | Климато-зависимая эрозия | Roe et al. 2003 |
 | Level 3.2 | Профиль континентального шельфа | Kennett 1982 |
 | Level 4.1 | Перераспределение осадков | Milliman & Syvitski 1992 |
-| Level 4.2 | Кратонные пенеплены | King 1967 |
+| Level 4.2 | Кратонные пенеплены (tau_denudation) | Pazzaglia & Brandon 1996; King 1967 |
 | Level 4.3 | Океанические плато / LIPs | Coffin & Eldholm 1994 |
 | Level 5.1 | Срединно-океанические хребты | Macdonald 1982; Stern 2002 |
 | Level 5.2 | Эпейрогенический варпинг | Mitrovica 1989; Bond 1976 |
 | Level 5.3 | Задуговые бассейны | Karig 1971; Sdrolias & Muller 2006 |
 | Phase H13 | Climate-coupled runoff в SPACE | Roe 2003 |
 | Phase H16 | Изостатическая разгрузка в B&W solver | Molnar & England 1990 |
+| River R0-R5 | Priority-Flood, Budyko, Strahler, channel geom, deltas | Barnes 2014; Budyko 1974; Leopold 1953 |
+| SPACE cal | H*=1.0m, V_s=0.05 m/yr (in-range params) | Shobe et al. 2017 |
+| **IDEAL-01** | **LIP lat convention fix** | **North-first WorldCache convention** |
+| **IDEAL-02** | **Biome smoothing: Prentice 1992** | **Spatial climate averaging at ecotones** |
+| **IDEAL-03** | **Structural field: spherical_fbm** | **5-octave FBM, Rodrigues domain rotation** |
+| **IDEAL-04** | **Ridge/trench Gaussian profiles** | **exp(-(1-def)^2/sigma^2), sigma from lit.** |
+| **IDEAL-05** | **Glacial buzzsaw calibration** | **Mitchell & Montgomery 2006 peak-ELA** |
+| **IDEAL-06** | **Per-cell isostatic tau** | **tau ~ Te^0.75 (Watts 2001 §8.4)** |
+| **IDEAL-07** | **Foreland basin calibration** | **DeCelles & Giles 1996 Table 2 means** |
+| **IDEAL-08** | **Rift shoulder maturity** | **500-1200m (Weissel & Karner 1989)** |
+| **IDEAL-09** | **Nonlinear K_br** | **Whipple 2004: (1-def)^2 power law** |
+| **IDEAL-10** | **Margin-modulated coastline** | **Kearey et al. 2009 active/passive** |
+| **IDEAL-11** | **Semi-implicit MFD stream power** | **B&W 2013 implicit + MFD area** |
+| **IDEAL-12** | **Two-stream greenhouse** | **Pierrehumbert 2010 Schwarzschild eq.** |
+| **IDEAL-13** | **Margin-dependent shelf** | **Emery & Uchupi 1984 + Watts 2001** |
+| **IDEAL-14** | **Calibrated continentality** | **sin^2(phi), 2000km sat. (Terjung 1972)** |
 
 ---
 
@@ -364,7 +281,7 @@ kappa*dt/dx^2 = 0.02 * 10e6 / 10000^2 = 2.0. CFL требует < 0.25.
 
 | # | Файл | Тема |
 |---|------|------|
-| — | [AUDIT_REPORT](AUDIT_REPORT.md) | Полный научно-технический аудит (март 2026) |
+| -- | [AUDIT_REPORT](AUDIT_REPORT.md) | Полный научно-технический аудит v6 (март 2026) |
 | 01 | [01_ОБЗОР](01_ОБЗОР.md) | Архитектура, pipeline, входы/выходы |
 | 02 | [02_СЕТКА](02_СЕТКА.md) | Сетка, координаты, обёртка полюсов |
 | 03 | [03_ПЛИТЫ](03_ПЛИТЫ.md) | Генерация и эволюция тектонических плит |
@@ -387,4 +304,4 @@ kappa*dt/dx^2 = 0.02 * 10e6 / 10000^2 = 2.0. CFL требует < 0.25.
 ## Принцип
 
 Каждый параметр указан с точным значением из кода и источником.
-Где физика упрощена или подобрана вручную — указано явно.
+Где физика упрощена или подобрана вручную -- указано явно.
