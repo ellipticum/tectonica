@@ -3321,18 +3321,19 @@ fn compute_relief_physics(
             // Distance from convergent boundary
             let d_km = -l_d_conv_km * cd.ln();
 
-            // Foredeep: Gaussian trough centered at ~200 km from orogen edge,
-            // width σ = 80 km (Beaumont 1981: foredeep 100–300 km wide).
-            let foredeep = (-((d_km - 200.0) / 80.0).powi(2) / 2.0).exp();
+            // Foredeep: Gaussian trough centered at ~175 km from orogen edge,
+            // width sigma = 80 km (Beaumont 1981: foredeep 100-300 km wide).
+            // DeCelles & Giles 1996 Table 2: mean distance ~150-200 km.
+            let foredeep = (-((d_km - 175.0) / 80.0).powi(2) / 2.0).exp();
 
-            // Forebulge: subtle rise at ~400 km (Watts 2001 Fig 3.17).
-            let forebulge = (-((d_km - 400.0) / 60.0).powi(2) / 2.0).exp();
+            // Forebulge: subtle rise at ~350 km (DeCelles & Giles 1996
+            // Table 2: 250-450 km; Watts 2001 Fig 3.17: ~300-400 km).
+            let forebulge = (-((d_km - 350.0) / 60.0).powi(2) / 2.0).exp();
 
-            // Surface expression: foredeep −150 m, forebulge +30 m.
-            // These are SURFACE effects — the subsurface basin is km-deep
-            // but filled with sediment to near sea level.
-            // The surface expression is the underfilled portion.
-            let basin_depth = -150.0 * foredeep + 30.0 * forebulge;
+            // Surface expression: foredeep -120 m, forebulge +30 m.
+            // DeCelles & Giles 1996: surface expression 50-200 m,
+            // mean ~120 m for active foreland (Ganges, Po Valley).
+            let basin_depth = -120.0 * foredeep + 30.0 * forebulge;
 
             basin_field[i] = basin_depth * cf; // fade at continent edges
         }
