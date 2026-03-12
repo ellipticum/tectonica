@@ -3805,67 +3805,83 @@ fn compute_relief_physics(
     // get noise added.  If the noise pushes them across 0, they flip land↔ocean.
     // This is equivalent to the spectral perturbation used at crop scale but
     // applied to the global coastline.
-    // Two-pass Gaussian-weighted elevation perturbation near sea level.
+    // Three-pass Gaussian-weighted elevation perturbation near sea level.
     //
-    // Pass 1 — large scale (σ=2000m): creates 200–1000 km embayments,
-    //   peninsulas, and inland seas.  Low-frequency noise (λ = 2500–5000 km)
-    //   reshapes continental outlines.
+    // Per-cell sigma and amplitude are modulated by margin type
+    // (Kearey, Klepeis & Vine 2009, "Global Tectonics", ch. 7):
+    //   Active margins (subduction, high conv_def) → steeper gradient,
+    //     more linear coast → narrower Gaussian (σ×0.7), smaller amplitude (×0.6)
+    //   Passive margins (trailing edge, low conv_def) → wide shelf,
+    //     irregular coast → wider Gaussian (σ×1.3), larger amplitude (×1.4)
     //
-    // Pass 2 — medium scale (σ=600m): creates 30–200 km bays, islands,
-    //   and archipelagos.  Mid-frequency noise (λ = 600–1200 km).
+    // Pass 1 — large scale (σ_base=2000m): 200–1000 km embayments
+    // Pass 2 — medium scale (σ_base=1000m): 50–200 km bays, capes
+    // Pass 3 — fine scale (σ_base=500m): 10–50 km fjords, small islands
     //
     // The Gaussian weight exp(−h²/2σ²) ensures maximum perturbation at the
-    // coast (h≈0) and rapid decay inland/seaward.  Physically, this models
-    // the variability of continental shelf width and coastal plain topography
-    // (Wessel & Smith 1996, J. Geophys. Res.).
+    // coast (h≈0) and rapid decay inland/seaward (Wessel & Smith 1996).
     {
         let coast_seed = hash_u32(seed ^ 0xC0A5_7111);
         // Pass 1: large-scale coastal reshaping (200–1000 km embayments)
-        // σ = 2000 m: affects cells within ~±4000 m of sea level → wide
-        // reshaping zone for inland seas, major gulfs, and large peninsulas.
-        let sigma1 = 2000.0_f32;
-        let inv_2sig2_1 = 1.0 / (2.0 * sigma1 * sigma1);
+        let sigma1_base = 2000.0_f32;
+        let amp1_base = [1500.0_f32, 800.0_f32];
         for i in 0..size {
             let h = relief[i];
-            let weight = (-h * h * inv_2sig2_1).exp();
+            // Margin-type modulation: conv_def as proxy for active margin
+            let activity = (conv_def[i].clamp(0.0, 0.8)) / 0.8;
+            let sigma_f = 0.7 + 0.6 * (1.0 - activity);
+            let amp_f = 0.6 + 0.8 * (1.0 - activity);
+            let sigma = sigma1_base * sigma_f;
+            let inv_2sig2 = 1.0 / (2.0 * sigma * sigma);
+            let weight = (-h * h * inv_2sig2).exp();
             if weight < 0.01 { continue; }
             let nx = cell_cache.noise_x[i];
             let ny = cell_cache.noise_y[i];
             let nz = cell_cache.noise_z[i];
-            let n1 = value_noise3(nx * 3.0, ny * 3.0, nz * 3.0, coast_seed) * 1500.0;
-            let n2 = value_noise3(nx * 6.0 + 3.7, ny * 6.0 - 1.3, nz * 6.0, coast_seed ^ 0x1111) * 800.0;
+            let n1 = value_noise3(nx * 3.0, ny * 3.0, nz * 3.0, coast_seed) * amp1_base[0] * amp_f;
+            let n2 = value_noise3(nx * 6.0 + 3.7, ny * 6.0 - 1.3, nz * 6.0, coast_seed ^ 0x1111) * amp1_base[1] * amp_f;
             relief[i] += (n1 + n2) * weight;
         }
         // Pass 2: medium-scale coastal detail (50–200 km bays, capes)
-        let sigma2 = 1000.0_f32;
-        let inv_2sig2_2 = 1.0 / (2.0 * sigma2 * sigma2);
+        let sigma2_base = 1000.0_f32;
+        let amp2_base = [500.0_f32, 250.0_f32];
         let coast_seed2 = hash_u32(seed ^ 0xC0A5_7222);
         for i in 0..size {
             let h = relief[i];
-            let weight = (-h * h * inv_2sig2_2).exp();
+            let activity = (conv_def[i].clamp(0.0, 0.8)) / 0.8;
+            let sigma_f = 0.7 + 0.6 * (1.0 - activity);
+            let amp_f = 0.6 + 0.8 * (1.0 - activity);
+            let sigma = sigma2_base * sigma_f;
+            let inv_2sig2 = 1.0 / (2.0 * sigma * sigma);
+            let weight = (-h * h * inv_2sig2).exp();
             if weight < 0.01 { continue; }
             let nx = cell_cache.noise_x[i];
             let ny = cell_cache.noise_y[i];
             let nz = cell_cache.noise_z[i];
-            let n1 = value_noise3(nx * 12.0 + 5.1, ny * 12.0 - 2.7, nz * 12.0, coast_seed2) * 500.0;
-            let n2 = value_noise3(nx * 24.0 - 1.9, ny * 24.0 + 3.3, nz * 24.0, coast_seed2 ^ 0x2222) * 250.0;
+            let n1 = value_noise3(nx * 12.0 + 5.1, ny * 12.0 - 2.7, nz * 12.0, coast_seed2) * amp2_base[0] * amp_f;
+            let n2 = value_noise3(nx * 24.0 - 1.9, ny * 24.0 + 3.3, nz * 24.0, coast_seed2 ^ 0x2222) * amp2_base[1] * amp_f;
             relief[i] += (n1 + n2) * weight;
         }
         // Pass 3: fine-scale fractal detail (10–50 km fjords, small islands)
         // High-frequency noise creates the jagged, fractal coastline texture
         // that makes maps look realistic (Richardson 1961, D ≈ 1.25).
-        let sigma3 = 500.0_f32;
-        let inv_2sig2_3 = 1.0 / (2.0 * sigma3 * sigma3);
+        let sigma3_base = 500.0_f32;
+        let amp3_base = [200.0_f32, 100.0_f32];
         let coast_seed3 = hash_u32(seed ^ 0xC0A5_7333);
         for i in 0..size {
             let h = relief[i];
-            let weight = (-h * h * inv_2sig2_3).exp();
+            let activity = (conv_def[i].clamp(0.0, 0.8)) / 0.8;
+            let sigma_f = 0.7 + 0.6 * (1.0 - activity);
+            let amp_f = 0.6 + 0.8 * (1.0 - activity);
+            let sigma = sigma3_base * sigma_f;
+            let inv_2sig2 = 1.0 / (2.0 * sigma * sigma);
+            let weight = (-h * h * inv_2sig2).exp();
             if weight < 0.01 { continue; }
             let nx = cell_cache.noise_x[i];
             let ny = cell_cache.noise_y[i];
             let nz = cell_cache.noise_z[i];
-            let n1 = value_noise3(nx * 48.0 + 9.3, ny * 48.0 - 4.1, nz * 48.0, coast_seed3) * 200.0;
-            let n2 = value_noise3(nx * 96.0 - 7.5, ny * 96.0 + 6.2, nz * 96.0, coast_seed3 ^ 0x3333) * 100.0;
+            let n1 = value_noise3(nx * 48.0 + 9.3, ny * 48.0 - 4.1, nz * 48.0, coast_seed3) * amp3_base[0] * amp_f;
+            let n2 = value_noise3(nx * 96.0 - 7.5, ny * 96.0 + 6.2, nz * 96.0, coast_seed3 ^ 0x3333) * amp3_base[1] * amp_f;
             relief[i] += (n1 + n2) * weight;
         }
     }
