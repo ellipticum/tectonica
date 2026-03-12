@@ -3442,9 +3442,14 @@ fn compute_relief_physics(
             // Gaussian peak at ~100 km from rift, width 40 km.
             let shoulder = (-((d_km - 100.0) / 40.0).powi(2) / 2.0).exp();
 
-            // Shoulder amplitude: 400 m (modest — large rifts like EAR
-            // have 1–2 km but those are partially from hotspot interaction).
-            let shoulder_uplift = 400.0 * shoulder * cf * dd.min(1.0);
+            // Shoulder amplitude: scales with rift maturity (div_def
+            // at boundary ≈ 1.0 for mature rift, ≈ 0.3 for incipient).
+            // Weissel & Karner 1989: 500 m (incipient) to 1200 m (mature).
+            // Mature rifts (EAR, Red Sea) have 1-2 km, but hotspot
+            // interaction contributes ~50%; pure flexural ≈ 0.5-1.2 km.
+            let maturity = dd.min(1.0);
+            let amp = 500.0 + 700.0 * maturity; // 500-1200 m
+            let shoulder_uplift = amp * shoulder * cf * maturity;
 
             if relief[i] > 0.0 {
                 relief[i] += shoulder_uplift;
