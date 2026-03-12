@@ -2704,17 +2704,23 @@ fn compute_relief_physics(
             // We add a peaked ridge crest using div_def, which is maximal at
             // the boundary and decays over 200 km.
             // Ridge crest: +500 m at axis, narrowly concentrated.
-            let ridge_crest = div_def[i].powf(3.0) * 500.0;
+            // Ridge crest: Gaussian profile, half-width σ ≈ 30 km
+            // (Macdonald 1982 Fig. 2: axial high ~20–50 km wide).
+            // def decays as exp(-d/L_d), so def² ≈ exp(-2d/L_d) ≈ Gaussian
+            // with σ_eff = L_d/(2√2) ≈ 200/(2√2) ≈ 70 km — still broad.
+            // Use exp(-(1-def)²/σ²) for sharper axial peak.
+            let d = div_def[i];
+            let ridge_crest = (-(1.0 - d).powi(2) / 0.04).exp() * 500.0; // σ=0.2 in def-space ≈ 40 km
 
-            // Convergent trench deepening (Stern 2002):
-            // Subduction trenches are 2–4 km deeper than surrounding ocean.
-            // At the boundary crest (conv_def ≈ 1): −1500 m; decays with d³
-            // to concentrate the trench narrowly.
-            let trench = conv_def[i].powf(3.0) * 1500.0;
+            // Trench: Gaussian profile, half-width σ ≈ 50 km
+            // (Stern 2002: trench widths 40–100 km, depths 2–4 km).
+            let c = conv_def[i];
+            let trench = (-(1.0 - c).powi(2) / 0.06).exp() * 1500.0; // σ=0.245 ≈ 50 km
 
-            // Transform fracture zone scarps: 200–800 m relief at transform
-            // boundaries (Tucholke & Schouten 1988).
-            let fracture = trans_def[i].powf(2.0) * 400.0;
+            // Transform fracture zone scarps: Gaussian, 200–800 m relief
+            // (Tucholke & Schouten 1988). σ ≈ 60 km.
+            let t = trans_def[i];
+            let fracture = (-(1.0 - t).powi(2) / 0.09).exp() * 400.0; // σ=0.3 ≈ 45 km
 
             relief[i] += hills + ridge_crest - trench - fracture;
         }
