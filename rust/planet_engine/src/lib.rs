@@ -2267,10 +2267,12 @@ fn compute_relief_physics(
     // Transform L_d = 150 km: San Andreas fault zone.
     // Bourne et al. 1998 cite 100–200 km for transcurrent shear zones.
     // Convergent L_d = 250 km: England & McKenzie 1982 Table 1 cite
-    // 200–500 km for continental collision zones.  250 km is the geometric
-    // mean, producing 3σ ≈ 750 km wide orogenic belts (consistent with
-    // Andes ~700 km, Himalaya-Tibet ~800 km, Alps ~200 km).
-    let mut conv_def = propagate_deformation(&conv_seed, 250.0, grid);
+    // Convergent half-width 180 km (Hodges 2000; Oncken et al. 2006).
+    // Full orogen width ≈ 2.3 × L_d ≈ 414 km, consistent with
+    // Andes ~300 km, Himalaya ~250 km, Alps ~150 km.  Combined with
+    // stream power erosion (H1), effective belt narrows further as
+    // rivers incise the flanks.
+    let mut conv_def = propagate_deformation(&conv_seed, 180.0, grid);
     let mut div_def = propagate_deformation(&div_seed, 200.0, grid);
     let mut trans_def = propagate_deformation(&trans_seed, 150.0, grid);
 
@@ -2740,7 +2742,7 @@ fn compute_relief_physics(
     // Continental arcs (Andes, Cascades): 1000–2000 m additional uplift.
     // Oceanic island arcs (Mariana, Tonga): 500–1500 m above ocean floor.
     {
-        let l_d_conv_km = 250.0_f32; // must match propagate_deformation L_d
+        let l_d_conv_km = 180.0_f32; // must match propagate_deformation L_d
         let d_arc_km = 166.0_f32;    // Syracuse & Abers 2006 median
         let sigma_arc_km = 40.0_f32; // across-strike half-width
 
@@ -3085,7 +3087,7 @@ fn compute_relief_physics(
         let mut uplift = vec![0.0_f32; size];
         let v_plate = tectonics.plate_speed_cm_per_year.clamp(1.0, 20.0) * 0.01; // m/yr
         // L_d values must match the propagate_deformation calls above.
-        let l_d_conv = 250.0e3_f32; // m (convergent half-width)
+        let l_d_conv = 180.0e3_f32; // m (convergent half-width, Hodges 2000)
         let l_d_div = 200.0e3_f32;  // m (divergent half-width)
         let l_d_trans = 150.0e3_f32; // m (transform half-width)
         let rho_m = 3300.0_f32;
@@ -3122,25 +3124,13 @@ fn compute_relief_physics(
         // the linear ridge structure that makes mountains readable.
         smooth_field(&mut uplift, 4, grid);
 
-        // Apply uplift to land cells.
         // dt = total plate evolution time from evolve_plate_field (sum of all
         // reorganization step durations; Torsvik et al. 2010).  Typical value
         // ~7–15 Myr for 7 steps.  Replaces the previous arbitrary 1.5 Myr.
         let dt_yr = plates.evolution_time_yr;
-        for i in 0..size {
-            if relief[i] > 0.0 {
-                relief[i] += uplift[i] * dt_yr;
-            }
-        }
 
-        // Climate-dependent diffusive erosion (Roe et al. 2003; Whipple 2009).
+        // Climate factor for erosion modulation (Roe et al. 2003; Whipple 2009).
         //
-        // Erosion rate depends on precipitation (runoff drives incision and
-        // mass wasting).  At 10 km/cell, κ_eff integrates all surface
-        // processes: hillslope creep, mass wasting, sheet wash, weathering.
-        //
-        // Base: κ₀ = 0.02 m²/yr (Fernandes & Dietrich 1997).
-        // Climate modulation: κ_eff = κ₀ × f_climate
         //   f_climate from latitude-based Hadley precipitation pattern:
         //   - ITCZ (0–15°): f = 1.5 (wet tropics, high weathering)
         //   - Subtropical deserts (15–30°): f = 0.3 (arid, minimal erosion)
@@ -3150,10 +3140,6 @@ fn compute_relief_physics(
         // Continental aridity: interior cells (far from coast) get reduced κ
         // (Scanlon et al. 2006: continental interior receives 30–60% of
         // coastal precipitation).
-        //
-        // 12 passes, CFL-safe with per-cell κ.
-
-        // Pre-compute climate factor per cell.
         let mut climate_factor = vec![1.0_f32; size];
         for y in 0..grid.height {
             let lat_deg = ((y as f32 + 0.5) / grid.height as f32 * 180.0 - 90.0).abs();
@@ -3183,19 +3169,51 @@ fn compute_relief_physics(
             }
         }
 
-        // Diffusive erosion with sediment redistribution (Allen 2008,
-        // "Sediment routing systems"; Paola & Voller 2005, JGR).
+        // ── Stream power erosion (Braun & Willett 2013; Salles et al. 2023) ──
         //
-        // Material eroded from highlands is tracked as a sediment budget.
-        // After diffusion, accumulated sediment is deposited in lowland cells
-        // (elevation < median), creating alluvial plains, river deltas, and
-        // basin fills.  This transforms the current "erosion-only" model into
-        // a mass-conserving "erosion + deposition" system.
+        // Coupled uplift + fluvial incision via semi-implicit B&W scheme.
+        // MFD drainage area (Freeman 1991) avoids D8 spoke artifacts at
+        // ~10 km/cell resolution.
+        //
+        // K_base = 3×10⁻⁶ yr⁻¹ (Whipple 2004, Table 1: detachment-limited,
+        // m=0.5, n=1 → K ≈ 1–10 × 10⁻⁶ yr⁻¹ for typical lithologies).
+        // Climate modulation: K_eff = K_base × f_climate (Roe et al. 2003).
+        //
+        // 5 coupled steps at sub_dt = evolution_time / 5.  The implicit scheme
+        // is unconditionally stable (no CFL restriction), so sub-stepping is
+        // for accuracy of the uplift–erosion coupling, not stability.
+        {
+            let k_base_sp = 3e-6_f32;
+            let n_steps_sp = 5_usize;
+            let sub_dt = dt_yr / n_steps_sp as f32;
+            let mut k_eff_sp = vec![0.0_f32; size];
+            for i in 0..size {
+                k_eff_sp[i] = k_base_sp * climate_factor[i];
+            }
+            for _ in 0..n_steps_sp {
+                stream_power_step_mfd(
+                    &mut relief,
+                    &uplift,
+                    &k_eff_sp,
+                    sub_dt,
+                    dx_m,
+                    0.5,  // m: drainage area exponent (Whipple & Tucker 1999)
+                    1.0,  // n: slope exponent (linear, exact implicit)
+                    0.0,  // kappa: hillslope diffusion handled separately below
+                    1.1,  // mfd_p: gentle MFD partitioning (Freeman 1991)
+                    grid,
+                );
+            }
+        }
+
+        // ── Hillslope diffusion + MFD sediment routing ──
+        //
+        // Hillslope diffusive erosion (Fernandes & Dietrich 1997).
+        // κ₀ = 0.02 m²/yr, climate-modulated.  12 Jacobi passes.
+        // CFL: κ·dt/dx² = 0.02 × 10⁷ / 10⁴² = 0.002 ≪ 0.25.  Stable.
         let kappa_base = 0.02_f32;
         let inv_dx2 = 1.0 / (dx_m * dx_m);
-        let mut total_eroded = 0.0_f32;
-        // 12 Jacobi iterations of diffusion with full time step.
-        // CFL check: kappa*dt/dx^2 = 0.02 * ~10e6 / 10000^2 = 0.002 << 0.25. Stable.
+        let mut cell_eroded = vec![0.0_f32; size];
         for _ in 0..12 {
             let mut laplacian = vec![0.0_f32; size];
             for y in 0..grid.height {
@@ -3215,41 +3233,86 @@ fn compute_relief_physics(
                     let kdt = kappa_base * climate_factor[i] * dt_yr;
                     let dh = kdt * laplacian[i];
                     let new_h = (relief[i] + dh).max(0.0);
-                    let removed = relief[i] - new_h; // positive = erosion
-                    if removed > 0.0 { total_eroded += removed; }
+                    let removed = relief[i] - new_h;
+                    if removed > 0.0 { cell_eroded[i] += removed; }
                     relief[i] = new_h;
                 }
             }
         }
 
-        // Redistribute eroded sediment into lowland cells.
-        // Sediment preferentially fills the lowest continental areas
-        // (foreland basins, river valleys, coastal plains).
-        // Only 60% of eroded material stays on land — 40% is transported
-        // to the ocean as suspended load (Milliman & Syvitski 1992).
-        if total_eroded > 0.0 {
-            let land_sediment = total_eroded * 0.6;
-            // Find lowland cells (below median land elevation) and weight by
-            // how low they are — lowest cells get the most sediment.
-            let mut low_cells: Vec<(usize, f32)> = Vec::new();
-            let mut weight_sum = 0.0_f32;
-            // Quick median estimate: use 30th percentile of land as cutoff
-            let mut land_heights: Vec<f32> = relief.iter()
-                .filter(|&&h| h > 0.0).copied().collect();
-            if land_heights.len() > 100 {
-                land_heights.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let p30 = land_heights[land_heights.len() * 30 / 100];
-                for i in 0..size {
-                    if relief[i] > 0.0 && relief[i] < p30 {
-                        let w = (p30 - relief[i]).max(0.0);
-                        low_cells.push((i, w));
-                        weight_sum += w;
+        // ── MFD sediment routing (Salles 2019, GMD; Paola & Voller 2005) ──
+        //
+        // Eroded sediment is routed downstream via MFD (Freeman 1991).
+        // Deposition occurs where transport capacity drops — i.e. where
+        // local slope falls below S_crit (transport-limited regime).
+        //
+        //   Transport capacity: proportional to slope (unit stream power).
+        //   Deposition fraction: f_dep = max(0, 1 − S/S_crit)
+        //   S_crit = 0.001 (1 m/km) — typical alluvial transport threshold
+        //   (Parker 1978; Paola et al. 1992).
+        //
+        // 60% of eroded material stays on land — 40% exported to ocean
+        // as suspended load (Milliman & Syvitski 1992).
+        {
+            let s_crit = 0.001_f32; // alluvial transport threshold
+            let land_frac = 0.6_f32; // fraction retained on land
+
+            // Sediment source: per-cell erosion × land retention
+            let mut sed_flux = vec![0.0_f32; size];
+            for i in 0..size {
+                sed_flux[i] = cell_eroded[i] * land_frac;
+            }
+
+            // Topological sort high → low for downstream routing
+            let order = topological_sort_descending(&relief);
+
+            // Route sediment downstream: high cells first
+            for &i in &order {
+                if relief[i] <= 0.0 || sed_flux[i] <= 0.0 { continue; }
+
+                let y = i / grid.width;
+                let x = i % grid.width;
+                let hi = relief[i];
+
+                // Compute MFD weights to downslope neighbors
+                let mut targets: [(usize, f32); 8] = [(0, 0.0); 8];
+                let mut w_sum = 0.0_f32;
+                let mut count = 0_usize;
+                let mut max_slope = 0.0_f32;
+                for oy in -1_i32..=1 {
+                    for ox in -1_i32..=1 {
+                        if ox == 0 && oy == 0 { continue; }
+                        let j = grid.neighbor(x as i32 + ox, y as i32 + oy);
+                        let dist = if ox == 0 || oy == 0 { dx_m }
+                                   else { dx_m * std::f32::consts::SQRT_2 };
+                        let slope = (hi - relief[j]) / dist;
+                        if slope > 0.0 {
+                            let w = slope.powf(1.1); // MFD p=1.1
+                            targets[count] = (j, w);
+                            w_sum += w;
+                            count += 1;
+                            if slope > max_slope { max_slope = slope; }
+                        }
                     }
                 }
-                if weight_sum > 0.0 {
-                    for &(i, w) in &low_cells {
-                        relief[i] += land_sediment * (w / weight_sum);
-                    }
+
+                if w_sum <= 0.0 || count == 0 { continue; }
+
+                // Deposition fraction: deposit where slope < S_crit
+                let f_dep = (1.0 - max_slope / s_crit).clamp(0.0, 0.9);
+                let deposit = sed_flux[i] * f_dep;
+                let pass_on = sed_flux[i] - deposit;
+
+                // Deposit sediment at this cell
+                if deposit > 0.0 && relief[i] > 0.0 {
+                    relief[i] += deposit;
+                }
+
+                // Pass remaining sediment to downslope neighbors via MFD
+                let inv_w = 1.0 / w_sum;
+                for k in 0..count {
+                    let (j, w) = targets[k];
+                    sed_flux[j] += pass_on * w * inv_w;
                 }
             }
         }
@@ -3310,7 +3373,7 @@ fn compute_relief_physics(
         // AND continental_frac is high (interior craton, not ocean).
         // The basin is NEGATIVE topography relative to surroundings.
         let mut basin_field = vec![0.0_f32; size];
-        let l_d_conv_km = 250.0;
+        let l_d_conv_km = 180.0; // must match propagate_deformation L_d
         for i in 0..size {
             let cd = conv_def[i];
             if cd < 0.005 || cd > 0.7 { continue; } // only in foreland zone
@@ -3570,7 +3633,7 @@ fn compute_relief_physics(
     // (behind the arc), σ=80 km.  Ocean back-arcs: -800 m deepening.
     // Continental back-arcs: -300 m subsidence.
     {
-        let l_d_conv_km = 250.0_f32;
+        let l_d_conv_km = 180.0_f32; // must match propagate_deformation L_d
 
         for i in 0..size {
             let cd = conv_def[i];
@@ -3929,6 +3992,42 @@ fn compute_relief_physics(
             } else if scratch[i] <= 0.0 && land_n >= 3 {
                 relief[i] = land_min.min(5.0).max(0.5);
             }
+        }
+    }
+
+    // ── Hypsometric validation (Strahler 1952; Harrison et al. 1983) ──
+    //
+    // Earth reference: hypsometric integral ≈ 0.39–0.42, modal elevation
+    // 300–400 m, ~70% of land below 1000 m.  Log key stats for comparison.
+    {
+        let mut land_h: Vec<f32> = relief.iter().filter(|&&h| h > 0.0).copied().collect();
+        if !land_h.is_empty() {
+            land_h.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = land_h.len();
+            let h_max = land_h[n - 1];
+            let h_min = land_h[0];
+            let h_median = land_h[n / 2];
+            // Hypsometric integral = mean(h - h_min) / (h_max - h_min)
+            let range = (h_max - h_min).max(1.0);
+            let mean_h: f32 = land_h.iter().sum::<f32>() / n as f32;
+            let hypso_integral = (mean_h - h_min) / range;
+            // Fraction below 1000 m
+            let below_1k = land_h.iter().filter(|&&h| h < 1000.0).count();
+            let frac_below_1k = below_1k as f32 / n as f32;
+            // Percentiles
+            let p10 = land_h[n * 10 / 100];
+            let p25 = land_h[n * 25 / 100];
+            let p75 = land_h[n * 75 / 100];
+            let p90 = land_h[n * 90 / 100];
+            web_sys::console::log_1(&format!(
+                "[HYPSO] integral={:.3} (Earth≈0.40) | mean={:.0}m median={:.0}m | \
+                 <1000m: {:.1}% (Earth≈70%) | p10={:.0} p25={:.0} p75={:.0} p90={:.0} | \
+                 min={:.0} max={:.0}",
+                hypso_integral, mean_h, h_median,
+                frac_below_1k * 100.0,
+                p10, p25, p75, p90,
+                h_min, h_max,
+            ).into());
         }
     }
 
@@ -6067,7 +6166,11 @@ fn stream_power_step_mfd(
     for &i in order.iter().rev() {
         if height[i] <= 0.0 { continue; }
         let j = receiver[i];
-        if j == i { continue; } // pit or flat — skip
+        if j == i {
+            // Local minimum / flat — no erosion, but still apply uplift
+            height[i] += uplift[i] * dt_yr;
+            continue;
+        }
         let h_recv = height[j].max(0.0);
         let dx_ij = recv_dx[i];
         let a_term = k_eff[i] * area[i].powf(m) * dt_yr;
@@ -7340,7 +7443,7 @@ fn run_crop_pipeline(
     let rho_m_crop = 3300.0_f32;
     let rho_c_crop = 2800.0_f32;
     let delta_rho_frac_crop = (rho_m_crop - rho_c_crop) / rho_m_crop; // ≈ 0.1515
-    let l_d_conv_crop = 250.0e3_f32; // m — must match planet propagation
+    let l_d_conv_crop = 180.0e3_f32; // m — must match planet propagation
     let l_d_div_crop = 200.0e3_f32;
     let l_d_trans_crop = 150.0e3_f32;
     let f_transpression_crop = 0.15_f32; // Bourne et al. 1998
