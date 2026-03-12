@@ -5730,32 +5730,43 @@ fn compute_biomes_grid(
         biomes[i] = biome;
     }
 
-    // Biome smoothing: 2-pass mode filter eliminates single-cell biome
-    // anomalies (coastal "eyelash" fringe, isolated riparian pixels).
-    // For each land cell, if fewer than 2 of its 4 cardinal neighbors
-    // share its biome, replace with the most common non-ocean neighbor.
-    for _ in 0..2 {
+    // Biome boundary smoothing via spatial climate averaging (Prentice
+    // et al. 1992 BIOME model).  Instead of a mode filter (no physics),
+    // re-classify boundary cells from the mean T/P in a 3x3 window.
+    // This models microclimate mixing at ecotones: temperature advection
+    // and precipitation blending across grid-scale boundaries.
+    {
         let prev = biomes.clone();
         for i in 0..size {
             if prev[i] == 0 { continue; }
             let x = i % width;
             let y = i / width;
             let mut same = 0_u32;
-            let mut counts = [0_u32; 12];
             for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
                 let nx = (x as i32 + dx).rem_euclid(width as i32) as usize;
                 let ny = (y as i32 + dy).clamp(0, height_grid as i32 - 1) as usize;
-                let j = ny * width + nx;
-                let nb = prev[j];
-                if nb == prev[i] { same += 1; }
-                if nb != 0 && (nb as usize) < 12 { counts[nb as usize] += 1; }
+                if prev[ny * width + nx] == prev[i] { same += 1; }
             }
-            if same < 2 {
-                if let Some((best_id, _)) = counts.iter().enumerate()
-                    .skip(1).max_by_key(|(_, &c)| c)
-                {
-                    biomes[i] = best_id as u8;
+            if same >= 2 { continue; } // interior cell — keep as-is
+            // Boundary cell: average T/P in 3x3 neighborhood (land only)
+            let mut sum_t = 0.0_f32;
+            let mut sum_p = 0.0_f32;
+            let mut n = 0_u32;
+            for dy in -1_i32..=1 {
+                for dx in -1_i32..=1 {
+                    let nx = (x as i32 + dx).rem_euclid(width as i32) as usize;
+                    let ny = (y as i32 + dy).clamp(0, height_grid as i32 - 1) as usize;
+                    let j = ny * width + nx;
+                    if heights[j] > 0.0 {
+                        sum_t += temperature[j];
+                        sum_p += precipitation[j];
+                        n += 1;
+                    }
                 }
+            }
+            if n > 0 {
+                let abs_lat = ((y as f32 + 0.5) / height_grid as f32 * 180.0 - 90.0).abs();
+                biomes[i] = classify_biome_whittaker(sum_t / n as f32, sum_p / n as f32, heights[i], abs_lat);
             }
         }
     }
