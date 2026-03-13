@@ -2238,6 +2238,37 @@ fn compute_relief_physics(
         smooth_field(&mut continental_frac, 3, grid);
     }
 
+    // Polar attenuation: fade continental_frac → 0 at |lat| > 75°.
+    //
+    // On equirectangular grids, polar cells have extreme E-W compression
+    // (cos 85° ≈ 0.087 → 11:1 aspect ratio), producing severe artifacts
+    // in BFS propagation, smoothing, and erosion.  The spherical_wrap
+    // polar reflection mixes terrain from opposite longitudes, creating
+    // additional sharp boundaries.
+    //
+    // Physically justified: Earth has minimal land above 80°N (small
+    // Arctic islands); Antarctic bedrock is largely below sea level
+    // beneath the ice sheet (Fretwell et al. 2013, Bedmap2).
+    //
+    // Smooth cosine fade over 75°–85° to avoid introducing a new
+    // sharp boundary.
+    if grid.is_spherical {
+        let fade_start = 75.0_f32 * RADIANS;
+        let fade_range = 10.0_f32 * RADIANS;
+        for y in 0..grid.height {
+            let lat_deg = 90.0 - (y as f32 + 0.5) * (180.0 / grid.height as f32);
+            let abs_lat = lat_deg.abs() * RADIANS;
+            if abs_lat > fade_start {
+                let t = ((abs_lat - fade_start) / fade_range).clamp(0.0, 1.0);
+                let fade = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+                for x in 0..grid.width {
+                    let i = grid.index(x, y);
+                    continental_frac[i] *= fade;
+                }
+            }
+        }
+    }
+
     // --- 2. Crustal thickness from plate boundary physics ---
     // Create per-type seed fields from boundary detection, then propagate
     // with exponential decay to form wide deformation zones.
@@ -3079,50 +3110,18 @@ fn compute_relief_physics(
         // conv_def[i] already encodes the exp(−x/L_d) spatial decay.
         //
         // Crustal thickening rate: dH/dt = H_c × ε̇  (volume conservation)
-        // Surface uplift rate:     U = dH/dt × (ρ_m − ρ_c) / ρ_m  (Airy)
+        // No separate E&M uplift: crustal thickening is already encoded in
+        // crust_thickness (conv_thick = conv_def × 30 km) → isostatic_elevation.
+        // Adding E&M uplift on top double-counts the convergent contribution:
+        //   crust_thickness → isostasy already builds mountains;
+        //   E&M rate × dt would add 2–5× more than the accumulated thickening.
         //
-        // This replaces the previous fudge constants (0.002, 0.001, 0.0003
-        // m/yr) with physics: the uplift rate depends on actual plate speed,
-        // crustal thickness, and density contrast per cell.
-        let mut uplift = vec![0.0_f32; size];
-        let v_plate = tectonics.plate_speed_cm_per_year.clamp(1.0, 20.0) * 0.01; // m/yr
-        // L_d values must match the propagate_deformation calls above.
-        let l_d_conv = 180.0e3_f32; // m (convergent half-width, Hodges 2000)
-        let l_d_div = 200.0e3_f32;  // m (divergent half-width)
-        let l_d_trans = 150.0e3_f32; // m (transform half-width)
-        let rho_m = 3300.0_f32;
-        for i in 0..size {
-            let cf = continental_frac[i];
-            // Only continental crust thickens under convergence; oceanic
-            // crust subducts.  cf² smoothly suppresses uplift in oceanic
-            // and transitional zones.
-            let cf_scale = cf * cf;
-            // Per-cell crustal thickness and density (same as isostatic_elevation).
-            let h_c = crust_thickness[i] * 1000.0; // km → m
-            let rho_c = 2900.0 - cf * 100.0;
-            let delta_rho_frac = (rho_m - rho_c) / rho_m;
-            // Convergent: shortening → crustal thickening → Airy uplift.
-            // Peak ≈ 0.8 mm/yr for v=5 cm/yr, H_c=40 km (cf. Bilham et al.
-            // 1997: 1–5 mm/yr GPS across Himalaya; our lower value reflects
-            // the 250 km orogenic belt average, not point rate).
-            let conv_rate = v_plate / (2.0 * l_d_conv);
-            let conv_uplift = conv_def[i] * conv_rate * h_c * delta_rho_frac * cf_scale;
-            // Divergent: extension → crustal thinning → subsidence.
-            let div_rate = v_plate / (2.0 * l_d_div);
-            let div_uplift = -div_def[i] * div_rate * h_c * delta_rho_frac * cf_scale;
-            // Transform: transpressional component ≈ 15% of plate-parallel
-            // motion (Bourne et al. 1998, JGR).
-            let f_transpression = 0.15_f32;
-            let trans_rate = f_transpression * v_plate / (2.0 * l_d_trans);
-            let trans_uplift = trans_def[i] * trans_rate * h_c * delta_rho_frac * cf_scale;
-            uplift[i] = conv_uplift + div_uplift + trans_uplift;
-        }
-        // 4 passes (σ ≈ 40 km) — keeps uplift concentrated near boundary
-        // crests.  Previous 10 passes (σ ≈ 100 km) flattened ridges into
-        // wide circular domes.  The deformation field itself already
-        // provides the 250 km half-width; additional smoothing only erases
-        // the linear ridge structure that makes mountains readable.
-        smooth_field(&mut uplift, 4, grid);
+        // Instead, stream power erosion carves from the isostatic starting
+        // relief, and the isostatic relaxation step (below) provides ongoing
+        // support by pulling relief back toward equilibrium.  This matches
+        // the real physics: mountains are isostatically supported, rivers
+        // carve valleys, and rebound partially restores eroded areas.
+        let uplift = vec![0.0_f32; size];
 
         // dt = total plate evolution time from evolve_plate_field (sum of all
         // reorganization step durations; Torsvik et al. 2010).  Typical value
@@ -3175,15 +3174,24 @@ fn compute_relief_physics(
         // MFD drainage area (Freeman 1991) avoids D8 spoke artifacts at
         // ~10 km/cell resolution.
         //
-        // K_base = 3×10⁻⁶ yr⁻¹ (Whipple 2004, Table 1: detachment-limited,
-        // m=0.5, n=1 → K ≈ 1–10 × 10⁻⁶ yr⁻¹ for typical lithologies).
-        // Climate modulation: K_eff = K_base × f_climate (Roe et al. 2003).
+        // K calibrated at dx_ref = 5 km (8K resolution) then scaled:
+        //   factor = K × A_cells^m × dt / dx
+        //   A_cells ∝ 1/dx², so factor ∝ K / dx^(2m+1)
+        //   Resolution-invariant K_eff = K_ref × (dx / dx_ref)^(2m+1)
+        //   For m=0.5: K_eff = K_ref × (dx / dx_ref)²
+        //
+        // K_ref = 8×10⁻⁶ at 8K (Whipple 2004, Table 1: K ≈ 1–10 × 10⁻⁶
+        // for detachment-limited, m=0.5, n=1; upper range accounts for
+        // sedimentary cover and chemical weathering at coarse grid scale).
+        // Climate modulation: K_eff = K_scaled × f_climate (Roe et al. 2003).
         //
         // 5 coupled steps at sub_dt = evolution_time / 5.  The implicit scheme
         // is unconditionally stable (no CFL restriction), so sub-stepping is
         // for accuracy of the uplift–erosion coupling, not stability.
         {
-            let k_base_sp = 3e-6_f32;
+            let k_ref = 8e-6_f32;
+            let dx_ref = 5000.0_f32; // m — reference: 8K grid
+            let k_base_sp = k_ref * (dx_m / dx_ref).powi(2);
             let n_steps_sp = 5_usize;
             let sub_dt = dt_yr / n_steps_sp as f32;
             let mut k_eff_sp = vec![0.0_f32; size];
@@ -3203,6 +3211,47 @@ fn compute_relief_physics(
                     1.1,  // mfd_p: gentle MFD partitioning (Freeman 1991)
                     grid,
                 );
+            }
+        }
+
+        // ── Subgrid-scale ridge smoothing (Tucker & Hancock 2010) ──
+        //
+        // At ~10 km grid resolution, each cell averages over a 10×10 km
+        // terrain patch containing hundreds of hillslopes.  The implicit
+        // B&W scheme routes flow via single-receiver steepest descent,
+        // creating artificially sharp drainage divides: cells on one side
+        // of a divide may drain to the ocean (strong erosion) while
+        // adjacent cells on the other side drain to a different basin
+        // (different erosion).  This produces staircase-like "cut"
+        // artifacts along divide ridges.
+        //
+        // Real drainage divides are smooth — mass wasting, regolith creep,
+        // and frost weathering redistribute material across divides at
+        // scales below grid resolution (Roering et al. 1999, JGR;
+        // Tucker & Hancock 2010, ESPL).
+        //
+        // Fix: 5 passes of land-only Laplacian smoothing, averaging
+        // each land cell with its 4-connected land neighbors.  Each pass
+        // blends ~20% with neighbors (standard 5-point stencil);
+        // 5 passes ≈ Gaussian σ ≈ 1.6 cells ≈ 16 km, comparable to
+        // the subgrid averaging scale.
+        for _ in 0..5 {
+            let prev = relief.clone();
+            for y in 0..grid.height {
+                for x in 0..grid.width {
+                    let i = grid.index(x, y);
+                    if prev[i] <= 0.0 { continue; }
+                    let mut sum = prev[i] * 4.0;
+                    let mut wt = 4.0_f32;
+                    for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
+                        let j = grid.neighbor(x as i32 + dx, y as i32 + dy);
+                        if prev[j] > 0.0 {
+                            sum += prev[j];
+                            wt += 1.0;
+                        }
+                    }
+                    relief[i] = sum / wt;
+                }
             }
         }
 
@@ -3317,29 +3366,20 @@ fn compute_relief_physics(
             }
         }
 
-        // Isostatic relaxation: exponential approach to equilibrium.
-        // τ = 2π μ / (ρ_m g α) where α = flexural wavelength ∝ Te^(3/4)
-        // (Watts 2001 §8.4; Turcotte & Schubert 2002 §6.10).
-        // Te proxy: continental crust → Te ≈ 15–50 km (thick crust = old,
-        // strong lithosphere); oceanic → Te ≈ 5–15 km.
-        // τ ∝ Te^(3/4) × (μ/ρ_m g): ranges from ~1 Myr (Te=5 km, young
-        // ocean) to ~10 Myr (Te=50 km, old craton).
-        // Normalization: Te=25 km → τ=5 Myr (canonical global mean).
-        let dt_myr = dt_yr / 1e6;
-        let tau_ref = 5.0_f32; // Myr at Te_ref=25 km
-        let te_ref = 25.0_f32; // km
-        for i in 0..size {
-            // Te proxy from crust thickness: continental 30-50 km crust →
-            // Te 20-50 km; oceanic 7 km crust → Te 5-15 km.
-            let cf = continental_frac[i];
-            let te_km = cf * (10.0 + crust_thickness[i] * 0.8) + (1.0 - cf) * 8.0;
-            let te_km = te_km.clamp(5.0, 50.0);
-            // τ ∝ Te^(3/4): thick lithosphere relaxes slower
-            let tau = tau_ref * (te_km / te_ref).powf(0.75);
-            let f_relax = 1.0 - (-dt_myr / tau).exp();
-            let target = isostatic_elevation(crust_thickness[i], continental_frac[i], heat_map[i]);
-            relief[i] = relief[i] * (1.0 - f_relax) + target * f_relax;
-        }
+        // Isostatic relaxation REMOVED.
+        //
+        // The initial relief IS the isostatic equilibrium (computed from
+        // flexurally-smoothed crust_thickness).  Without separate E&M uplift,
+        // the per-cell relaxation toward isostatic target simply undoes the
+        // stream power erosion — a narrow river valley (< flexural wavelength
+        // ~200 km) should NOT trigger rebound because the lithospheric plate
+        // is rigid enough to support the void.
+        //
+        // Flexural support is already correctly modeled via the 34-pass
+        // Gaussian smoothing of crust_thickness (equivalent to Te=25 km
+        // flexural filtering, Watts 2001 §3.13).  This ensures that
+        // small-scale erosion features remain while broad-scale topography
+        // is isostatically supported.
     }
     progress.phase(progress_base, progress_span, 0.70);
 
@@ -4019,7 +4059,7 @@ fn compute_relief_physics(
             let p25 = land_h[n * 25 / 100];
             let p75 = land_h[n * 75 / 100];
             let p90 = land_h[n * 90 / 100];
-            web_sys::console::log_1(&format!(
+            let msg = format!(
                 "[HYPSO] integral={:.3} (Earth≈0.40) | mean={:.0}m median={:.0}m | \
                  <1000m: {:.1}% (Earth≈70%) | p10={:.0} p25={:.0} p75={:.0} p90={:.0} | \
                  min={:.0} max={:.0}",
@@ -4027,7 +4067,11 @@ fn compute_relief_physics(
                 frac_below_1k * 100.0,
                 p10, p25, p75, p90,
                 h_min, h_max,
-            ).into());
+            );
+            #[cfg(target_arch = "wasm32")]
+            web_sys::console::log_1(&msg.into());
+            #[cfg(not(target_arch = "wasm32"))]
+            eprintln!("{msg}");
         }
     }
 

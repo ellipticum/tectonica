@@ -11,6 +11,11 @@ name = "planet_cli"
 path = "src/bin/planet_cli.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "add_latitudes"
+path = "src/bin/add_latitudes.rs"
+required-features = ["cli"]
+
 [features]
 default = []
 cli = ["serde_json", "image"]
