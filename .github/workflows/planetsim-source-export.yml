@@ -1,0 +1,27 @@
+name: PlanetSim source export
+
+on:
+  push:
+    branches:
+      - automation/planetsim-source-export
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package source
+        run: |
+          mkdir -p artifact
+          tar --exclude=.git --exclude=artifact -czf artifact/tectonica-source.tar.gz .
+          sha256sum artifact/tectonica-source.tar.gz > artifact/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tectonica-planetsim-source
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 1
