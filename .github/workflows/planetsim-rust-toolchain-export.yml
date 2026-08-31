@@ -1,0 +1,52 @@
+name: PlanetSim Rust toolchain export
+
+on:
+  push:
+    branches:
+      - automation/planetsim-source-export
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install minimal Rust 1.91 toolchain
+        run: |
+          rustup toolchain install 1.91.0 --profile minimal
+          rustup default 1.91.0
+          rustc --version
+          cargo --version
+      - name: Fetch parity dependencies
+        run: |
+          mkdir -p /tmp/parity/src artifact
+          cat >/tmp/parity/Cargo.toml <<'EOF'
+          [package]
+          name = "parity-deps"
+          version = "0.0.0"
+          edition = "2024"
+          [dependencies]
+          robust = "=1.2.0"
+          image = { version = "=0.25.10", default-features = false, features = ["png"] }
+          serde_json = "1.0"
+          EOF
+          printf 'fn main() {}\n' >/tmp/parity/src/main.rs
+          cd /tmp/parity
+          cargo fetch
+      - name: Package toolchain and registry
+        run: |
+          set -euo pipefail
+          TOOLCHAIN=$(rustup toolchain list | awk '/1.91.0/{print $1; exit}')
+          TOOLCHAIN_DIR="$HOME/.rustup/toolchains/$TOOLCHAIN"
+          tar -C "$TOOLCHAIN_DIR" -czf artifact/rust-1.91.0-x86_64-unknown-linux-gnu.tar.gz .
+          tar -C "$HOME/.cargo" -czf artifact/cargo-registry-cache.tar.gz registry
+          sha256sum artifact/*.tar.gz > artifact/SHA256SUMS
+          du -h artifact/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: planetsim-rust-offline-toolchain
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 1
