@@ -9,15 +9,27 @@ on:
 permissions:
   contents: read
 
+env:
+  GH_TOKEN: ${{ github.token }}
+
 jobs:
   export:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Package source
+      - name: Test private Lehor access
+        shell: bash
+        run: |
+          set +e
+          git ls-remote "https://x-access-token:${GH_TOKEN}@github.com/ellipticum/lehor.git" HEAD > cross-repo.txt 2>&1
+          status=$?
+          printf '\nstatus=%s\n' "$status" >> cross-repo.txt
+          cat cross-repo.txt
+      - name: Package public source
         run: |
           mkdir -p artifact
           tar --exclude=.git --exclude=artifact -czf artifact/tectonica-source.tar.gz .
+          cp cross-repo.txt artifact/
           sha256sum artifact/tectonica-source.tar.gz > artifact/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
